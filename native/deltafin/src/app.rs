@@ -137,6 +137,7 @@ fn run() -> Result<()> {
         Command::WarmExpertCache(arguments) => run_warm_expert_cache(arguments),
         Command::ConvertSpineInt8(arguments) => run_convert_spine_int8(arguments),
         Command::ConvertExpertsScale4(arguments) => run_convert_experts_scale4(arguments),
+        Command::Scale4ManifestFromSidecars(arguments) => run_scale4_manifest_from_sidecars(arguments),
         Command::PackSpine(arguments) => crate::pack_command::run(arguments),
         Command::Serve(arguments) => {
             let host = Host::compiled().validate()?;
@@ -252,6 +253,79 @@ fn run() -> Result<()> {
                 status.verify_snapshots.max_positions,
             );
             eprintln!("[native] {}", status.readiness);
+            {
+                // Always emitted, enabled or not: these two constants were
+                // measured wrong on 2026-08-31 by enough to invert the
+                // scheduler's preference, and no log line would have shown it.
+                // Gate arms on this rather than on the resolved-config line,
+                // which does not carry them.
+                let (enabled, internal_us, enclosure_us) =
+                    crate::storage::mirror_sched_report();
+                let bias = crate::storage::mirror_bias_report();
+                // `mode` is reported separately from `enabled` because
+                // K3_MIRROR_SCHED now has three values: 0 off, 1 cumulative
+                // clocks (a weighted round-robin), 2 least-expected-completion.
+                // An arm that meant to test mode 2 and silently resolved to
+                // mode 1 would produce a plausible, wrong, unfalsifiable
+                // result — and the resolved-config line does not carry this
+                // knob at all, so this is the only place it can be asserted.
+                // Arena depth, reported because NOTHING else does. The
+                // `resident=93/93 (50.74 GiB)` figure above is the SPINE — the
+                // persistent per-layer model weights — while the expert arena is
+                // a separate staging pool inside the Reader, ~280 MB per slot,
+                // counted in a different budget. Asserting the arena knob against
+                // `resident` is a test that cannot fail: it reads 50.74 GiB at
+                // 1, 2, 3 or 4 slots. K3_EXPERT_ARENA_SLOTS does not appear in
+                // `[config] resolved:` either, so without this line an arena arm
+                // is unfalsifiable — which is exactly what happened to the first
+                // one on 2026-08-31.
+                eprintln!(
+                    "[native] expert arena: slots={} prefetch_slots={}",
+                    crate::engine::expert_arena_slots_report(),
+                    crate::engine::expert_prefetch_slots_report(),
+                );
+                // K3_PROBE_ORDER does not appear in `[config] resolved:`, so this
+                // line is the only assertable record of which chain ran. A reorder
+                // that silently failed to resolve would look exactly like a null.
+                eprintln!(
+                    "[native] probe-order: {}",
+                    crate::storage::probe_order_report()
+                );
+                eprintln!(
+                    "[native] mirror-cost: {}",
+                    crate::storage::mirror_cost_table_report()
+                );
+                let mode = crate::storage::mirror_sched_mode_report();
+                let (oi, oc, ob, oa) = crate::storage::mirror_outstanding_report();
+                eprintln!(
+                    "[native] mirror: enabled={enabled} mode={mode} \
+internal_cost_us={internal_us} \
+enclosure_cost_us={enclosure_us} bias=internal:{:.2},K3C:{:.2},K3B:{:.2},K3A:{:.2} \
+outstanding={oi}/{oc}/{ob}/{oa}",
+                    bias[0], bias[1], bias[2], bias[3]
+                );
+            }
+            {
+                // Always emitted, on or off — same rule as the mirror line
+                // directly above. K3_EXPERT_RETAIN does not appear in the
+                // `[config] resolved:` line, so k3-assert-config.py cannot
+                // check it and an arm can otherwise only be asserted by
+                // resolution, never by effect.
+                let (enabled, cap_gb, first_layer) = crate::engine::retain_config_report();
+                eprintln!(
+                    "[native] retain: enabled={enabled} cap_gb={cap_gb} layers={first_layer}..=92"
+                );
+            }
+            {
+                // Always emitted, on or off — same rule as the mirror and
+                // retain lines above. K3_SUMMER_POOL does not appear in
+                // `[config] resolved:` either, so this is the only way an arm
+                // can be gated on it BY EFFECT.
+                let (enabled, cap_gb, sample) = crate::engine::summer_config_report();
+                eprintln!(
+                    "[native] summer: enabled={enabled} cap_gb={cap_gb} policy=lfru sample={sample}"
+                );
+            }
             if status.expert_heat_recording || status.expert_pin_candidates != 0 {
                 eprintln!(
                     "[native] expert heat: weight={:.0} passes recording={}; pin tier: candidates={} charged={:.2} GiB",
@@ -292,12 +366,17 @@ fn run() -> Result<()> {
                 if config.stats {
                     for layer in &report.layers {
                         eprintln!(
-                            "[pilot-gate] layer {:>2}: pilot {:>5.1}% (n={}) prev-token {:>5.1}% (n={}) preferred={} reads={}",
+                            "[pilot-gate] layer {:>2}: pilot {:>5.1}% (n={}) prev-token {:>5.1}% (n={}) union {:>5.1}% (+{:.1}) preferred={} reads={}",
                             layer.layer_index,
                             layer.pilot_ema * 100.0,
                             layer.pilot_samples,
                             layer.prev_token_ema * 100.0,
                             layer.prev_token_samples,
+                            layer.union_ema * 100.0,
+                            // The headline number: how much of the pilot's
+                            // miss rate a previous-token PRIOR could recover
+                            // without issuing a single extra read.
+                            (layer.union_ema - layer.pilot_ema) * 100.0,
                             layer.preferred.as_str(),
                             if layer.reads_suppressed {
                                 "suppressed"
@@ -367,6 +446,7 @@ fn command_requires_native_runtime_preflight(command: &Command) -> bool {
         | Command::WarmExpertCache(_)
         | Command::ConvertSpineInt8(_)
         | Command::ConvertExpertsScale4(_)
+        | Command::Scale4ManifestFromSidecars(_)
         | Command::Doctor(_)
         | Command::Upgrade => true,
     }
@@ -691,6 +771,75 @@ fn print_setup_plan(root: &Path, plan: crate::one_shot_setup::SetupPlan) {
             format_bytes(shortfall),
         );
     }
+}
+
+
+/// Rebuild `scale4-manifest.json` from ALREADY-WRITTEN `.sc4` sidecars, without
+/// reading the raw corpus.
+///
+/// The normal converter re-encodes every raw expert to verify each record, but
+/// that is impossible here: the raw corpus is now split across volumes by index
+/// parity (K3A even, K3B odd), so no single `source_root` holds a contiguous
+/// layer and the converter aborts on the first odd expert.
+///
+/// Each record's header already carries its `source_sha256` (written at encode
+/// time), so a manifest can be reconstructed from the sidecars alone. This
+/// ASSERTS rather than proves that the sidecars match the raw corpus — the
+/// checksums it copies were computed by the original conversion. Validate by
+/// running a known-output prompt and comparing token IDs before trusting it.
+fn run_scale4_manifest_from_sidecars(arguments: ConvertExpertsScale4Args) -> Result<()> {
+    use crate::expert_scale4::{FILE_BYTES, MANIFEST_NAME, parse_header, record_digest};
+    use crate::expert_scale4::manifest::{ManifestRow, manifest_bytes};
+    use std::io::Read;
+
+    let root = arguments
+        .output_root
+        .clone()
+        .unwrap_or_else(|| arguments.model_root.join("k3-experts-scale4"));
+    let mut rows: Vec<ManifestRow> = Vec::new();
+    let mut raw_names: Vec<String> = Vec::new();
+    let mut record = vec![0_u8; FILE_BYTES];
+    for layer in crate::experts::K3_MOE_LAYER_FIRST..=crate::experts::K3_MOE_LAYER_LAST {
+        let path = root.join(format!("L{layer}.sc4"));
+        let mut file = std::fs::File::open(&path).map_err(|error| {
+            DeltafinError::new(format!("open {}: {error}", path.display()))
+        })?;
+        let count = std::fs::metadata(&path)
+            .map_err(|error| DeltafinError::new(format!("stat {}: {error}", path.display())))?
+            .len() as usize
+            / FILE_BYTES;
+        for expert in 0..count {
+            file.read_exact(&mut record).map_err(|error| {
+                DeltafinError::new(format!("read {} record {expert}: {error}", path.display()))
+            })?;
+            // parse_header expects ONLY the header, not the whole record.
+            let header = parse_header(&record[..crate::expert_scale4::HEADER_BYTES])?;
+            rows.push(ManifestRow {
+                bases: header.bases,
+                expert: expert as u16,
+                layer,
+                record_sha256: hex_digest_public(record_digest(&record)?),
+                source_sha256: hex_digest_public(header.source_sha256),
+            });
+            raw_names.push(format!("L{layer}-E{expert}.bin"));
+        }
+        eprintln!("[scale4-manifest] layer {layer}: {count} records");
+    }
+    let payload = manifest_bytes(rows, &raw_names)?;
+    let destination = root.join(MANIFEST_NAME);
+    std::fs::write(&destination, &payload).map_err(|error| {
+        DeltafinError::new(format!("write {}: {error}", destination.display()))
+    })?;
+    eprintln!(
+        "[scale4-manifest] wrote {} ({} bytes) from sidecars only — NOT verified against raw",
+        destination.display(),
+        payload.len()
+    );
+    Ok(())
+}
+
+fn hex_digest_public(digest: [u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn run_convert_experts_scale4(arguments: ConvertExpertsScale4Args) -> Result<()> {
@@ -1195,13 +1344,17 @@ fn yes_no(value: bool) -> &'static str {
 
 fn print_canary(report: crate::provider::CanaryReport) {
     println!(
-        "canary {}: core={} rms_fp32={} matmul_fp32={} softmax_fp32={} packed_int8_fp32={} packed_shape={}x{}",
+        "canary {}: core={} rms_fp32={} matmul_fp32={} softmax_fp32={} packed_int8_fp32={} mla_attn_metal_fp32={} bespoke_loop_metal={} loop_router_metal={} loop_kda_metal={} packed_shape={}x{}",
         report.device,
         pass_fail(report.core_passed()),
         pass_fail(report.rms_fp32),
         pass_fail(report.matmul_fp32),
         pass_fail(report.softmax_fp32),
         pass_fail(report.packed_int8_fp32),
+        pass_fail(report.mla_attn_metal_fp32),
+        pass_fail(report.bespoke_loop_metal),
+        pass_fail(report.loop_router_metal),
+        pass_fail(report.loop_kda_metal),
         report.packed_shape.0,
         report.packed_shape.1,
     );

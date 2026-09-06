@@ -33,6 +33,10 @@ const CHECK_RMS_FP32: u32 = 1 << 0;
 const CHECK_MATMUL_FP32: u32 = 1 << 1;
 const CHECK_SOFTMAX_FP32: u32 = 1 << 2;
 const CHECK_PACKED_INT8_FP32: u32 = 1 << 3;
+const CHECK_MLA_ATTN_METAL_FP32: u32 = 1 << 4;
+const CHECK_BESPOKE_LOOP_METAL: u32 = 1 << 5;
+const CHECK_LOOP_ROUTER_METAL: u32 = 1 << 6;
+const CHECK_LOOP_KDA_METAL: u32 = 1 << 7;
 const FEATURE_CUDA_MOE: u32 = 1 << 0;
 const FEATURE_CUDA_EXACT_BF16: u32 = 1 << 1;
 const KNOWN_PROVIDER_FEATURES: u32 = FEATURE_CUDA_MOE | FEATURE_CUDA_EXACT_BF16;
@@ -75,6 +79,24 @@ const TARGET_EXPERT_CPU: u32 = 1;
 const TARGET_EXPERT_METAL: u32 = 2;
 const TARGET_EXPERT_CUDA: u32 = 3;
 const TARGET_EXPERT_RETAIN_METAL_WRAPPERS: u32 = 1 << 0;
+/// Arrival-driven expert compute (ABI flags 1<<1, 1<<2): this call carries a
+/// subset of the tile's experts; FINAL completes the rows from the running sum.
+pub(crate) const TARGET_EXPERT_ARRIVAL_PARTIAL: u32 = 1 << 1;
+pub(crate) const TARGET_EXPERT_ARRIVAL_FINAL: u32 = 1 << 2;
+
+/// Per-call arrival flags for `finish_expert_*` (None = stock single dispatch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TargetExpertArrival {
+    pub partial: bool,
+    pub final_group: bool,
+}
+
+impl TargetExpertArrival {
+    fn flags(self) -> u32 {
+        (if self.partial { TARGET_EXPERT_ARRIVAL_PARTIAL } else { 0 })
+            | (if self.final_group { TARGET_EXPERT_ARRIVAL_FINAL } else { 0 })
+    }
+}
 const EXPERT_LAYOUT_RAW_V1: u32 = 1;
 const EXPERT_LAYOUT_SCALE4_V2: u32 = 2;
 const METAL_DESCRIPTOR_ABI_V1: u32 = 1;
@@ -1851,12 +1873,34 @@ const _: [(); 40] = [(); std::mem::offset_of!(CudaCacheConfigureRequestV1, flags
 const _: [(); 64] = [(); size_of::<CudaCacheConfigureReportV1>()];
 const _: [(); 40] = [(); std::mem::offset_of!(CudaCacheConfigureReportV1, configured)];
 
+/// Register (or with `len == 0`, unregister) a host arena with the Metal
+/// expert path, so every span inside it shares ONE MTLBuffer wrap and ONE
+/// `useResource` residency call per dispatch instead of one each per expert.
+///
+/// The caller must keep the arena alive, unmoved and page-aligned for as long
+/// as it stays registered.
+pub(crate) fn register_metal_arena(base: *const u8, len: u64) -> i32 {
+    // SAFETY: `base`/`len` describe a live, page-aligned host allocation the
+    // caller owns for the process lifetime; the Metal side only reads it.
+    unsafe { k3_metal_register_arena(base, len) }
+}
+
 unsafe extern "C" {
     #[cfg(all(test, target_os = "macos"))]
     fn k3_metal_embedded_library_cycle_test_v1(cycles: i32) -> i32;
+    /// Register a host arena with the Metal layer so every expert span inside
+    /// it shares ONE MTLBuffer wrap and ONE `useResource` residency call per
+    /// dispatch. `len == 0` unregisters. Returns 0 on success.
+    fn k3_metal_register_arena(base: *const u8, len: u64) -> i32;
     #[cfg(all(test, target_os = "macos"))]
     fn deltafin_route_mailbox_metallib_cycle_test_v1(cycles: i32) -> i32;
     fn deltafin_provider_abi_version() -> u32;
+    fn deltafin_provider_prep_timer_report_v1(
+        values: *mut u64,
+        value_count: usize,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
     fn deltafin_provider_inventory_v1(
         inventory: *mut InventoryV1,
         error: *mut c_char,
@@ -1899,6 +1943,14 @@ unsafe extern "C" {
     ) -> i32;
     fn deltafin_provider_metal_expert_cache_flush_v1(
         request: *const ResourceRequestV1,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+
+    fn deltafin_provider_metal_expert_cache_drop_v1(
+        request: *const ResourceRequestV1,
+        blobs: *const *const std::ffi::c_void,
+        blob_count: u64,
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
@@ -2211,6 +2263,78 @@ unsafe extern "C" {
     ) -> i32;
 }
 
+/// One bucket of the provider's prepare/hint host-wait decomposition
+/// (attention-timer split, 2026-09-02). Cumulative and monotonic, so the
+/// per-chunk difference is meaningful. `wait_ns` is host-blocking time
+/// inside the ABI call, `drain_ns` the part of it spent queued behind
+/// EARLIER GPU work, `total_ns - wait_ns` the host CPU on the critical path.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrepTimerBucket {
+    pub calls: u64,
+    pub total_ns: u64,
+    pub wait_ns: u64,
+    pub drain_ns: u64,
+    pub waits: u64,
+    pub untimed_syncs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrepTimerReport {
+    /// Single-position tiles: the bespoke loop / precommit prepare path.
+    pub single: PrepTimerBucket,
+    /// Wide drafted-verify tiles: the batched stock ATen prepare path.
+    pub wide: PrepTimerBucket,
+    /// `take_prefetch_hint` (the pilot readback under `expert_plan`).
+    pub hint: PrepTimerBucket,
+    /// `finish_experts` (Rust's expert_kernel bucket), single-row tiles.
+    pub finish_single: PrepTimerBucket,
+    /// `finish_experts`, wide tiles.
+    pub finish_wide: PrepTimerBucket,
+    /// Cumulative wall ns of finish sub-regions (any width): routed-input
+    /// device->host materialization, MoE execute, next-layer KDA precommit.
+    pub finish_materialize_ns: u64,
+    pub finish_moe_ns: u64,
+    pub finish_precommit_ns: u64,
+}
+
+/// Reads the provider's cumulative prepare/hint wait decomposition. Word
+/// order mirrors provider_prep_timer.h; `None` only when the ABI refuses.
+pub fn prep_timer_report() -> Option<PrepTimerReport> {
+    let mut values = [0_u64; 33];
+    let mut error = [0 as c_char; ERROR_CAPACITY];
+    // SAFETY: both buffers are valid for the whole synchronous call and the
+    // provider only writes into them.
+    let status = unsafe {
+        deltafin_provider_prep_timer_report_v1(
+            values.as_mut_ptr(),
+            values.len(),
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let bucket = |base: usize| PrepTimerBucket {
+        calls: values[base],
+        total_ns: values[base + 1],
+        wait_ns: values[base + 2],
+        drain_ns: values[base + 3],
+        waits: values[base + 4],
+        untimed_syncs: values[base + 5],
+    };
+    Some(PrepTimerReport {
+        single: bucket(0),
+        wide: bucket(6),
+        hint: bucket(12),
+        finish_single: bucket(18),
+        finish_wide: bucket(24),
+        finish_materialize_ns: values[30],
+        finish_moe_ns: values[31],
+        finish_precommit_ns: values[32],
+    })
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NativeProviderInventory {
     pub providers: ProviderInventory,
@@ -2227,6 +2351,14 @@ pub struct CanaryReport {
     pub matmul_fp32: bool,
     pub softmax_fp32: bool,
     pub packed_int8_fp32: bool,
+    /// MPS-only advisory canary of the fused MLA decode attention kernel;
+    /// false everywhere the kernel is not attempted (CPU/CUDA).
+    pub mla_attn_metal_fp32: bool,
+    /// MPS-only advisory canary of the bespoke decode-loop scaffold
+    /// (worklist step 2); false everywhere it is not attempted (CPU/CUDA).
+    pub bespoke_loop_metal: bool,
+    pub loop_router_metal: bool,
+    pub loop_kda_metal: bool,
     pub required_passed: bool,
     pub detail: String,
 }
@@ -2349,6 +2481,10 @@ impl NativeProvider {
             matmul_fp32: passed & CHECK_MATMUL_FP32 != 0,
             softmax_fp32: passed & CHECK_SOFTMAX_FP32 != 0,
             packed_int8_fp32: passed & CHECK_PACKED_INT8_FP32 != 0,
+            mla_attn_metal_fp32: passed & CHECK_MLA_ATTN_METAL_FP32 != 0,
+            bespoke_loop_metal: passed & CHECK_BESPOKE_LOOP_METAL != 0,
+            loop_router_metal: passed & CHECK_LOOP_ROUTER_METAL != 0,
+            loop_kda_metal: passed & CHECK_LOOP_KDA_METAL != 0,
             required_passed: report.required_passed != 0,
             detail: fixed_c_string(&report.detail),
         };
@@ -3014,6 +3150,38 @@ impl SessionInner {
         )
     }
 
+    /// Per-blob wrapper eviction for the K3_EXPERT_RETAIN graveyard: drops
+    /// the cached no-copy MTLBuffer for each retiring span pointer instead
+    /// of flushing every warm wrapper (the measured super-linear retention
+    /// tax, [metal-cache] counter gate 2026-08-25).
+    pub(crate) fn drop_metal_expert_blobs(&self, blobs: &[*const std::ffi::c_void]) -> Result<()> {
+        if self.device != Device::Mps {
+            return Err(DeltafinError::new(
+                "Metal expert-cache drop requires an MPS provider session",
+            ));
+        }
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let request = ResourceRequestV1::new(self.handle, 0);
+        let mut error = [0 as c_char; ERROR_CAPACITY];
+        // SAFETY: request/blobs/error are valid for this synchronous,
+        // session-retained ABI call; the callee reads blobs[0..len).
+        let status = unsafe {
+            deltafin_provider_metal_expert_cache_drop_v1(
+                &request,
+                blobs.as_ptr(),
+                blobs.len() as u64,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error("native Metal expert-cache drop", &error));
+        }
+        Ok(())
+    }
+
     pub(crate) fn metal_expert_cache_stats(&self) -> Result<MetalExpertCacheStats> {
         if self.device != Device::Mps {
             return Err(DeltafinError::new(
@@ -3215,7 +3383,8 @@ impl NativeProviderSession {
         self.inner.flush_metal_expert_cache()
     }
 
-    #[cfg(test)]
+    // Was #[cfg(test)]; the K3_EXPERT_RETAIN counter gate (engine.rs
+    // print_metal_expert_cache_stats) now reads it in release builds.
     pub(crate) fn metal_expert_cache_stats(&self) -> Result<MetalExpertCacheStats> {
         self.inner.metal_expert_cache_stats()
     }
@@ -5185,6 +5354,8 @@ fn target_sequence_from_report(
         expert_plan: None,
         capture_dspark,
         full_commit_only,
+    pending_expert_arrival: None,
+            arrival_dispatched: Vec::new(),
     })
 }
 
@@ -5843,9 +6014,18 @@ pub struct TargetSequence {
     expert_plan: Option<Arc<TargetSequenceExpertPlanLease>>,
     capture_dspark: bool,
     full_commit_only: bool,
+    /// Arrival-driven compute: flags for the NEXT finish_expert_* call only.
+    pending_expert_arrival: Option<TargetExpertArrival>,
+    /// Arrival-driven compute: experts dispatched so far for the open tile.
+    arrival_dispatched: Vec<u16>,
 }
 
 impl TargetSequence {
+    /// Arm the next expert-tile finish as a partial (and/or final) arrival group.
+    pub(crate) fn set_expert_arrival(&mut self, arrival: Option<TargetExpertArrival>) {
+        self.pending_expert_arrival = arrival;
+    }
+
     pub const fn mode(&self) -> TargetSequenceMode {
         self.mode
     }
@@ -6073,7 +6253,7 @@ impl TargetSequence {
             }
             return Ok(None);
         }
-        if !(ROUTE_TOP_K..=PILOT_MAX_PREFETCH).contains(&count)
+        if !(crate::pilot_gate::prefetch_plan_floor()..=PILOT_MAX_PREFETCH).contains(&count)
             || report.source_layer != waiting.layer_index
             || report.target_layer != waiting.layer_index + 1
             || report.target_layer >= 93
@@ -6523,21 +6703,58 @@ impl TargetSequence {
                 ));
             }
         }
+        let arrival = self.pending_expert_arrival.take();
+        let partial_open = arrival.is_some_and(|a| a.partial && !a.final_group);
         let wide_request = canonical_expert_ids.len() > TARGET_SEQUENCE_MAX_EXPERTS;
         let route_union = target_sequence_route_union(
             mailbox,
             first_row,
             row_count,
-            if wide_request {
+            if wide_request || arrival.is_some() {
                 TARGET_SEQUENCE_MAX_EXPERTS_V2
             } else {
                 TARGET_SEQUENCE_MAX_EXPERTS
             },
         )?;
-        if route_union.as_ref() != canonical_expert_ids {
-            return Err(DeltafinError::new(
-                "target-sequence expert IDs are not the exact canonical active-row union",
-            ));
+        match arrival {
+            None => {
+                if route_union.as_ref() != canonical_expert_ids {
+                    return Err(DeltafinError::new(
+                        "target-sequence expert IDs are not the exact canonical active-row union",
+                    ));
+                }
+            }
+            Some(group) => {
+                // A partial group must be a subset of the active-row union and
+                // must not repeat an expert already dispatched for this tile;
+                // the final group must complete the union exactly.
+                let union = route_union.as_ref();
+                let mut merged: Vec<u16> = self.arrival_dispatched.clone();
+                for &expert in canonical_expert_ids {
+                    if union.binary_search(&expert).is_err() {
+                        return Err(DeltafinError::new(
+                            "arrival group names an expert outside the active-row union",
+                        ));
+                    }
+                    if merged.binary_search(&expert).is_ok() {
+                        return Err(DeltafinError::new(
+                            "arrival group repeats an expert already dispatched for this tile",
+                        ));
+                    }
+                    let at = merged.partition_point(|&seen| seen < expert);
+                    merged.insert(at, expert);
+                }
+                if group.final_group {
+                    if merged.as_slice() != union {
+                        return Err(DeltafinError::new(
+                            "arrival groups did not complete the active-row union by the final group",
+                        ));
+                    }
+                    self.arrival_dispatched.clear();
+                } else {
+                    self.arrival_dispatched = merged;
+                }
+            }
         }
         let backend = resolve_target_backend(self.session.device, backend)?;
         if retain_metal_wrappers && backend != TargetExpertBackend::Metal {
@@ -6627,11 +6844,11 @@ impl TargetSequence {
         } else {
             shader_bytes.as_ptr().cast()
         };
-        let expert_flags = if retain_metal_wrappers {
+        let expert_flags = (if retain_metal_wrappers {
             TARGET_EXPERT_RETAIN_METAL_WRAPPERS
         } else {
             0
-        };
+        }) | arrival.map_or(0, TargetExpertArrival::flags);
         let status = if wide_request {
             let mut expert_span_pointers = [ptr::null(); TARGET_SEQUENCE_MAX_EXPERTS_V2];
             let (expert_major_bytes, expert_major_length, span_pointers, span_pointer_count) =
@@ -6775,6 +6992,22 @@ impl TargetSequence {
             let failure = ffi_error("native provider target-sequence finish experts", &error);
             self.cancel_after_invalid_report();
             return Err(failure);
+        }
+        if partial_open {
+            // A non-final arrival group: the provider accumulated and kept the
+            // tile open, so its row cursor and state are unchanged.
+            if report.struct_size as usize != size_of::<TargetSequenceFinishExpertsReportV1>()
+                || report.sequence != self.handle
+                || report.next_expert_row as usize != first_row
+                || report.state != TARGET_SEQUENCE_STATE_WAITING_FOR_EXPERTS
+            {
+                self.cancel_after_invalid_report();
+                return Err(DeltafinError::new(
+                    "native provider returned an invalid partial expert-group report",
+                ));
+            }
+            self.waiting = Some(waiting);
+            return Ok(());
         }
         let next_row = first_row + row_count;
         let completed_layer = next_row == self.position_count;

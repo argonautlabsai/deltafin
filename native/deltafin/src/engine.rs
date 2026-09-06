@@ -57,6 +57,7 @@ use crate::program::{
     GlobalSpinePlan, LayerSpinePlan, PackedSpineCatalog, SourceLayout, SpineRepresentation,
     TargetProgram, WeightDType, WeightStorage,
 };
+use crate::provider::TargetExpertArrival;
 use crate::provider::{
     CUDA_EXPERT_CACHE_MAX_EXPERTS, CudaExpertCachePolicy, NativeProvider, NativeProviderInventory,
     NativeProviderMemorySnapshot, NativeProviderSession, ProviderTensor,
@@ -74,14 +75,16 @@ use crate::qwen_provider::NativeQwen;
 use crate::residency::{
     FixedCosts, HostMemory, ProviderMemory, ResidencyOverride, ResidencyPolicy, ResidencySelection,
     ResidencyStop, probe_host_memory, select_resident_prefix,
+    select_resident_prefix_crediting_request,
 };
 use crate::router_trace::{ROUTER_TRACE_HOST_RESERVE_BYTES, RouterTrace, RouterTraceMode};
 use crate::run_events::RunEventLog;
 use crate::run_interrupt::InterruptSource;
 use crate::spine_runtime::SpinePipeline;
 use crate::storage::{
-    BufferLengths, BufferRetireHook, CachePolicy, LOOSE_SPINE_DESCRIPTOR_RESERVE, Reader,
-    prepare_persistent_descriptor_capacity,
+    BufferDropHook, BufferLengths, BufferRetireHook, CachePolicy, LOOSE_SPINE_DESCRIPTOR_RESERVE,
+    Reader,
+    RetainedAllocation, prepare_persistent_descriptor_capacity,
 };
 use crate::tokenizer::K3Tokenizer;
 
@@ -96,6 +99,21 @@ const AUTO_SPINE_DEVICE_RESERVE_BYTES: u64 = 12 * (1_u64 << 30);
 const AUTO_SPINE_RESIDENT_PERCENT: u64 = 3;
 const AUTO_SPINE_RESIDENT_MAX_BYTES: u64 = 2_100_000_000;
 const SPINE_ARENA_SLOTS: usize = 2;
+
+/// K3_SPINE_LOOKAHEAD=<n>: streamed spine layers kept in flight (default 1 =
+/// the historical one-ahead). Each extra read costs one more layer-sized
+/// arena slab (~0.6 GB host); with K3_SPINE_HOMES the reads land on different
+/// drives, so they run in parallel instead of one drive taking a turn.
+fn spine_lookahead() -> usize {
+    std::env::var("K3_SPINE_LOOKAHEAD")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map_or(1, |value| value.clamp(1, 16))
+}
+
+fn spine_arena_slots() -> usize {
+    SPINE_ARENA_SLOTS.max(spine_lookahead() + 1)
+}
 const EXPERT_READER_LIMIT: usize = 4;
 // Authoritative expert misses are read and consumed synchronously. One
 // reusable union slot prevents a second multi-gigabyte demand slab from
@@ -109,6 +127,34 @@ const FULL_COMMIT_EXPERT_UNION_MAX: usize = (MAX_EXACT_DRAFTS + 1) * K3_EXPERT_T
 // synchronous kernel. `ReadPriority::Prefetch` may never consume a Reader's
 // final slot, so the extra slot preserves the Reader's demand-first invariant.
 // The complete 64-live-slot cost is charged by `native_fixed_costs` below.
+
+/// Seconds on CLOCK_MONOTONIC_RAW — the one clock an external sampler can also
+/// read, so `[phases]` boundaries and GPU residency samples share a timebase.
+/// `Instant` is deliberately not used: it is opaque and process-local.
+fn mono_raw_seconds() -> f64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: writes only into the local timespec; CLOCK_MONOTONIC_RAW is
+    // always available on Darwin.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
+
+/// Append one demand-union wait interval (CLOCK_MONOTONIC_RAW seconds) when
+/// `K3_PHASE_TRACE` names a file. Used to attribute externally-sampled GPU
+/// idle to the demand window; `[phases]` durations cannot do this because a
+/// chunk interleaves 92 layers' worth of every phase.
+fn phase_trace_demand(begin: f64, end: f64) {
+    use std::io::Write;
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("K3_PHASE_TRACE").ok()) else {
+        return;
+    };
+    if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(fh, "{begin:.6} {end:.6}");
+    }
+}
+
 const EXPERT_PREFETCH_MAX_EXPERTS: usize = 2 * K3_EXPERT_TOP_K;
 const EXPERT_PREFETCH_GENERATIONS: usize = 2;
 const EXPERT_PREFETCH_LIVE_SLOTS: usize = EXPERT_PREFETCH_GENERATIONS * EXPERT_PREFETCH_MAX_EXPERTS;
@@ -142,7 +188,33 @@ const K3_METAL_EMBEDDED_SOURCE_V1: &str = "deltafin:embedded-metal-moe-mxfp4:v1"
 // owns the isolated source-compiler test variant.
 const K3_METAL_DEVELOPMENT_SOURCE_ENV: &str = "K3_METAL_SRC";
 const MAX_NATIVE_CPU_EXPERT_THREADS: usize = 32;
-const MAX_EXACT_DRAFTS: usize = 8;
+/// Ceiling on drafted rows per verify transaction. `K3_SPEC_DEPTH` selects the
+/// value actually used and is clamped to this, so raising the ceiling is inert
+/// until `K3_SPEC_DEPTH` is raised with it.
+///
+/// Raised 8 -> 12 on 2026-08-31. Hard limits, both checked:
+///   * rows = drafts + 1 must fit `DELTAFIN_PROVIDER_TARGET_SEQUENCE_MAX_TILE_ROWS_V1`
+///     (= 16, provider_abi.h:27), so the true maximum is 15.
+///   * `FULL_COMMIT_EXPERT_UNION_MAX` = (drafts + 1) * 16 must fit
+///     `K3_EXPERT_UNION_MAX` (= 256), which also gives 15.
+/// 12 leaves headroom under both. The union constant only feeds
+/// `startup_complete_expert_union_capacity`, which requires the Scale4V2
+/// layout; the champion runs RawV1, so nothing changes there either.
+///
+/// Motivation: 5 of 12 max-width transactions on the champion trace were fully
+/// accepted, i.e. the depth cap and not the drafter ended them, and the
+/// per-transaction fit `elapsed = 2.418 + 0.558 * rows` gives a 4.3:1
+/// fixed-to-marginal ratio — more committed tokens per 93-layer sweep is the
+/// only lever that has paid. UNMEASURED: depth is NON-MONOTONIC (6 is worse
+/// than both 4 and 8), so 12 must be bracketed, not assumed.
+const MAX_EXACT_DRAFTS: usize = 12;
+
+/// What `K3_SPEC_DEPTH` resolves to when unset. Deliberately NOT
+/// `MAX_EXACT_DRAFTS`: this value sizes the verify-snapshot reserve
+/// (~452.81 MiB per candidate boundary), so binding it to the ceiling would
+/// make every ceiling raise a silent startup-memory raise. The champion sets
+/// `K3_SPEC_DEPTH=8` explicitly, so this default is not on the measured path.
+const DEFAULT_EXACT_DRAFTS: usize = 8;
 const SERVER_TARGET_REUSE_MIN_TOKENS: usize = 117;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -528,7 +600,10 @@ impl QwenRuntime {
             context_capacity: plan.context_capacity,
             telemetry: QwenTelemetry::default(),
             last_error: None,
-            raw_override_allowed: true,
+            // K3_QWEN_RAW_OVERRIDE=0: never submit the probe's unconfident raw
+            // candidate; ask the 1.7B wide drafter instead (general-prose
+            // acceptance experiment, 2026-09-05).
+            raw_override_allowed: !std::env::var("K3_QWEN_RAW_OVERRIDE").is_ok_and(|v| v == "0"),
             last_raw_override: false,
             last_submitted_drafts: 0,
         };
@@ -706,6 +781,50 @@ struct QwenRequestPolicy {
     probe_width: usize,
     maximum_width: usize,
     current_width: usize,
+    /// K3_QWEN_REARM=<steps>: re-arm the drafter this many decode steps after
+    /// it deactivates. 0 (the default) preserves the historical behaviour, in
+    /// which `active` is strictly one-way and a single bad patch of text kills
+    /// drafting for the remainder of the request.
+    ///
+    /// Measured 2026-08-28 (200-token raw, K3_SPEC_DEPTH=8): Qwen proposed on
+    /// only 28 of 102 decode steps at 93/144 = 64.6% acceptance, then latched
+    /// off near step 28 and never returned. The remaining ~74 steps fell
+    /// through to the n-gram source at 4/72 = 5.6%. The drafter did not
+    /// degrade -- it died, and was replaced by something worse than nothing.
+    rearm_after: usize,
+    cooldown: usize,
+    /// Whether a Qwen source exists at all; re-arming must never resurrect a
+    /// drafter that was never installed.
+    available: bool,
+    /// K3_QWEN_ADAPTIVE=1: size the draft from a rolling accepted-fraction
+    /// instead of the two-state 2<->maximum ladder.
+    ///
+    /// The stock ladder has only two useful widths: it jumps straight to
+    /// `maximum_width` on qualification or a full accept, and collapses to
+    /// `probe_width` otherwise. Measured 2026-08-28, that is the wrong shape
+    /// twice over. Acceptance is BIMODAL, not geometric -- transactions tend
+    /// to accept everything or nothing -- so the useful policy is to ride the
+    /// easy stretches wide and the hard stretches narrow, which a two-state
+    /// ladder cannot express. And a fixed K3_SPEC_DEPTH=4 measured +5..9%
+    /// over depth 8, i.e. the value is in the middle of the range the ladder
+    /// skips over.
+    adaptive: bool,
+    /// EWMA of accepted/proposed over verified transactions, in PERMILLE
+    /// (0..=1000). Fixed point rather than f32 so the struct keeps its `Eq`
+    /// derive, which other call sites rely on. Starts at 1000 (=1.0) so a
+    /// fresh request behaves like the stock ladder -- wide until proven
+    /// otherwise -- rather than crawling up from narrow.
+    accept_ewma_permille: u32,
+    /// K3_QWEN_REARM_PROBE=<n>: consecutive re-arms refused by the acceptance
+    /// gate. Measured 2026-09-03 (400 tok, champion prompt): the gate is a
+    /// one-way latch — the EWMA only moves on draft results, so a drafter that
+    /// died on one 0/10 chunk at token ~331 stayed below the bar for the rest
+    /// of the generation and the last 69 tokens ran single-position (~0.55
+    /// vs ~0.68 tok/s). After `n` refusals one probe re-arm is allowed with
+    /// the EWMA reset to the bar, so a recovered drafter comes back and a
+    /// still-bad one dies again at the cost of one probe-width chunk per
+    /// n × K3_QWEN_REARM steps. Default 0 = latch (promoted behaviour).
+    gate_refusals: u32,
 }
 
 impl QwenRequestPolicy {
@@ -719,6 +838,72 @@ impl QwenRequestPolicy {
             probe_width,
             maximum_width,
             current_width: probe_width,
+            rearm_after: configured_qwen_rearm_steps(),
+            cooldown: 0,
+            available: available && probe_width != 0,
+            adaptive: qwen_adaptive_width_enabled(),
+            accept_ewma_permille: 1000,
+            gate_refusals: 0,
+        }
+    }
+
+    /// Width from the rolling accepted-fraction, clamped to [probe, maximum].
+    ///
+    /// Deliberately linear in the accepted fraction rather than the geometric
+    /// optimum p/(1-p): the measured acceptance distribution is bimodal, so
+    /// the geometric estimator (which assumes i.i.d. per-token acceptance)
+    /// systematically under-widens on the all-accept transactions that supply
+    /// most of the win -- Qwen's mean accepted was 3.3 where geometric
+    /// predicts 1.8.
+    fn adaptive_width(&self) -> usize {
+        // Round-to-nearest in fixed point: (max * permille + 500) / 1000.
+        let scaled = (self.maximum_width as u64 * self.accept_ewma_permille as u64 + 500) / 1000;
+        (scaled as usize).clamp(self.probe_width, self.maximum_width)
+    }
+
+    /// Deactivate, arming the re-arm countdown when one is configured.
+    fn deactivate(&mut self) {
+        self.active = false;
+        self.cooldown = self.rearm_after;
+    }
+
+    /// Advance one decode step. When a cooldown is armed and expires, the
+    /// drafter returns at PROBE width and unqualified, so it must re-earn a
+    /// wide proposal exactly as it did at the start of the request. That keeps
+    /// the cost of a wrong re-arm bounded at probe width (2 rows).
+    fn tick(&mut self) {
+        if self.active || self.rearm_after == 0 || !self.available {
+            return;
+        }
+        self.cooldown = self.cooldown.saturating_sub(1);
+        if self.cooldown == 0 {
+            // K3_QWEN_REARM_MIN_ACCEPT=<permille>: re-arm only while the
+            // rolling acceptance is at least this high. Measured 2026-09-03:
+            // the re-arm pair is +16% on the champion prompt (68% acceptance)
+            // and -21..-22% on p2/p3 (32-34%) — re-arming a low-acceptance
+            // drafter every 4 steps turns every chunk into a wide tile that
+            // pays for its rejected positions. Below the bar the countdown
+            // re-arms itself and re-checks later; the EWMA cannot rise while
+            // inactive, so a measured-low prompt keeps the historical one-way
+            // latch. Default 0 = no gate (the promoted 2026-09-03 behaviour).
+            let bar = configured_qwen_rearm_min_accept();
+            if self.accept_ewma_permille < bar {
+                self.gate_refusals = self.gate_refusals.saturating_add(1);
+                let probe_after = configured_qwen_rearm_probe();
+                if probe_after == 0 || self.gate_refusals < probe_after {
+                    self.cooldown = self.rearm_after;
+                    return;
+                }
+                // Probe re-arm: start exactly at the bar so the next verified
+                // chunk decides — one accept-heavy chunk keeps it, one miss
+                // drops it below the bar again.
+                self.accept_ewma_permille = bar;
+            }
+            self.gate_refusals = 0;
+            self.active = true;
+            self.qualified = false;
+            self.consecutive_misses = 0;
+            self.current_width = self.probe_width;
         }
     }
 
@@ -732,7 +917,7 @@ impl QwenRequestPolicy {
 
     fn record_empty(&mut self, confidence_stopped: bool) {
         if !confidence_stopped {
-            self.active = false;
+            self.deactivate();
         }
     }
 
@@ -741,7 +926,7 @@ impl QwenRequestPolicy {
             return;
         }
         if accepted > proposed {
-            self.active = false;
+            self.deactivate();
             return;
         }
         if accepted == 0 {
@@ -749,12 +934,40 @@ impl QwenRequestPolicy {
         } else {
             self.consecutive_misses = 0;
         }
+        // Rolling accepted-fraction. Maintained on every verified transaction
+        // regardless of which width policy is in force, so the counter stays
+        // comparable across arms. `proposed` is non-zero: guarded above.
+        // alpha = 0.4, held in permille integer arithmetic:
+        //   ewma <- (2 * ratio + 3 * ewma) / 5
+        let ratio_permille = (accepted as u64 * 1000 / proposed as u64) as u32;
+        self.accept_ewma_permille =
+            ((2 * ratio_permille as u64 + 3 * self.accept_ewma_permille as u64) / 5) as u32;
+
+        if self.adaptive {
+            // The two deactivation guards are retained -- they bound the cost
+            // of a drafter that has genuinely stopped working -- but the
+            // controller owns the width in every surviving case, so the
+            // 2<->maximum jump never happens.
+            if !self.qualified {
+                if accepted == 0 {
+                    self.deactivate();
+                    return;
+                }
+                self.qualified = true;
+            } else if accepted == 0 && self.consecutive_misses >= 2 {
+                self.deactivate();
+                return;
+            }
+            self.current_width = self.adaptive_width();
+            return;
+        }
+
         if !self.qualified {
             if accepted == proposed && accepted >= 2 {
                 self.qualified = true;
                 self.current_width = self.maximum_width;
             } else if accepted == 0 {
-                self.active = false;
+                self.deactivate();
             } else {
                 self.current_width = self.probe_width;
             }
@@ -764,7 +977,7 @@ impl QwenRequestPolicy {
             self.current_width = self.maximum_width;
         } else if accepted == 0 {
             if self.consecutive_misses >= 2 {
-                self.active = false;
+                self.deactivate();
             } else {
                 self.current_width = self.probe_width;
             }
@@ -1063,6 +1276,20 @@ pub struct NativeTargetEngine {
     expert_backend: ResolvedExpertBackend,
     expert_cpu_threads: usize,
     ngram_drafter: NgramDraftSource,
+    /// K3_NGRAM_DRAFT=off suppresses the suffix-repeat fallback drafter.
+    ngram_draft_enabled: bool,
+    /// K3_QWEN_PREFIX_COMMIT=1 routes Qwen down the ordinary Verify path so a
+    /// partial accept with a>=1 commits the accepted prefix instead of
+    /// cancelling and rerunning.
+    qwen_prefix_commit: bool,
+    // K3_SPEC_MIN_TRAILING_ACCEPT: engine-level trailing-acceptance window
+    // over ALL verified drafts (DSpark + universal + ngram). The
+    // dspark_runtime gate (7dea2f8) can never govern the depth regime —
+    // DSpark self-disables by miss streak at ~token 124 and everything
+    // after is the stateless ngram source, which resolves engine-side
+    // (measured: two bit-identical 500-token nulls, trace 2026-08-23).
+    spec_trailing_drafted: u32,
+    spec_trailing_accepted: u32,
     dspark: DSparkRuntime<NativeDSparkBackend>,
     qwen: QwenRuntime,
     speculative_max_drafts: usize,
@@ -1076,6 +1303,10 @@ pub struct NativeTargetEngine {
     experts: RawExpertCorpus,
     expert_reader: Reader,
     expert_prefetch_reader: Option<Reader>,
+    /// Resolved prefetch-pool worker policy (configured override or the
+    /// demand pool's count) — the fail-closed startup invariant checks the
+    /// live reader against this, not against the demand pool.
+    expert_prefetch_workers: usize,
     pilot_gate: Option<PilotGate>,
     expert_heat: ExpertHeat,
     expert_pin_tier: Option<ExpertPinTier>,
@@ -1120,8 +1351,18 @@ impl Drop for NativeTargetEngine {
         // arena at this exclusive teardown boundary. Clear the process-global
         // no-copy wrapper cache before either reader field can release pages.
         // Each arena also owns the same hook as a final fail-safe.
+        // K3_EXPERT_RETAIN: bury every retained tile first so the flush
+        // below covers their wrappers too, then release (or deliberately
+        // leak, on a failed flush) after it — and always drop the
+        // session-holding hook before this engine's provider goes away.
+        if expert_retain_enabled() {
+            retain_teardown_bury_all();
+        }
         let metal_cache_failed = self.expert_backend == ResolvedExpertBackend::Metal
             && self.provider.flush_metal_expert_cache().is_err();
+        if expert_retain_enabled() {
+            retain_teardown_release(!metal_cache_failed);
+        }
         if self.spine_pipeline.teardown(&self.provider).is_err() || metal_cache_failed {
             self.provider.suppress_destroy_after_unproven_source_use();
         }
@@ -1302,7 +1543,7 @@ impl NativeTargetEngine {
             &spine_cache.policies,
             persistent_loose_descriptors,
         );
-        let spine = match spine_candidate {
+        let mut spine = match spine_candidate {
             Ok(spine) => spine,
             Err(_) if persistent_loose_descriptors && config.spine_fd_cache.is_none() => {
                 // Automatic admission is transactional: a descriptor race or
@@ -1357,10 +1598,33 @@ impl NativeTargetEngine {
                 let session = provider.lease();
                 Arc::new(move || session.flush_metal_expert_cache()) as BufferRetireHook
             });
+        // Per-blob graveyard eviction (2026-08-26): the counter gate proved
+        // the global flush's wrapper churn is super-linear in retention
+        // coverage; the graveyard now drops exactly the retiring spans'
+        // wrappers and falls back to the global flush only if the drop ABI
+        // fails.
+        let metal_expert_drop_hook: Option<BufferDropHook> =
+            (expert_backend == ResolvedExpertBackend::Metal).then(|| {
+                let session = provider.lease();
+                Arc::new(move |blobs: &[usize]| {
+                    let pointers: Vec<*const std::ffi::c_void> = blobs
+                        .iter()
+                        .map(|&address| address as *const std::ffi::c_void)
+                        .collect();
+                    session.drop_metal_expert_blobs(&pointers)
+                }) as BufferDropHook
+            });
         let metal_expert_wrapper_retention = metal_expert_retire_hook.is_some();
+        // K3_EXPERT_RETAIN: retention frees detached expert slabs and must
+        // follow the same flush-before-free discipline as the arenas. The
+        // hook is parked globally only under the flag (it holds a session
+        // lease) and is torn down in Drop below.
+        if expert_retain_enabled() {
+            retain_install_retire_hook(metal_expert_retire_hook.clone(), metal_expert_drop_hook);
+        }
         let expert_reader = Reader::with_arena_capacity_and_retire_hook(
             expert_reader_workers,
-            EXPERT_ARENA_SLOTS,
+            expert_arena_slots(),
             metal_expert_retire_hook.clone(),
         )?;
         // The nine-row verifier's compact expert slab is a startup resource,
@@ -1377,6 +1641,10 @@ impl NativeTargetEngine {
             experts.layout(),
             probe_host_memory(),
         );
+        // Static-band Summer preload (K3_SUMMER_PRELOAD): fills the pool
+        // through the authenticated read path while the demand Reader is
+        // otherwise empty, so the whole cost lands on startup wall.
+        summer_preload(&experts, &expert_reader);
         // A partial installation cannot safely speculate because a prediction
         // must never trigger a remote fetch. CUDA uses its separate provider-
         // owned cache plan and requires one contiguous miss slab, so the
@@ -1386,12 +1654,20 @@ impl NativeTargetEngine {
                 expert_backend,
                 ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
             );
+        let expert_prefetch_workers = config
+            .expert_prefetch_threads
+            .map_or(expert_reader_workers, |workers| {
+                workers.clamp(1, crate::config::MAX_EXPERT_READ_THREADS)
+            });
         let expert_prefetch_reader = expert_prefetch_enabled
             .then(|| {
-                Reader::with_arena_capacity_and_retire_hook(
-                    expert_reader_workers,
-                    EXPERT_PREFETCH_ARENA_SLOTS,
+                Reader::with_arena_capacity_retire_hook_and_class(
+                    expert_prefetch_workers,
+                    expert_prefetch_arena_slots(),
                     metal_expert_retire_hook.clone(),
+                    // Speculative pool: eligible for K3_PREFETCH_IOPOL kernel
+                    // deprioritization so demand never queues behind it.
+                    true,
                 )
             })
             .transpose()?;
@@ -1417,7 +1693,7 @@ impl NativeTargetEngine {
         let expert_prefetch_bytes = if expert_prefetch_enabled {
             u64::try_from(experts.layout().expert_span_bytes())
                 .ok()
-                .and_then(|bytes| bytes.checked_mul(EXPERT_PREFETCH_LIVE_SLOTS as u64))
+                .and_then(|bytes| bytes.checked_mul(expert_prefetch_live_slots() as u64))
                 .ok_or_else(|| DeltafinError::new("expert prefetch arena budget overflows u64"))?
         } else {
             0
@@ -1524,12 +1800,19 @@ impl NativeTargetEngine {
             requested_layers: config.provider_resident_layers,
             requested_provider_bytes: None,
         };
+        // K3_SPINE_LOAD_RESERVE_GB mirrors K3_HOST_RESERVE_GB (see
+        // `admit_live_context_growth`) but for LOAD-TIME spine-layer
+        // residency sizing, which the growth-time fix deliberately left on
+        // the stock 10 GiB floor / 18% permille policy (~23 GiB reserve on a
+        // 128 GiB host). Unset keeps upstream behavior exactly.
+        let load_time_residency_policy = host_reserve_policy_from_env("K3_SPINE_LOAD_RESERVE_GB");
         let (baseline_residency, baseline_transient) = select_residency_with_transient(
             host_memory,
             provider_memory,
             &provider_layer_bytes,
             fixed,
             residency_override,
+            load_time_residency_policy,
         )?;
         let admit_qwen = |plan: QwenPlan| {
             let qwen_fixed = qwen_fixed_costs(fixed, plan)?;
@@ -1539,6 +1822,7 @@ impl NativeTargetEngine {
                 &provider_layer_bytes,
                 qwen_fixed,
                 residency_override,
+                load_time_residency_policy,
             )
             .ok()?;
             qwen_residency_admitted(&residency).then_some((plan, residency, transient_layer_bytes))
@@ -1571,12 +1855,78 @@ impl NativeTargetEngine {
             provider_memory_snapshot,
             max_buffer_length,
         );
-        let spine_pipeline = SpinePipeline::with_resident_prefix(
+        let resident_layer_count = u32::try_from(residency.resident_layers).map_err(|_| {
+            DeltafinError::new("resident layer prefix does not fit the spine ABI")
+        })?;
+        let resident_mask = spine_residency_mask(resident_layer_count);
+        let transient_layers = resident_mask
+            .iter()
+            .enumerate()
+            .filter(|(_, kept)| !**kept)
+            .map(|(layer, _)| layer)
+            .collect::<Vec<usize>>();
+        if !transient_layers.is_empty() {
+            eprintln!(
+                "[native] spine residency: {}/{} resident, transient layers {:?} ({})",
+                resident_layer_count,
+                crate::program::K3_LAYER_COUNT,
+                transient_layers,
+                if spine_transient_spread_enabled() { "spread" } else { "suffix" },
+            );
+        }
+        // K3_SPINE_HOMES: give each transient layer a home drive by recompiling
+        // its read plan from that drive's copy of k3-resident-int8/tensors.
+        let spine_homes = configured_spine_homes();
+        if !spine_homes.is_empty() && !transient_layers.is_empty() {
+            match &mut spine {
+                CompiledSpine::Loose(layers) => {
+                    let mut per_home = vec![0_usize; spine_homes.len()];
+                    for (ordinal, &layer) in transient_layers.iter().enumerate() {
+                        let home = &spine_homes[ordinal % spine_homes.len()];
+                        let home_layout = SourceLayout {
+                            resident_tensors: layout.resident_tensors.clone(),
+                            int8_tensors: home.join("k3-resident-int8/tensors"),
+                        };
+                        if !home_layout.int8_tensors.is_dir() {
+                            return Err(DeltafinError::new(format!(
+                                "K3_SPINE_HOMES entry {} has no k3-resident-int8/tensors directory",
+                                home.display()
+                            )));
+                        }
+                        layers[layer] = program.layers[layer].loose_read_plan_with_cache_policy(
+                            &home_layout,
+                            crate::program::DEFAULT_SPINE_CHUNK_BYTES,
+                            spine_cache.policies[layer],
+                        )?;
+                        per_home[ordinal % spine_homes.len()] += 1;
+                    }
+                    eprintln!(
+                        "[native] spine homes: {}",
+                        spine_homes
+                            .iter()
+                            .zip(per_home)
+                            .map(|(home, count)| format!("{}={} layers", home.display(), count))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                CompiledSpine::Packed(_) => {
+                    eprintln!("[native] K3_SPINE_HOMES ignored: packed spine representation");
+                }
+            }
+        }
+        let spine_lookahead = spine_lookahead();
+        if spine_lookahead > 1 {
+            eprintln!(
+                "[native] spine lookahead: {spine_lookahead} reads in flight, {} arena slots",
+                spine_arena_slots(),
+            );
+        }
+        let spine_pipeline = SpinePipeline::with_resident_mask_lookahead(
             spine_reader_workers,
-            SPINE_ARENA_SLOTS,
-            u32::try_from(residency.resident_layers).map_err(|_| {
-                DeltafinError::new("resident layer prefix does not fit the spine ABI")
-            })?,
+            spine_arena_slots(),
+            resident_mask,
+            spine_lookahead,
         )?;
 
         // Freeze the session's expert-cache budget before anything can run a
@@ -1643,6 +1993,10 @@ impl NativeTargetEngine {
             expert_backend,
             expert_cpu_threads,
             ngram_drafter: NgramDraftSource::default(),
+            ngram_draft_enabled: ngram_draft_enabled(),
+            qwen_prefix_commit: qwen_prefix_commit_enabled(),
+            spec_trailing_drafted: 0,
+            spec_trailing_accepted: 0,
             dspark,
             qwen,
             speculative_max_drafts,
@@ -1656,6 +2010,7 @@ impl NativeTargetEngine {
             experts,
             expert_reader,
             expert_prefetch_reader,
+            expert_prefetch_workers,
             pilot_gate,
             expert_heat,
             expert_pin_tier,
@@ -1809,7 +2164,7 @@ impl NativeTargetEngine {
             || self
                 .expert_prefetch_reader
                 .as_ref()
-                .is_some_and(|reader| reader.workers() != self.expert_reader.workers())
+                .is_some_and(|reader| reader.workers() != self.expert_prefetch_workers)
         {
             return Err(DeltafinError::new(
                 "native expert-prefetch owner differs from its fail-closed device/install policy",
@@ -1877,6 +2232,13 @@ impl NativeTargetEngine {
         if let Some(effort) = config.reasoning_effort.as_deref() {
             options.thinking_effort = Some(effort);
         }
+        // K3_CHAT_THINKING=0: answer without the thinking channel (the CLI
+        // publishes only public content, so a thinking answer of N tokens
+        // prints nothing and the prose drafter has nothing to draft).
+        if chat_thinking_disabled() {
+            options.thinking = false;
+            options.thinking_effort = None;
+        }
         encode_chat(&self.tokenizer, &[Value::Object(message)], &options)
     }
 
@@ -1917,6 +2279,50 @@ impl NativeTargetEngine {
             self.target_reuse_identity,
             prompt,
         );
+        {
+            // K3_REUSE_TRACE=1: name every reuse decision. On PromptDiverged
+            // also localize the first mismatching token — divergence exactly
+            // at committed_positions means only the replayed-anyway pending
+            // token blocked the hit (server smoke test 2026-08-23: B re-paid
+            // a full prefill on a conversation that extends A).
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TRACE.get_or_init(|| {
+                std::env::var("K3_REUSE_TRACE").is_ok_and(|value| value == "1")
+            }) {
+                match (&plan, published.as_ref()) {
+                    (TargetReusePlan::Reset(TargetReuseInvalidation::PromptDiverged), Some(boundary)) => {
+                        let mismatch = boundary
+                            .logical_tokens
+                            .iter()
+                            .zip(prompt.iter())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(boundary.logical_tokens.len().min(prompt.len()));
+                        eprintln!(
+                            "[reuse-trace] MISS PromptDiverged at token {} (committed={}, logical={}, prompt={})",
+                            mismatch,
+                            boundary.committed_positions,
+                            boundary.logical_tokens.len(),
+                            prompt.len()
+                        );
+                    }
+                    (TargetReusePlan::Reset(reason), _) => {
+                        eprintln!(
+                            "[reuse-trace] MISS {:?} (prompt={})",
+                            reason,
+                            prompt.len()
+                        );
+                    }
+                    (TargetReusePlan::Reuse { replay, .. }, _) => {
+                        eprintln!(
+                            "[reuse-trace] HIT replay {}..{} (prompt={})",
+                            replay.start,
+                            replay.end,
+                            prompt.len()
+                        );
+                    }
+                }
+            }
+        }
         if reusable {
             if let (
                 Some(boundary),
@@ -2170,11 +2576,29 @@ impl NativeTargetEngine {
             .committed_context_tokens
             .checked_add(token_ids.len() as u64)
             .ok_or_else(|| DeltafinError::new("native committed context length overflows u64"))?;
+        // K3_GROWTH_TRACE=1: split the growth-boundary wall (measured
+        // 4-9s per event, every ~22-40 tokens, topup-widened) into its
+        // segments. Admission is believed cheap; the execution inside the
+        // provider begin call is the prime suspect.
+        let growth_trace = {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var("K3_GROWTH_TRACE").is_ok_and(|value| value == "1")
+            }) && (staged_session_positions > self.mla_capacity_tokens
+                || mode == TargetSequenceMode::Verify)
+        };
+        let capacity_before = self.mla_capacity_tokens;
+        let admit_started = std::time::Instant::now();
         let next_mla_capacity = self.admit_context_chunk(staged_session_positions)?;
+        let admit_ms = admit_started.elapsed().as_secs_f64() * 1e3;
+        let mut embed_ms = 0.0_f64;
+        let begin_started = std::time::Instant::now();
         let mut sequence = {
+            let embed_started = std::time::Instant::now();
             let embedding = self
                 .embedding
                 .read_rows(token_ids, &mut self.embedding_arena)?;
+            embed_ms = embed_started.elapsed().as_secs_f64() * 1e3;
             if full_commit_only {
                 if mode != TargetSequenceMode::Verify {
                     return Err(DeltafinError::new(
@@ -2201,6 +2625,17 @@ impl NativeTargetEngine {
                 )?
             }
         };
+        if growth_trace {
+            eprintln!(
+                "[growth-trace] mode={mode:?} positions={} capacity {}->{} admit={:.1}ms embed={:.1}ms begin={:.1}ms",
+                token_ids.len(),
+                capacity_before,
+                next_mla_capacity,
+                admit_ms,
+                embed_ms,
+                begin_started.elapsed().as_secs_f64() * 1e3 - embed_ms
+            );
+        }
         let metal_source_selector = self.metal_source_selector.as_deref();
         let complete_expert_union = prepare_complete_expert_union(
             self.complete_expert_union,
@@ -2433,6 +2868,16 @@ impl NativeTargetEngine {
         if full_commit_only {
             return Ok(true);
         }
+        // K3_VERIFY_ADMIT_ALWAYS=1: skip the live per-proposal memory probe for
+        // the prefix-commit drafter. Measured 2026-09-04: the probe refused
+        // 16-28 verify batches per 200-token run whenever the provider's
+        // in-flight footprint was high (arrival-driven compute), collapsing
+        // the drafter to narrow decode (chunks 49 -> 63-73, -5..-14%) while
+        // host memory stayed at 35 GiB available; the snapshots themselves
+        // are <= 453 MiB x 9 positions. Default off.
+        if verify_admit_always() {
+            return Ok(true);
+        }
         // Subtract only verifier bytes already withheld by the selected
         // startup plan. Full-commit Qwen returned above with a zero snapshot
         // reserve; ordinary n-gram/DSpark verification therefore charges its
@@ -2442,7 +2887,13 @@ impl NativeTargetEngine {
         if unreserved_bytes == 0 {
             return Ok(true);
         }
-        let selection = select_resident_prefix(
+        // Credit the requested verify bytes into the envelope exactly as the
+        // KV-growth admission does (select_resident_prefix_crediting_request):
+        // the strict variant was the only admission site that did not, which
+        // made it ~4 GiB stricter than every other site and let it flip on
+        // page-cache state (measured 2026-09-04: 16-28 refusals per 200-token
+        // run, drafter collapsed to narrow decode, chunks 49 -> 63-73).
+        let selection = select_resident_prefix_crediting_request(
             probe_host_memory(),
             provider_memory(self.provider.memory_snapshot(false)?),
             &[],
@@ -2451,7 +2902,12 @@ impl NativeTargetEngine {
                 provider_bytes: unreserved_bytes,
             },
             ResidencyOverride::default(),
-            ResidencyPolicy::default(),
+            // Verify admission is a growth-time decision: honor the same
+            // K3_HOST_RESERVE_GB floor as KV-growth admission instead of the
+            // stock ~23GiB default, which on a full-residency 128GB host
+            // denies nearly every DSpark verify batch (third site of the
+            // same reserve-policy family: growth-time, load-time, verify).
+            host_reserve_policy_from_env("K3_HOST_RESERVE_GB"),
         );
         Ok(selection.stop == ResidencyStop::AllLayersFit)
     }
@@ -2567,10 +3023,11 @@ fn build_native_dspark(
 ) -> Result<DSparkRuntime<NativeDSparkBackend>> {
     let runtime_config = DSparkRuntimeConfig {
         vocab_size: 163_840,
-        probe_drafts: 2,
-        max_drafts: 7,
+        probe_drafts: 2_u8.min(config.dspark_max_drafts),
+        max_drafts: config.dspark_max_drafts,
         max_context_tokens: config.dspark_max_context,
         min_auto_speedup: config.dspark_min_auto_speedup,
+        miss_tolerance: config.dspark_miss_tolerance,
     };
     let directory = model_root.join("k3-draft-dspark");
     let eligible = dspark_eligible(config, &directory, device);
@@ -2696,8 +3153,18 @@ fn discover_qwen_plan(
     if request == QwenRequest::Auto && !matches!(device, Device::Mps) {
         return QwenPlan::inactive(QwenRuntimeState::IneligibleDevice);
     }
-    let probe = QwenCheckpoint::open(model_root, QwenVariant::Probe06B).is_ok();
+    let mut probe = QwenCheckpoint::open(model_root, QwenVariant::Probe06B).is_ok();
     let wide = QwenCheckpoint::open(model_root, QwenVariant::Wide17B).is_ok();
+    // K3_QWEN_PRIMARY=wide (2026-09-06, reviewer's quick test 1): run the 1.7B
+    // as the only drafter, with its own acceptance history, instead of the
+    // 0.6B probe + lazy wide pair. The wide-only plan already exists for hosts
+    // without the probe checkpoint; this just declines the probe.
+    if wide
+        && std::env::var("K3_QWEN_PRIMARY").is_ok_and(|v| v.trim().eq_ignore_ascii_case("wide"))
+    {
+        eprintln!("[native] qwen: K3_QWEN_PRIMARY=wide -> 1.7B is the only drafter (probe not loaded)");
+        probe = false;
+    }
     let Ok((reserved_verify_positions, reserved_verify_bytes)) =
         qwen_verify_reserve(verify_snapshots, speculative_max_drafts)
     else {
@@ -2803,8 +3270,48 @@ fn qwen_fixed_costs(base: FixedCosts, plan: QwenPlan) -> Option<FixedCosts> {
     })
 }
 
+/// K3_QWEN_ALLOW_CHAT=1: let the Qwen universal drafter serve CHAT
+/// requests too. Upstream scopes Qwen to raw completions and leaves chat
+/// to DSpark, so `allow_dspark` (which chat forces true) blocks it. But
+/// Qwen measures 85% acceptance on finance-style prose and is worth +34.6% on the
+/// raw path, while chat/DSpark amortises only ~1.57 tokens per K3 pass —
+/// so the classification, not the content, is what costs us. Safe by
+/// construction: acceptance is still u32 token-ID equality against full
+/// K3's argmax.
+///
+/// CORRECTION 2026-08-31. This comment used to end "and if the
+/// cross-tokenizer round-trip rejects chat special tokens the drafter
+/// simply proposes nothing." That is FALSE and it is why the one recorded
+/// chat trial of this flag ("proposed once, accepted 0/2, then latched
+/// off") was misread as "Qwen has nothing to offer in chat".
+///
+/// A round-trip rejection raises an Err, which reaches
+/// `FailSoftQwenDraft::propose_with_outcome` and sets `enabled = false`
+/// PERMANENTLY for the request. And an accepted-0 verification reaches
+/// `QwenRequestPolicy::record_verified`, whose `deactivate()` is one-way
+/// while `K3_QWEN_REARM` is 0 (the default). Chat prompts carry the chat
+/// template's special tokens, so the round trip is far MORE likely to fail
+/// here than on the raw path — a single early failure ends drafting for the
+/// whole request.
+///
+/// Do not evaluate this flag without BOTH `K3_QWEN_ROUNDTRIP_SOFT=1` and
+/// `K3_QWEN_REARM=4`. On the raw path that pair is worth +19.05%
+/// (2026-08-30, 5-arm interleaved bracket). Default off.
+/// K3_CHAT_THINKING=0: build chat prompts with the thinking channel off.
+fn chat_thinking_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("K3_CHAT_THINKING").is_ok_and(|value| value == "0"))
+}
+
+fn qwen_allow_chat() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("K3_QWEN_ALLOW_CHAT").is_ok_and(|value| value == "1")
+    })
+}
+
 fn qwen_allowed_for_request(allow_dspark: bool) -> bool {
-    !allow_dspark
+    !allow_dspark || qwen_allow_chat()
 }
 
 fn qwen_provider_reserve(
@@ -2890,6 +3397,69 @@ impl NativeTargetEngine {
         clippy::too_many_arguments,
         reason = "the native generation boundary keeps authority, publication, and cooperative-stop controls explicit"
     )]
+    /// K3_SPEC_MIN_TRAILING_ACCEPT=<percent 1..=99>: engine-level
+    /// speculative governor threshold. Unset/unparsable = off.
+    fn spec_trailing_threshold() -> Option<u8> {
+        static THRESHOLD: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+        *THRESHOLD.get_or_init(|| {
+            std::env::var("K3_SPEC_MIN_TRAILING_ACCEPT")
+                .ok()
+                .and_then(|value| value.trim().parse::<u8>().ok())
+                .filter(|percent| (1..=99).contains(percent))
+        })
+    }
+
+    /// True when the trailing window says fallback (ngram/universal)
+    /// drafting no longer pays. DSpark is never gated here — its own
+    /// economics govern it; an accepted DSpark streak re-earns the window.
+    fn spec_trailing_gate_blocked(&self) -> bool {
+        let Some(threshold) = Self::spec_trailing_threshold() else {
+            return false;
+        };
+        self.spec_trailing_drafted >= 32
+            && u64::from(self.spec_trailing_accepted) * 100
+                < u64::from(self.spec_trailing_drafted) * u64::from(threshold)
+    }
+
+    /// Account one verified proposal (any draft source) into the decayed
+    /// window: accumulate, then halve on every >=32 pass exactly like the
+    /// dspark_runtime gate, so the window tracks recent acceptance. Once
+    /// blocked, no halving occurs and the block is sticky unless DSpark
+    /// acceptance re-credits the window.
+    fn record_spec_trailing(&mut self, drafted: usize, accepted: usize) {
+        let Some(threshold) = Self::spec_trailing_threshold() else {
+            return;
+        };
+        self.spec_trailing_drafted = self
+            .spec_trailing_drafted
+            .saturating_add(drafted as u32);
+        self.spec_trailing_accepted = self
+            .spec_trailing_accepted
+            .saturating_add(accepted as u32);
+        let below = self.spec_trailing_drafted >= 32
+            && u64::from(self.spec_trailing_accepted) * 100
+                < u64::from(self.spec_trailing_drafted) * u64::from(threshold);
+        eprintln!(
+            "[spec-trailing] +{}/+{} window={}/{} ({:.1}%) threshold={} blocked={}",
+            drafted,
+            accepted,
+            self.spec_trailing_accepted,
+            self.spec_trailing_drafted,
+            if self.spec_trailing_drafted > 0 {
+                100.0 * f64::from(self.spec_trailing_accepted)
+                    / f64::from(self.spec_trailing_drafted)
+            } else {
+                0.0
+            },
+            threshold,
+            below
+        );
+        if self.spec_trailing_drafted >= 32 && !below {
+            self.spec_trailing_drafted /= 2;
+            self.spec_trailing_accepted /= 2;
+        }
+    }
+
     fn generate_tokens_to_with_interrupt<W: Write, I: InterruptSource>(
         &mut self,
         prompt: &[u32],
@@ -2954,6 +3524,7 @@ impl NativeTargetEngine {
                 }
                 if stats {
                     print_run_stats(&counters, started);
+                    print_metal_expert_cache_stats(&self.provider);
                 }
                 self.finish_output(output)?;
                 return Ok(NativeGeneration {
@@ -2972,6 +3543,7 @@ impl NativeTargetEngine {
                 }
                 if stats {
                     print_run_stats(&counters, started);
+                    print_metal_expert_cache_stats(&self.provider);
                 }
                 self.finish_output(output)?;
                 return Ok(NativeGeneration {
@@ -3012,6 +3584,7 @@ impl NativeTargetEngine {
                     }
                     if stats {
                         print_run_stats(&counters, started);
+                        print_metal_expert_cache_stats(&self.provider);
                     }
                     self.finish_output(output)?;
                     return Ok(NativeGeneration {
@@ -3090,6 +3663,7 @@ impl NativeTargetEngine {
             }
             if stats {
                 print_run_stats(&counters, started);
+                print_metal_expert_cache_stats(&self.provider);
             }
 
             let mut pending_token = initial_token;
@@ -3099,6 +3673,12 @@ impl NativeTargetEngine {
                 interrupted_after_prefill || interrupt.requested(),
             );
             let mut decode_step = 0_u64;
+            // K3_DSPARK_DEBUG=1: diagnostic-only, env-gated per-block dump of
+            // the draft/verify arbitration (drafted ids vs. target-argmax ids,
+            // both models' KV/position bookkeeping) to stderr as it happens.
+            // Checked once so the hot loop pays only a bool read when off.
+            // See DIRECTIVE STEP 2 (DSpark day) in K3-ENGINE-STATUS.md.
+            let dspark_debug = std::env::var_os("K3_DSPARK_DEBUG").is_some_and(|v| v == "1");
             let mut qwen_policy = QwenRequestPolicy::new(
                 qwen_allowed_for_request(allow_dspark) && self.qwen.is_available(),
                 self.speculative_max_drafts,
@@ -3127,21 +3707,53 @@ impl NativeTargetEngine {
                     .is_some_and(|lease| self.dspark.needs_target_baseline(lease).unwrap_or(false));
                 let mut dspark_proposal = if !needs_dspark_baseline && draft_budget != 0 {
                     dspark_lease.as_ref().and_then(|lease| {
-                        self.dspark
-                            .propose(lease, pending_token, u8::try_from(draft_budget.min(7)).ok())
-                            .ok()
-                            .flatten()
+                        match self.dspark.propose(
+                            lease,
+                            pending_token,
+                            u8::try_from(draft_budget.min(7)).ok(),
+                        ) {
+                            Ok(proposal) => proposal,
+                            Err(error) => {
+                                // K3_DSPARK_DEBUG=1: propose() protocol errors
+                                // are deliberately swallowed on the hot path —
+                                // surface them for the DSpark-day diagnosis.
+                                if dspark_debug {
+                                    eprintln!(
+                                        "K3_DSPARK_DEBUG propose_err step={decode_step} error={error}"
+                                    );
+                                }
+                                None
+                            }
+                        }
                     })
                 } else {
                     None
                 };
+                if dspark_debug && decode_step < 12 {
+                    eprintln!(
+                        "K3_DSPARK_DEBUG gate step={decode_step} lease={} needs_baseline={needs_dspark_baseline} draft_budget={draft_budget} proposed={}",
+                        dspark_lease.is_some(),
+                        dspark_proposal.is_some()
+                    );
+                }
                 let mut qwen_proposal_used = false;
                 let mut qwen_proposed_drafts = 0_usize;
                 let mut drafts = if let Some(proposal) = dspark_proposal.as_ref() {
                     proposal.token_ids().to_vec()
                 } else if needs_dspark_baseline {
                     Vec::new()
+                } else if self.spec_trailing_gate_blocked() {
+                    // K3_SPEC_MIN_TRAILING_ACCEPT: trailing acceptance over
+                    // all verified drafts fell below threshold — stop paying
+                    // fallback (ngram/universal) verify transactions. Exact
+                    // decode continues token by token; output-invariant by
+                    // the verification contract.
+                    Vec::new()
                 } else {
+                    // K3_QWEN_REARM: give a deactivated drafter its cooldown
+                    // step before the width is read, so an expired cooldown
+                    // takes effect on this step rather than the next one.
+                    qwen_policy.tick();
                     let qwen_width = qwen_policy.proposal_width(draft_budget);
                     let qwen_attempted = qwen_width != 0;
                     let qwen = if qwen_attempted {
@@ -3154,11 +3766,17 @@ impl NativeTargetEngine {
                         if qwen_attempted {
                             qwen_policy.record_empty(qwen.confidence_stopped());
                         }
-                        if qwen_attempted && qwen.confidence_stopped() {
+                        if (qwen_attempted && qwen.confidence_stopped())
+                            || !self.ngram_draft_enabled
+                        {
                             // A low-confidence wide row is evidence against
                             // paying for a verifier at this position. Decode
                             // one exact target row but retain request-local
                             // qualification for the next position.
+                            //
+                            // The same empty proposal is returned when
+                            // K3_NGRAM_DRAFT=off, which reaches this branch on
+                            // every step where Qwen is absent or latched off.
                             Vec::new()
                         } else {
                             self.ngram_drafter
@@ -3182,7 +3800,18 @@ impl NativeTargetEngine {
                 let proposal_candidate_count = drafts.len();
                 let use_verify = !drafts.is_empty()
                     && self
-                        .admit_verify_width(drafts.len().saturating_add(1), qwen_proposal_used)?;
+                        .admit_verify_width(
+                            drafts.len().saturating_add(1),
+                            // Under prefix-commit Qwen uses the ORDINARY Verify
+                            // transaction, which really does retain per-row KDA
+                            // boundaries, so it must pay the same live snapshot
+                            // admission n-gram pays -- ~452.81 MiB per boundary,
+                            // i.e. 1.77 GiB transient at depth 4. Charging it is
+                            // what makes the reserve fail-soft: on denial the
+                            // caller clears drafts and falls through to ordinary
+                            // exact decode, never to a crash.
+                            qwen_proposal_used && !self.qwen_prefix_commit,
+                        )?;
                 let proposal_memory_rejected = proposal_candidate_count != 0 && !use_verify;
                 if !use_verify {
                     if let (Some(lease), Some(proposal)) =
@@ -3229,7 +3858,7 @@ impl NativeTargetEngine {
                         inputs.extend_from_slice(&drafts);
                         let capture_dspark = self.dspark_tracks_rows(dspark_lease.as_ref());
                         let verifier_started = Instant::now();
-                        let prepared = if qwen_proposal_used {
+                        let prepared = if qwen_proposal_used && !self.qwen_prefix_commit {
                             self.prepare_full_commit_verify_chunk(
                                 &inputs,
                                 stats,
@@ -3256,6 +3885,54 @@ impl NativeTargetEngine {
                         let emitted = plan.emitted().to_vec();
                         let stop = plan.stop();
                         let accepted_drafts = plan.accepted_drafts();
+                        self.record_spec_trailing(drafts.len(), accepted_drafts);
+                        {
+                            // K3_GROWTH_TRACE=1: per-verify-transaction total.
+                            // Together with the [growth-trace] mode=Verify
+                            // prepare split, this decomposes the 4-9s tx
+                            // wall into begin(snapshot) vs forward/plan.
+                            static TRACE: std::sync::OnceLock<bool> =
+                                std::sync::OnceLock::new();
+                            if *TRACE.get_or_init(|| {
+                                std::env::var("K3_GROWTH_TRACE")
+                                    .is_ok_and(|value| value == "1")
+                            }) {
+                                eprintln!(
+                                    "[verify-trace] width={} accepted={} arm_total={:.1}ms",
+                                    drafts.len(),
+                                    accepted_drafts,
+                                    verifier_started.elapsed().as_secs_f64() * 1e3
+                                );
+                            }
+                        }
+                        if dspark_debug {
+                            // target_position is the absolute KV/history length
+                            // the verify pass ran against, i.e. drafts[0] is the
+                            // candidate for position target_position (predicted
+                            // from row 0 == pending_token). prepared.predictions
+                            // is the target's row-major argmax id per input row
+                            // (hypothesis 2: wrong logit row would show up as a
+                            // shift between drafts and target_predictions here).
+                            // dspark_proposal's own pending_token_id/generated
+                            // ids are the pre-truncation view so a KV-position
+                            // desync (hypothesis 1/5) or width truncation bug is
+                            // visible without rerunning. Paired C++-side
+                            // draft_topk/target_topk lines (provider_dspark_model
+                            // .cpp / provider_target_sequence.cpp) bracket this
+                            // line in the same stderr stream, in step order,
+                            // since decode is single-threaded/synchronous.
+                            eprintln!(
+                                "K3_DSPARK_DEBUG step={decode_step} target_position={} pending_token={pending_token} drafts={:?} target_predictions={:?} accepted_drafts={accepted_drafts} emitted={:?} qwen_proposal_used={qwen_proposal_used} proposal_id={:?} proposal_pending_token_id={:?} proposal_generated={:?} proposal_probe={:?}",
+                                decode.history().len(),
+                                drafts,
+                                prepared.predictions.as_ref(),
+                                emitted,
+                                dspark_proposal.as_ref().map(|p| p.proposal_id()),
+                                dspark_proposal.as_ref().map(|p| p.pending_token_id()),
+                                dspark_proposal.as_ref().map(|p| p.generated_token_ids()),
+                                dspark_proposal.as_ref().map(|p| p.is_probe()),
+                            );
+                        }
                         if emitted.is_empty() {
                             return Err(cancel_after_error(
                                 prepared.sequence,
@@ -3271,7 +3948,16 @@ impl NativeTargetEngine {
                         // reruns only old-pending + accepted drafts. The rerun
                         // must reproduce the saved full-K3 authoritative IDs
                         // before its complete sequence is allowed to commit.
-                        let completed = if qwen_proposal_used {
+                        // K3_QWEN_PREFIX_COMMIT: a>=1 partial accepts fall through
+                        // to the ordinary prefix commit below. a==0 keeps today's
+                        // cancel+rerun so the canonical width-1 successor state is
+                        // preserved (see qwen_prefix_commit_enabled). Note
+                        // emitted.len()==1 implies a==0 here, because `use_verify`
+                        // required a non-empty draft list, so inputs.len()>=2.
+                        let qwen_needs_full_commit_path = qwen_proposal_used
+                            && (!self.qwen_prefix_commit
+                                || (emitted.len() == 1 && emitted.len() != inputs.len()));
+                        let completed = if qwen_needs_full_commit_path {
                             if interrupt.requested() {
                                 prepared.sequence.cancel()?;
                                 final_stop = Some(StopReason::Interrupted);
@@ -3430,6 +4116,9 @@ impl NativeTargetEngine {
                 counters.absorb(&completed);
                 if use_verify {
                     counters.verify_transactions = counters.verify_transactions.saturating_add(1);
+                    let width_bucket = drafts.len().min(8);
+                    counters.verify_width_histogram[width_bucket] =
+                        counters.verify_width_histogram[width_bucket].saturating_add(1);
                     counters.verified_draft_tokens = counters
                         .verified_draft_tokens
                         .saturating_add(drafts.len() as u64);
@@ -3477,6 +4166,7 @@ impl NativeTargetEngine {
                     stop_after_transaction(stop, interrupted_after_target || interrupt.requested());
                 if stats {
                     print_run_stats(&counters, started);
+                    print_metal_expert_cache_stats(&self.provider);
                 }
             }
             self.finish_output(output)?;
@@ -4033,6 +4723,10 @@ impl NativeTargetEngine {
                 {
                     options.thinking_effort = Some(effort);
                 }
+                if chat_thinking_disabled() {
+                    options.thinking = false;
+                    options.thinking_effort = None;
+                }
                 (encode_chat(&self.tokenizer, &messages, &options)?, true)
             }
         };
@@ -4173,7 +4867,16 @@ impl<W: Write> CliOutputWriter<W> {
     fn new(sink: W, chat: bool) -> Self {
         Self {
             sink,
-            chat: chat.then(ChatStreamParser::default),
+            // K3_CHAT_THINKING=0 opens the response channel in the prompt
+            // itself, so the stream never carries the response marker: start
+            // the parser inside the response.
+            chat: chat.then(|| {
+                if chat_thinking_disabled() {
+                    ChatStreamParser { phase: ChatParsePhase::Response(String::new()) }
+                } else {
+                    ChatStreamParser::default()
+                }
+            }),
             wrote_public_text: false,
         }
     }
@@ -4596,10 +5299,31 @@ fn plan_target_reuse(
     if boundary.identity != identity {
         return TargetReusePlan::Reset(TargetReuseInvalidation::ModelOrConfigChanged);
     }
-    if prompt.len() <= boundary.logical_tokens.len() {
+    // K3_REUSE_COMMITTED_PREFIX=1 (default off = stock strict matching):
+    // require the new prompt to extend only the COMMITTED prompt tokens,
+    // not the trailing pending token. The pending token is the previous
+    // request's own first prediction and was never consumed by the
+    // provider; the replay range re-feeds position committed.. regardless,
+    // so a divergence there is ordinary teacher-forcing from the same
+    // committed state. The strict form makes reuse unreachable for
+    // thinking models: the next turn's rendered history diverges at
+    // exactly the pending position (measured: MISS PromptDiverged at
+    // token 123 = committed_positions, server smoke test 2026-08-23).
+    let committed_prefix_only = {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("K3_REUSE_COMMITTED_PREFIX").is_ok_and(|value| value == "1")
+        })
+    };
+    let required_prefix = if committed_prefix_only {
+        &boundary.logical_tokens[..boundary.committed_positions as usize]
+    } else {
+        &boundary.logical_tokens[..]
+    };
+    if prompt.len() <= required_prefix.len() {
         return TargetReusePlan::Reset(TargetReuseInvalidation::PromptTruncated);
     }
-    if !prompt.starts_with(&boundary.logical_tokens) {
+    if !prompt.starts_with(required_prefix) {
         return TargetReusePlan::Reset(TargetReuseInvalidation::PromptDiverged);
     }
     TargetReusePlan::Reuse {
@@ -4711,6 +5435,30 @@ struct TargetLayerPhaseProfile {
     spine_bind_upload_ns: u64,
     attention_resident_compute_ns: u64,
     authoritative_expert_read_prefetch_ns: u64,
+    /// Sub-bucket of `authoritative_expert_read_prefetch_ns`: only the
+    /// blocking authoritative read wait (Metal/CPU tile read, CUDA miss
+    /// read), excluding plan/hint/gate-submit time. Not additive — never
+    /// counted in `attributed_ns`.
+    expert_demand_read_ns: u64,
+    /// Gross wall of the whole tile-read call — the pre-2026-09-02 meaning
+    /// of `expert_demand_read_ns` (§4.1 over-inclusion: prefetch-claim
+    /// waits, cancelled-loser drains, pin-tier memcpys and fan-out
+    /// submission all billed as "demand read"). Kept for one release so
+    /// historical [phases] lines stay comparable. Non-additive.
+    expert_read_gross_ns: u64,
+    /// Non-additive sub-buckets of `expert_plan_ns`: the provider
+    /// prefetch-hint FFI (pilot readback) and the speculative read
+    /// submission that follows it.
+    expert_plan_hint_ns: u64,
+    expert_plan_sched_ns: u64,
+    /// Further non-additive sub-buckets of the same composite, splitting the
+    /// NON-blocking remainder. Measured 2026-08-24: blocking reads are only
+    /// 45% of the composite (567 of 1253 ms/token) — down from 90% when the
+    /// timer landed on 2026-08-19, because the read war cut real I/O waiting
+    /// while this orchestration stayed put. These name what is left.
+    expert_plan_ns: u64,
+    expert_hint_ns: u64,
+    expert_submit_ns: u64,
     expert_kernel_ns: u64,
     source_fence_ns: u64,
     layer_total_ns: u64,
@@ -4743,6 +5491,21 @@ impl TargetLayerPhaseProfile {
         self.authoritative_expert_read_prefetch_ns = self
             .authoritative_expert_read_prefetch_ns
             .saturating_add(other.authoritative_expert_read_prefetch_ns);
+        self.expert_demand_read_ns = self
+            .expert_demand_read_ns
+            .saturating_add(other.expert_demand_read_ns);
+        self.expert_read_gross_ns = self
+            .expert_read_gross_ns
+            .saturating_add(other.expert_read_gross_ns);
+        self.expert_plan_hint_ns = self
+            .expert_plan_hint_ns
+            .saturating_add(other.expert_plan_hint_ns);
+        self.expert_plan_sched_ns = self
+            .expert_plan_sched_ns
+            .saturating_add(other.expert_plan_sched_ns);
+        self.expert_plan_ns = self.expert_plan_ns.saturating_add(other.expert_plan_ns);
+        self.expert_hint_ns = self.expert_hint_ns.saturating_add(other.expert_hint_ns);
+        self.expert_submit_ns = self.expert_submit_ns.saturating_add(other.expert_submit_ns);
         self.expert_kernel_ns = self.expert_kernel_ns.saturating_add(other.expert_kernel_ns);
         self.source_fence_ns = self.source_fence_ns.saturating_add(other.source_fence_ns);
         self.layer_total_ns = self.layer_total_ns.saturating_add(other.layer_total_ns);
@@ -4778,6 +5541,10 @@ impl TargetLayerPhaseProfile {
             "spine_bind_upload_ns": self.spine_bind_upload_ns,
             "attention_resident_compute_ns": self.attention_resident_compute_ns,
             "authoritative_expert_read_prefetch_ns": self.authoritative_expert_read_prefetch_ns,
+            "expert_demand_read_ns": self.expert_demand_read_ns,
+            "expert_read_gross_ns": self.expert_read_gross_ns,
+            "expert_plan_hint_ns": self.expert_plan_hint_ns,
+            "expert_plan_sched_ns": self.expert_plan_sched_ns,
             "expert_kernel_ns": self.expert_kernel_ns,
             "source_fence_ns": self.source_fence_ns,
             "other_control_ns": self.other_control_ns(),
@@ -4849,6 +5616,10 @@ impl TargetExecutionProfile {
                 "spine_bind_upload_ns": totals.spine_bind_upload_ns,
                 "attention_resident_compute_ns": totals.attention_resident_compute_ns,
                 "authoritative_expert_read_prefetch_ns": totals.authoritative_expert_read_prefetch_ns,
+                "expert_demand_read_ns": totals.expert_demand_read_ns,
+                "expert_read_gross_ns": totals.expert_read_gross_ns,
+                "expert_plan_hint_ns": totals.expert_plan_hint_ns,
+                "expert_plan_sched_ns": totals.expert_plan_sched_ns,
                 "expert_kernel_ns": totals.expert_kernel_ns,
                 "source_fence_ns": totals.source_fence_ns,
                 "layer_other_control_ns": totals.other_control_ns(),
@@ -4874,6 +5645,12 @@ struct NativeRunCounters {
     expert_tiles: u64,
     generated_tokens: u64,
     verify_transactions: u64,
+    /// Verify-width histogram, index = draft count (0..=7), 8 = wider.
+    /// A width-1 transaction pays the full multi-row verify machinery to
+    /// certify a single candidate; if that population is large, an
+    /// ordinary T=1 decode plus an argmax comparison is strictly cheaper
+    /// (DS4 PR #833's finding). Measure before building the fast path.
+    verify_width_histogram: [u64; 9],
     verified_draft_tokens: u64,
     accepted_draft_tokens: u64,
     target_profile: TargetExecutionProfile,
@@ -5106,11 +5883,101 @@ fn configured_speculative_max_drafts() -> Result<usize> {
     let configured = std::env::var_os("K3_SPEC_DEPTH")
         .map(|raw| {
             raw.into_string().map_err(|_| {
-                DeltafinError::new("K3_SPEC_DEPTH must be valid UTF-8 and an integer in 1..=8")
+                DeltafinError::new("K3_SPEC_DEPTH must be valid UTF-8 and an integer in 1..=12")
             })
         })
         .transpose()?;
     resolve_speculative_max_drafts(configured.as_deref())
+}
+
+/// K3_QWEN_REARM=<steps>: decode steps to wait before re-arming the Qwen
+/// drafter after it deactivates. Unset or 0 keeps the historical one-way
+/// latch. Values are clamped to 1..=512; a garbage value disables the feature
+/// rather than failing the run, because this sits on the decode hot path.
+fn configured_qwen_rearm_steps() -> usize {
+    std::env::var("K3_QWEN_REARM")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|steps| steps.min(512))
+        .unwrap_or(0)
+}
+
+/// K3_QWEN_REARM_MIN_ACCEPT=<permille 0..=1000>: acceptance floor for a
+/// re-arm (see QwenRequestPolicy::tick). Default 0 = never gate.
+fn configured_qwen_rearm_min_accept() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("K3_QWEN_REARM_MIN_ACCEPT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .map_or(0, |v| v.min(1000))
+    })
+}
+
+/// K3_QWEN_REARM_PROBE=<n>: after n consecutive gate-refused re-arms, allow one
+/// probe re-arm with the acceptance EWMA reset to the bar (see
+/// QwenRequestPolicy::gate_refusals). Default 0 = the gate stays a latch.
+fn configured_qwen_rearm_probe() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("K3_QWEN_REARM_PROBE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// K3_QWEN_ADAPTIVE=1: size the Qwen draft from a rolling accepted-fraction
+/// rather than the stock two-state ladder. Default off, so the shipped
+/// behaviour is unchanged until this is measured.
+fn qwen_adaptive_width_enabled() -> bool {
+    std::env::var("K3_QWEN_ADAPTIVE").is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true"))
+}
+
+/// K3_QWEN_PREFIX_COMMIT=1: on a PARTIAL accept with at least one accepted
+/// draft, commit the accepted prefix of the wide pass instead of cancelling
+/// it and rerunning.
+///
+/// Today Qwen uses the provider's full-commit-only transaction, which
+/// deliberately retains no per-row KDA boundaries (engine.rs admit_verify_width)
+/// and therefore cannot commit a prefix: a partial accept discards the whole
+/// wide pass and re-executes a fresh 93-layer pass over old-pending+accepted.
+/// That rerun is NOT warm -- measured 2026-08-28, a 1-row rerun costs 2.78 s
+/// against 2.79 s for a cold undrafted pass. Across the 200-token champion run
+/// the 14 reruns cost ~53-55 s of 507 s, i.e. **+11.1..12.3% recoverable**.
+/// The count of partial accepts is depth-INVARIANT (14 at depth 8 and 14 at
+/// depth 4), so this does NOT overlap with the K3_SPEC_DEPTH=4 win.
+///
+/// WHY a==0 IS DELIBERATELY EXCLUDED. When zero drafts are accepted the rerun
+/// runs at width 1, which takes the fused single-row kda_decode_one path and
+/// yields `final_kda_state` -- genuinely the canonical T=1 successor state.
+/// Committing `kda_boundaries[0]` instead would substitute a mid-recurrence
+/// snapshot produced by BATCHED projections, and the provider's own tests
+/// record that batched and per-row execution are "algebraically equivalent but
+/// not bit-exact ... float32-ULP drift". Committed KDA recurrent state carries
+/// forward indefinitely, so that drift compounds and could flip a later argmax.
+/// For a>=1 no such canonical alternative exists today -- the emitted token IDs
+/// are already authored by the wide pass, and the engine already commits
+/// unchecked wide-pass cache state on every FULL accept (22 of 36 transactions
+/// in the champion run). So a>=1 changes nothing about which pass authors the
+/// state; a==0 would. Excluding it costs ~3 points of the prize (~+9% remains)
+/// and keeps the exactness contract exactly as strong as today.
+fn qwen_prefix_commit_enabled() -> bool {
+    std::env::var("K3_QWEN_PREFIX_COMMIT")
+        .is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true"))
+}
+
+/// K3_NGRAM_DRAFT=off: suppress the n-gram fallback draft source.
+///
+/// The fallback fires only when the recent suffix repeats, and it is reached
+/// whenever Qwen is absent, latched off, or returned empty without a
+/// confidence stop. Measured 2026-08-28 (200-token raw): 9 n-gram
+/// transactions, 4/72 = 5.6% accepted, ~85 s spent to commit 13 tokens that
+/// would have cost ~36 s undrafted -- i.e. the fallback was ~49 s WORSE than
+/// not drafting at all on that run (~9% of total wall clock).
+fn ngram_draft_enabled() -> bool {
+    !std::env::var("K3_NGRAM_DRAFT")
+        .is_ok_and(|value| matches!(value.trim(), "off" | "0" | "false"))
 }
 
 fn configured_complete_expert_union() -> Result<bool> {
@@ -5136,19 +6003,25 @@ fn resolve_complete_expert_union(configured: Option<&str>) -> Result<bool> {
 
 fn resolve_speculative_max_drafts(configured: Option<&str>) -> Result<usize> {
     let Some(raw) = configured else {
-        // Capacity is not a promise to verify eight rows every step. Each
+        // Capacity is not a promise to verify this many rows every step. Each
         // proposal source starts narrow, widens only after request-local
         // evidence, and still passes the live cache/snapshot admission gate.
-        return Ok(MAX_EXACT_DRAFTS);
+        //
+        // DEFAULT_EXACT_DRAFTS, not MAX_EXACT_DRAFTS: the default feeds
+        // `qwen_verify_reserve`, which reserves ~452.81 MiB per candidate
+        // boundary, so tying it to the ceiling would silently grow the startup
+        // reserve every time the ceiling is raised. Raising the ceiling must be
+        // inert until K3_SPEC_DEPTH asks for it.
+        return Ok(DEFAULT_EXACT_DRAFTS);
     };
-    let drafts = raw
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| DeltafinError::new("K3_SPEC_DEPTH must be an integer in 1..=8"))?;
+    let message = || {
+        DeltafinError::new(format!(
+            "K3_SPEC_DEPTH must be an integer in 1..={MAX_EXACT_DRAFTS}"
+        ))
+    };
+    let drafts = raw.trim().parse::<usize>().map_err(|_| message())?;
     if !(1..=MAX_EXACT_DRAFTS).contains(&drafts) {
-        return Err(DeltafinError::new(
-            "K3_SPEC_DEPTH must be an integer in 1..=8",
-        ));
+        return Err(message());
     }
     Ok(drafts)
 }
@@ -5213,6 +6086,17 @@ fn execute_target_sequence(
     let mut profile = collect_profile.then(TargetExecutionProfile::default);
     spine_pipeline.prime(&layers[0])?;
     let mut trace_pass = router_trace.begin_pass();
+    // K3_ROUTE_ORACLE: this pass's ordinal, aligned with RouterTrace's step
+    // numbering (one increment per execute_target_sequence, starting at 0 —
+    // the recording and the replay run the identical deterministic pass
+    // sequence, verified by byte-diffing two recordings).
+    let oracle_step = crate::route_oracle::route_oracle().map(|_| {
+        static ORACLE_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        ORACLE_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    });
+    // Oracle sets for FUTURE layers live outside pending_expert_prefetch so
+    // they can never suppress the pilot's own L+1 scheduling.
+    let mut oracle_pending: Vec<ExpertPrefetchSet> = Vec::new();
     // Layer 1 is the one routed layer PILOT can never see coming: its hint
     // would have to come from the dense layer 0, which produces no mailbox.
     // The governor's prev-token predictor covers it from the previous pass's
@@ -5225,15 +6109,22 @@ fn execute_target_sequence(
             .and_then(|plan| try_schedule_expert_prefetch(experts, reader, plan)),
         _ => None,
     };
+    // K3_TAIL_ASYNC=1: the previous layer's expert-byte lease, kept alive
+    // while its deferred tail CB may still be reading the spans. Each park
+    // replaces (drops) the one before it, which the provider-side drain
+    // ordering has already proven safe to release.
+    let mut parked_expert_lease: Option<ExpertTileLease> = None;
     for (index, current) in layers.iter().enumerate() {
         let layer_started = collect_profile.then(Instant::now);
         let mut layer_profile = TargetLayerPhaseProfile::default();
         layer_profile.passes = u64::from(collect_profile);
-        let next = layers.get(index + 1);
+        // The pipeline looks past retained layers and keeps up to
+        // K3_SPINE_LOOKAHEAD streamed reads in flight (spine_runtime).
+        let upcoming = &layers[index + 1..];
         let binding = if collect_profile {
-            spine_pipeline.bind_current_profiled(provider, current, next)?
+            spine_pipeline.bind_current_profiled(provider, current, upcoming)?
         } else {
-            spine_pipeline.bind_current(provider, current, next)?
+            spine_pipeline.bind_current(provider, current, upcoming)?
         };
         if collect_profile {
             debug_assert!(binding.profiled);
@@ -5279,6 +6170,8 @@ fn execute_target_sequence(
                         expert_reader,
                         expert_prefetch_reader,
                         &mut pending_expert_prefetch,
+                        oracle_step,
+                        &mut oracle_pending,
                         pilot_gate.as_deref_mut(),
                         expert_heat,
                         expert_pin_tier,
@@ -5287,6 +6180,7 @@ fn execute_target_sequence(
                         metal_source_selector,
                         metal_expert_wrapper_retention,
                         complete_expert_union,
+                        &mut parked_expert_lease,
                         collect_profile.then_some(&mut layer_profile),
                     )?;
                     Ok(())
@@ -5374,6 +6268,13 @@ fn execute_target_sequence(
             "native target ended with an expert prefetch beyond the complete layer roster",
         ));
     }
+    // Oracle sets clamp their targets to <=92 and are consumed at their
+    // layer, so this drain should find nothing; it exists so a logic error
+    // can never leak arena slots across passes.
+    for stale in oracle_pending.drain(..) {
+        crate::route_oracle::note_stale();
+        stale.cancel_and_drain();
+    }
     let tail_started = collect_profile.then(Instant::now);
     let predictions = sequence.finish_tail()?;
     if let Some(started) = tail_started {
@@ -5455,11 +6356,55 @@ fn try_schedule_expert_prefetch(
     plan: ExpertPrefetchPlan,
 ) -> Option<ExpertPrefetchSet> {
     let expected = plan.expert_ids().len();
-    if !(K3_EXPERT_TOP_K..=EXPERT_PREFETCH_MAX_EXPERTS).contains(&expected) {
+    if !(crate::pilot_gate::prefetch_plan_floor()..=EXPERT_PREFETCH_MAX_EXPERTS)
+        .contains(&expected)
+    {
         return None;
     }
+    // SUPPRESSION AT PLANNING TIME. An expert already resident in the Summer
+    // pool needs no read: the consumer will serve it from the slot. Skipping the
+    // submission here is the only place the `openat` is actually avoided —
+    // cancelling the ticket later reclaims the read but not the open, and the
+    // prefetch worker has usually started by then.
+    //
+    // A partial set is safe. Downstream, `read_expert_tile_with_prefetch` matches
+    // tickets to experts and anything without a ticket falls through to the
+    // normal path, where `summer_take_hits` moves it into `pinned` before the
+    // demand union is built. The only exposure is eviction between planning and
+    // consumption: prefetch runs ~4 generations ahead, ~64 inserts against 1,835
+    // slots at 30 GB, so turnover in that window is small — and the failure mode
+    // is a demand read, not incorrect bytes.
+    let wanted: Vec<u16> = plan
+        .expert_ids()
+        .iter()
+        .copied()
+        .filter(|expert| !summer_is_ready(plan.target_layer(), *expert))
+        .collect();
+    let suppressed = expected - wanted.len();
+    if suppressed > 0 {
+        SUMMER_SUPPRESSED.fetch_add(suppressed as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    if wanted.is_empty() {
+        // Every expert of the next layer is already resident. Nothing to submit,
+        // and returning None here is correct: the consumer takes the no-prefetch
+        // path and serves the whole union from the pool.
+        return None;
+    }
+    let expected = wanted.len();
     let mut tickets = Vec::with_capacity(expected);
-    for &expert in plan.expert_ids() {
+    for &expert in &wanted {
+        // K3_SUMMER_READ_INTO_SLOT: a speculative read for an expert that
+        // qualifies for admission lands in its pool slot; the claim publishes.
+        if let Some(ticket) = summer_try_read_into_slot(
+            experts,
+            reader,
+            plan.target_layer(),
+            expert,
+            crate::storage::ReadPriority::Prefetch,
+        ) {
+            tickets.push((expert, ticket));
+            continue;
+        }
         let ticket =
             match experts.try_submit_local_prefetch_one(reader, plan.target_layer(), expert) {
                 Ok(Some(ticket))
@@ -5488,18 +6433,158 @@ fn try_schedule_expert_prefetch(
 
 enum ExpertTileLease {
     Contiguous(ExpertUnionReadBatch),
+    /// K3_ARRIVAL_GROUPS: the whole tile is one in-flight demand union.
+    ContiguousArrival(ExpertUnionReadTicket),
     Scattered {
         layout: ExpertStorageLayout,
         pinned: Vec<(u16, Arc<PageAlignedSpan>)>,
+        /// K3_EXPERT_RETAIN hits: (expert, previous-token allocation, span
+        /// offset in its `other` bytes). Zero-copy keep-alives — see
+        /// retain_expert_tile.
+        retained: Vec<(u16, Arc<RetainedAllocation>, usize)>,
         hits: Vec<ExpertUnionReadBatch>,
         demand: Option<ExpertUnionReadBatch>,
+        /// K3_ARRIVAL_GROUPS: the demand union still in flight (then `demand`
+        /// is None and the finish dispatches by arrival).
+        demand_ticket: Option<ExpertUnionReadTicket>,
     },
 }
 
+/// Adds the elapsed time to a cumulative counter when dropped (covers early
+/// returns and `?` errors in the wave loop).
+struct ArrivalTimer<'a>(&'a std::sync::atomic::AtomicU64, Instant);
+
+impl Drop for ArrivalTimer<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(elapsed_ns(self.1), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl ExpertTileLease {
+    /// Arrival-driven finish: resident spans first, then the demand union in
+    /// `K3_ARRIVAL_GROUPS` waves as experts land; the provider accumulates and
+    /// completes the rows on the final group.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_arrival(
+        sequence: &mut TargetSequence,
+        mailbox: &TargetSequenceMailbox,
+        tile: &ExpertTilePlan,
+        backend: TargetExpertBackend,
+        cpu_threads: usize,
+        metal_source_selector: Option<&str>,
+        retain_metal_wrappers: bool,
+        layout: ExpertStorageLayout,
+        mut resident: Vec<(u16, &[u8])>,
+        ticket: &ExpertUnionReadTicket,
+    ) -> Result<()> {
+        let span_bytes = layout.expert_span_bytes();
+        let demand_ids = ticket.expert_ids();
+        let demand_n = demand_ids.len();
+        resident.sort_unstable_by_key(|(expert, _)| *expert);
+        ARRIVAL_TILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !resident.is_empty() {
+            let ids: Vec<u16> = resident.iter().map(|(expert, _)| *expert).collect();
+            let spans: Vec<&[u8]> = resident.iter().map(|(_, span)| *span).collect();
+            sequence.set_expert_arrival(Some(TargetExpertArrival {
+                partial: true,
+                final_group: demand_n == 0,
+            }));
+            let dispatch_started = Instant::now();
+            ARRIVAL_WAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _dispatch_timer = ArrivalTimer(&ARRIVAL_DISPATCH_NS, dispatch_started);
+            sequence.finish_expert_span_tile(
+                mailbox,
+                tile.first_row,
+                tile.row_count,
+                &ids,
+                &spans,
+                layout,
+                backend,
+                cpu_threads,
+                metal_source_selector,
+                retain_metal_wrappers,
+            )?;
+            if demand_n == 0 {
+                return Ok(());
+            }
+        }
+        let waves = arrival_groups().max(1);
+        let mut dispatched = vec![false; demand_n];
+        let mut dispatched_count = 0_usize;
+        let mut wave = 1_usize;
+        loop {
+            let target = if wave >= waves {
+                demand_n
+            } else {
+                (demand_n * wave).div_ceil(waves).max(1)
+            };
+            let wait_started = Instant::now();
+            let mut ready = ticket.wait_ready_sources(target);
+            ARRIVAL_WAIT_NS.fetch_add(elapsed_ns(wait_started), std::sync::atomic::Ordering::Relaxed);
+            ticket.check_error()?;
+            if ticket.is_ready() {
+                // The whole union has landed: every expert is ready whatever
+                // the per-source tracking says (Shared batches track none).
+                ready = (0..demand_n).collect();
+            }
+            let mut ids: Vec<u16> = Vec::new();
+            for index in ready {
+                if index < demand_n && !dispatched[index] {
+                    dispatched[index] = true;
+                    dispatched_count += 1;
+                    ids.push(demand_ids[index]);
+                }
+            }
+            let last = dispatched_count == demand_n;
+            if ids.is_empty() {
+                if last || ticket.is_ready() {
+                    return Err(DeltafinError::new(
+                        "arrival-driven tile finished without a final expert group",
+                    ));
+                }
+                // Nothing new yet and the read is still in flight: wait for
+                // more arrivals rather than spinning.
+                wave += 1;
+                continue;
+            }
+            ids.sort_unstable();
+            let bytes = ticket.peek_other();
+            let spans = ids
+                .iter()
+                .map(|&expert| canonical_expert_span(demand_ids, bytes, span_bytes, expert))
+                .collect::<Result<Vec<&[u8]>>>()?;
+            sequence.set_expert_arrival(Some(TargetExpertArrival {
+                partial: true,
+                final_group: last,
+            }));
+            ARRIVAL_WAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _dispatch_timer = ArrivalTimer(&ARRIVAL_DISPATCH_NS, Instant::now());
+            sequence.finish_expert_span_tile(
+                mailbox,
+                tile.first_row,
+                tile.row_count,
+                &ids,
+                &spans,
+                layout,
+                backend,
+                cpu_threads,
+                metal_source_selector,
+                retain_metal_wrappers,
+            )?;
+            if last {
+                return Ok(());
+            }
+            wave += 1;
+        }
+    }
+
+    /// Borrowing finish: the caller decides whether the lease (and its
+    /// staged byte spans) drops immediately — today's synchronous contract —
+    /// or is parked one layer under K3_TAIL_ASYNC so a deferred tail CB can
+    /// keep reading the spans after this call returns.
     #[allow(clippy::too_many_arguments)]
     fn finish(
-        self,
+        &self,
         sequence: &mut TargetSequence,
         mailbox: &TargetSequenceMailbox,
         tile: &ExpertTilePlan,
@@ -5521,14 +6606,28 @@ impl ExpertTileLease {
                 metal_source_selector,
                 retain_metal_wrappers,
             ),
+            Self::ContiguousArrival(ticket) => Self::finish_arrival(
+                sequence,
+                mailbox,
+                tile,
+                backend,
+                cpu_threads,
+                metal_source_selector,
+                retain_metal_wrappers,
+                ticket.layout(),
+                Vec::new(),
+                ticket,
+            ),
             Self::Scattered {
                 layout,
                 pinned,
+                retained,
                 hits,
                 demand,
+                demand_ticket,
             } => {
                 let mut hit_spans = Vec::with_capacity(hits.len());
-                for batch in &hits {
+                for batch in hits {
                     let &[expert] = batch.expert_ids() else {
                         return Err(DeltafinError::new(
                             "expert-prefetch hit batch is not a single-expert span",
@@ -5536,14 +6635,56 @@ impl ExpertTileLease {
                     };
                     hit_spans.push((expert, batch.buffers().other()));
                 }
+                let span_bytes = layout.expert_span_bytes();
+                let mut retained_spans = Vec::with_capacity(retained.len());
+                for (expert, allocation, offset) in retained {
+                    let bytes = allocation.other();
+                    let end = offset.checked_add(span_bytes).ok_or_else(|| {
+                        DeltafinError::new("retained expert span offset overflowed")
+                    })?;
+                    if bytes.len() < end {
+                        return Err(DeltafinError::new(
+                            "retained expert span exceeds its keep-alive allocation",
+                        ));
+                    }
+                    retained_spans.push((*expert, &bytes[*offset..end]));
+                }
+                if let Some(ticket) = demand_ticket {
+                    let mut resident: Vec<(u16, &[u8])> = Vec::with_capacity(
+                        pinned.len() + retained_spans.len() + hit_spans.len(),
+                    );
+                    for (expert, span) in pinned {
+                        if span.len() != span_bytes {
+                            return Err(DeltafinError::new(
+                                "pinned expert span disagrees with the corpus span length",
+                            ));
+                        }
+                        resident.push((*expert, &span[..]));
+                    }
+                    resident.extend(retained_spans.iter().copied());
+                    resident.extend(hit_spans.iter().copied());
+                    return Self::finish_arrival(
+                        sequence,
+                        mailbox,
+                        tile,
+                        backend,
+                        cpu_threads,
+                        metal_source_selector,
+                        retain_metal_wrappers,
+                        *layout,
+                        resident,
+                        ticket,
+                    );
+                }
                 let spans = assemble_expert_spans(
                     tile.expert_ids(),
-                    &pinned,
+                    pinned,
+                    &retained_spans,
                     &hit_spans,
                     demand
                         .as_ref()
                         .map(|batch| (batch.expert_ids(), batch.buffers().other())),
-                    layout.expert_span_bytes(),
+                    span_bytes,
                 )?;
                 sequence.finish_expert_span_tile(
                     mailbox,
@@ -5551,7 +6692,7 @@ impl ExpertTileLease {
                     tile.row_count,
                     tile.expert_ids(),
                     &spans,
-                    layout,
+                    *layout,
                     backend,
                     cpu_threads,
                     metal_source_selector,
@@ -5563,13 +6704,15 @@ impl ExpertTileLease {
 }
 
 /// Resolve one span per canonical tile expert from, in order of preference,
-/// the permanent pin tier, single-expert prefetch-hit spans, and the
-/// expert-major demand slab. Pure assembly: every byte source was already
+/// the permanent pin tier, the previous-token retained tier, single-expert
+/// prefetch-hit spans, and the expert-major demand slab. Pure assembly:
+/// every byte source was already
 /// authenticated by the read that produced it, and the caller's canonical ID
 /// order is preserved exactly.
 fn assemble_expert_spans<'a>(
     tile_expert_ids: &[u16],
     pinned: &'a [(u16, Arc<PageAlignedSpan>)],
+    retained: &'a [(u16, &'a [u8])],
     hits: &'a [(u16, &'a [u8])],
     demand: Option<(&'a [u16], &'a [u8])>,
     span_bytes: usize,
@@ -5583,6 +6726,15 @@ fn assemble_expert_spans<'a>(
                 ));
             }
             spans.push(&span[..]);
+            continue;
+        }
+        if let Some(&(_, span)) = retained.iter().find(|(hit_id, _)| *hit_id == expert) {
+            if span.len() != span_bytes {
+                return Err(DeltafinError::new(
+                    "retained expert span disagrees with the corpus span length",
+                ));
+            }
+            spans.push(span);
             continue;
         }
         if let Some(&(_, span)) = hits.iter().find(|(hit_id, _)| *hit_id == expert) {
@@ -5646,21 +6798,1943 @@ fn promote_from_batch(
     if let Some(tier) = expert_pin_tier {
         tier.maybe_promote(layer, batch.expert_ids(), batch.buffers().other());
     }
+    // Summer pool admits from the same authenticated bytes the pin tier sees.
+    summer_admit(
+        layer,
+        batch.expert_ids(),
+        batch.buffers().other(),
+        batch.layout().expert_span_bytes(),
+        batch.layout(),
+    );
+}
+
+
+// ===================== SUMMER POOL (K3_SUMMER_POOL=1) =====================
+//
+// Host-RAM LFRU expert cache. WARP's policy shape, on our hardware.
+//
+// WHY A SECOND POOL RATHER THAN CHANGING RETAIN. The two differ in every
+// dimension that matters, so they must be A/B-able against each other:
+//
+//               retain (prevtok)              summer (this)
+//   storage     detached arena allocations    plain host RAM (PageAlignedSpan)
+//               METAL-WRAPPED  <-- the tax    un-wrapped, never MPS-charged
+//   keyed by    layer -> one generation       (layer, expert) globally
+//   policy      deepest N layers, last token  LFRU: freq primary, recency tiebreak
+//   ceiling     92*16*17.5MB = 25.8 GB hard   budget-bound, no structural cap
+//
+// The Metal wrapping is the measured cost of retain: holding wrapped spans
+// slowed EVERY phase, including ones retention never touches (2026-08-30:
+// demand read 0.645->0.659s, expert kernel 0.244->0.332s, attention
+// 0.475->0.559s). Host copies are not charged against the MPS budget, which
+// is the one residency design the resolution doc left open.
+//
+// HONEST INHERITED RISK, stated where it will be read: the pin tier already
+// showed that "per-expert promotion memcpy made it slower at depth" (see the
+// K3_EXPERT_RETAIN comment below). The Summer pool copies too. What differs is
+// WHAT is copied — the pin tier promotes by heat and holds permanently, this
+// ranks by frequency with recency tiebreak and evicts. If the copy alone is
+// the cost, this will lose the same way, and the [summer] counters will show
+// hits climbing while tok/s does not move.
+
+#[derive(Clone)]
+struct SummerEntry {
+    /// K3_SUMMER_GUARD fingerprint of the bytes at admit time. 0 when the
+    /// guard is off, so the check is skipped rather than falsely tripping.
+    guard: u64,
+    span: Arc<PageAlignedSpan>,
+    /// Index of this entry's region in the arena, returned on eviction.
+    slot: usize,
+    /// Frequency primary. Saturating so a long run cannot wrap a hot entry
+    /// into looking cold.
+    freq: u32,
+    /// Recency tiebreak: the global consult tick at last touch.
+    last: u64,
+}
+
+#[derive(Default)]
+struct SummerPool {
+    map: std::collections::HashMap<(u32, u16), SummerEntry>,
+    /// K3_SUMMER_READ_INTO_SLOT: slots reserved for a read in flight; not
+    /// served, not evictable, published on validated completion.
+    pending: std::collections::HashMap<(u32, u16), (Arc<PageAlignedSpan>, usize)>,
+    bytes: u64,
+    tick: u64,
+    /// xorshift state. Deterministic on purpose: an eviction policy that
+    /// samples must still produce reproducible arms.
+    rng: u64,
+    /// Recycled buffers. Evicted spans land here instead of being freed, and
+    /// admissions take from here instead of allocating.
+    ///
+    /// This is the fixed-arena requirement in practice. The first build called
+    /// `std::alloc::alloc` per admission and `dealloc` per eviction: ~45,000
+    /// fresh 17.5 MB mappings in a single 40-token run, each faulted in page
+    /// by page during the memcpy that followed. Recycling writes into memory
+    /// that is already mapped and already resident.
+    ///
+    /// A buffer is only recycled when `Arc::strong_count == 1`, i.e. no lease
+    /// still holds it. That check is what makes reuse safe without an explicit
+    /// pin count: a span handed to the execution path keeps its refcount above
+    /// one until the lease drops.
+    free: Vec<Arc<PageAlignedSpan>>,
+    /// Free arena slot indices.
+    ///
+    /// FIFO (`VecDeque`), not LIFO. A `Vec` with push/pop hands the most
+    /// recently returned slot to the very next insert, with a zero-length gap.
+    /// The arena is registered with Metal no-copy, so a returned slot can still
+    /// be referenced by an in-flight command buffer — LIFO laps immediately and
+    /// the next writer overwrites bytes a kernel is still reading. That is the
+    /// leading candidate for `full-target Qwen verifier rerun disagreed with the
+    /// saved authoritative prefix`, which reproduced at token 22 in both repeats
+    /// of a 16 GiB pool while only 420 of 979 slots were ever used — capacity
+    /// pressure was never involved.
+    ///
+    /// The worst case is the redundant-insert path below: a slot is popped,
+    /// found already present in the map, and pushed straight back. Under LIFO
+    /// the next pop returns that exact slot.
+    ///
+    /// FIFO gives a returned slot the whole free list to traverse before reuse,
+    /// which is `slots - live` inserts of separation. K3_SUMMER_SLOT_LIFO=1
+    /// restores the old behaviour so the bug can be demonstrated on demand.
+    free_slots: std::collections::VecDeque<usize>,
+}
+
+fn summer_pool_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // K3_EXPERT_RAM_CACHE is the name of record; K3_SUMMER_POOL is kept as
+        // an alias so arms recorded before the rename stay reproducible.
+        ["K3_EXPERT_RAM_CACHE", "K3_SUMMER_POOL"]
+            .iter()
+            .any(|name| std::env::var(name).is_ok_and(|value| value == "1"))
+    })
+}
+
+/// Byte ceiling for the Summer pool (K3_SUMMER_GB, default 8, clamped 1..=64).
+/// Unlike retain's cap this is a REAL budget: the policy has no structural
+/// ceiling, so every extra GiB buys coverage until the host runs out.
+fn summer_cap_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        // Range 4..=40 GiB per the brief: below 4 GiB the pool cannot hold a
+        // useful fraction of a token, and 40 GiB is the measured headroom on a
+        // 128 GiB host with the 50.7 GiB spine resident.
+        ["K3_EXPERT_RAM_CACHE_GB", "K3_SUMMER_GB"]
+            .iter()
+            .find_map(|name| std::env::var(name).ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map_or(8 << 30, |gb| gb.clamp(4, 40) << 30)
+    })
+}
+
+/// Entries sampled per eviction. 16 is WARP's figure and also our TOP_K, so a
+/// sample is the same width as a barrier.
+const SUMMER_SAMPLE: usize = 16;
+
+/// K3_EXPERT_RAM_CACHE_MIN_HITS: admit an expert only after it has been routed
+/// this many times in the session. Default 1 = admit on first sight, which is
+/// the behaviour every measurement so far used.
+///
+/// Why this is the highest-value knob in the cache. Measured over a 40-token
+/// finance-style generation (router trace, 92 x 896 grid): of 30,111 experts routed,
+/// **12,661 were routed exactly once** — 42% of every admission. Each cost a
+/// 17.5 MB memcpy and an eviction and could never be hit, because there was no
+/// second route to serve. Consolidated over four prompt variants the pattern
+/// holds: 32% of touched cells appear in only one of the four runs.
+///
+/// Admission is where the cache spends; a first-sight admission of a
+/// single-use expert is pure loss. Counting first and admitting second turns
+/// that loss off without changing what the cache can serve.
+///
+/// Sizing, from the same 4-run trace (160 tokens, 420,992 routes):
+///   >1x   35,677 experts  583.0 GiB  89.0% of routes
+///   >5x   18,105 experts  295.9 GiB  79.8%
+///   >10x   9,831 experts  160.7 GiB  66.8%
+///   >50x   1,238 experts   20.2 GiB  27.9%   <- the band that fits this host
+fn summer_min_hits() -> u32 {
+    static MIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("K3_EXPERT_RAM_CACHE_MIN_HITS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map_or(2, |n| n.clamp(1, 255))
+    })
+}
+
+/// Ceiling for the warm-up ramp (K3_EXPERT_RAM_CACHE_MAX_HITS, default 50).
+fn summer_max_hits() -> u32 {
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("K3_EXPERT_RAM_CACHE_MAX_HITS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map_or(50, |n| n.clamp(1, 255))
+    })
+}
+
+/// WARM-UP RAMP: the admission bar is the pool's own occupancy in GiB, clamped
+/// to [min_hits, max_hits].
+///
+///     empty pool   -> admit at  2x   (slots are free; filling costs nothing)
+///     10 GiB used  -> admit at 10x
+///     20 GiB used  -> admit at 20x
+///     at ceiling   -> admit at 50x   (a late admission must EVICT something,
+///                                     so it has to out-earn what it displaces)
+///
+/// Why occupancy and not a session route count. An absolute threshold is
+/// coupled to session length: measured on the finance-style traces, 50x admits 1,238
+/// experts over 160 tokens but only **42** over 40 tokens — a single request
+/// would fill 0.7 GiB of a 24 GiB pool and serve nothing. Occupancy is
+/// self-scaling: a short session never fills the pool, so the bar stays low
+/// and the cache is useful immediately; a long session tightens on its own.
+///
+/// The economics it encodes, from the 4-run trace (420,992 routes):
+///     band     experts   RAM      cacheable   traffic/expert
+///     1x        10,485   171.3 GiB      0 GiB     0.016 GiB   <- never admit
+///     11-50x     8,593   140.4 GiB  2,677 GiB     0.328 GiB
+///     >=51x      1,238    20.2 GiB  1,917 GiB     1.565 GiB   <- 95:1 return
+/// Return a slot to the free list. FIFO by default (`push_back`), so a slot
+/// traverses the whole list before reuse; K3_SUMMER_SLOT_LIFO=1 restores the
+/// original `push` for A/B demonstration of the use-after-recycle bug.
+/// K3_SUMMER_GUARD=1 — per-slot integrity guard, off by default.
+///
+/// The pool can serve wrong bytes: `full-target Qwen verifier rerun disagreed
+/// with the saved authoritative prefix`, reproducible at token 22 in both
+/// repeats of a 16 GiB pool. Two hypotheses are already dead — key collision
+/// (the map is `HashMap<(u32,u16)>`, no bit packing) and use-after-recycle
+/// (FIFO and LIFO free lists fail identically, same token, same counters).
+///
+/// This separates the two remaining classes without guessing:
+///   WRONG RECORD  -> the guard's key does not match the key being served.
+///                    The map points at a slot holding a different expert.
+///   TORN/STALE    -> the key matches but the fingerprint does not. Someone
+///                    wrote into the slot after it was admitted.
+///
+/// The fingerprint is a sample, not a full hash: 17.5 MB per serve would
+/// dominate the measurement. First 4 KB + last 4 KB + length catches a
+/// whole-record overwrite and any torn write at either edge; it will miss a
+/// surgical middle-only corruption, which is noted rather than pretended away.
+fn summer_guard_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_GUARD").is_ok_and(|v| v == "1"))
+}
+
+static SUMMER_GUARD_KEYMISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_GUARD_HASHMISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_GUARD_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn summer_guard_report() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        SUMMER_GUARD_CHECKED.load(Ordering::Relaxed),
+        SUMMER_GUARD_KEYMISS.load(Ordering::Relaxed),
+        SUMMER_GUARD_HASHMISS.load(Ordering::Relaxed),
+    )
+}
+
+fn summer_fingerprint(span: &PageAlignedSpan) -> u64 {
+    let b: &[u8] = span;   // PageAlignedSpan: Deref<Target=[u8]>
+    let n = b.len();
+    if n == 0 {
+        return 0;
+    }
+    let head = &b[..n.min(4096)];
+    let tail = &b[n.saturating_sub(4096)..];
+    let mut h: u64 = 0xcbf29ce484222325 ^ (n as u64);
+    for chunk in [head, tail] {
+        for w in chunk.chunks(8) {
+            let mut v = [0u8; 8];
+            v[..w.len()].copy_from_slice(w);
+            h ^= u64::from_le_bytes(v);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+/// K3_SUMMER_WIDE_ADMIT=1 (2026-09-02): let the dynamic pool COUNT and ADMIT
+/// routes from wide DECODE tiles (drafted verify unions). With the drafter on
+/// every decode tile is wider than TOP_K, so the TOP_K admission gate meant
+/// the pool never counted a single route in the drafted regime (France 17-tok:
+/// 88 inserts, 0 hits, 8,107 gated). Prefill unions stay excluded (the 1.03 TB
+/// churn case). Sound because promote_from_batch hands summer_admit the
+/// batch's OWN ids over the batch's OWN expert-major slab, so the positional
+/// mapping never drifts. Default off.
+fn summer_wide_admit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_WIDE_ADMIT").is_ok_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// Set per layer by finish_expert_mailbox: true while the tiles being
+    /// read belong to a DECODE (non-prefill) sequence.
+    static SUMMER_DECODE_TILE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn summer_set_decode_tile(decode: bool) {
+    SUMMER_DECODE_TILE.with(|cell| cell.set(decode));
+}
+
+fn summer_decode_tile() -> bool {
+    SUMMER_DECODE_TILE.with(|cell| cell.get())
+}
+
+fn summer_full_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_FULL_ONLY").is_ok_and(|v| v == "1"))
+}
+
+/// K3_SUMMER_NARROW_ONLY=1 — serve pool hits only into single-position tiles
+/// (canonical union <= top-16); wide (drafted multi-position) tiles fall
+/// through to the ordinary demand path untouched. Diagnostic for the
+/// 2026-09-01 corruption matrix: drafter-off serves were byte-exact at 10,060
+/// hits while every drafter-on arm diverged at every pool size, with admits
+/// proven clean — so the suspect is consumption of pool spans by
+/// multi-position tiles. Exact output under drafting with this gate on
+/// confirms that localisation.
+fn summer_narrow_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_NARROW_ONLY").is_ok_and(|v| v == "1"))
+}
+
+static SUMMER_WIDE_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn summer_slot_lifo() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_SLOT_LIFO").is_ok_and(|v| v == "1"))
+}
+
+/// K3_SUMMER_PRELOAD=<manifest path> — static-band mode. The pool is filled
+/// once at startup from a ranked "layer expert" manifest and dynamic
+/// admission is disabled, so decode pays zero insert copies and zero churn;
+/// the pool serves exactly the manifest. Composes with K3_SUMMER_SUPPRESS:
+/// preloaded entries are READY from token 0, so their prefetches are
+/// skipped at planning for the whole run. Requires K3_SUMMER_POOL=1.
+fn summer_preload_manifest() -> Option<&'static str> {
+    static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::var("K3_SUMMER_PRELOAD").ok().filter(|v| !v.is_empty()))
+        .as_deref()
+}
+
+/// Fill the pool from the manifest through the ordinary authenticated
+/// single-expert read path. Startup-only: runs before decode, so the copy
+/// into the arena is charged to first-token wall, never to token time.
+/// Fail-soft per entry; a missing or short manifest loads what it can.
+fn summer_preload(experts: &RawExpertCorpus, reader: &Reader) {
+    let Some(path) = summer_preload_manifest() else { return };
+    if !summer_pool_enabled() {
+        eprintln!("[native] summer-preload: IGNORED — requires K3_SUMMER_POOL=1");
+        return;
+    }
+    let Some(arena) = summer_arena() else {
+        eprintln!("[native] summer-preload: IGNORED — no arena");
+        return;
+    };
+    let span_bytes = experts.layout().expert_span_bytes();
+    let manifest = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("[native] summer-preload: cannot read {path}: {error}");
+            return;
+        }
+    };
+    let started = std::time::Instant::now();
+    let mut loaded = 0_usize;
+    let mut failed = 0_usize;
+    let mut full = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(layer), Some(expert)) = (
+            parts.next().and_then(|v| v.parse::<u32>().ok()),
+            parts.next().and_then(|v| v.parse::<u16>().ok()),
+        ) else {
+            failed += 1;
+            continue;
+        };
+        if summer_preload_dynamic() {
+            let index = (layer as usize) * 1024 + (expert as usize & 1023);
+            if let Some(slot) = summer_seen().get(index) {
+                slot.store(summer_min_hits().min(255) as u8, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let reserved = {
+            let mut pool = match summer_pool().lock() {
+                Ok(pool) => pool,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if pool.map.contains_key(&(layer, expert)) {
+                continue;
+            }
+            match pool.free_slots.pop_front() {
+                Some(slot) => {
+                    // SAFETY: slot regions are disjoint and this slot came off
+                    // the free list, so no live entry or lease references it.
+                    unsafe {
+                        PageAlignedSpan::view_into(arena.base.add(slot * span_bytes), span_bytes)
+                    }
+                    .map(|span| (span, slot))
+                }
+                None => {
+                    full = true;
+                    None
+                }
+            }
+        };
+        let Some((span, slot)) = reserved else {
+            if full {
+                break;
+            }
+            failed += 1;
+            continue;
+        };
+        let ok = experts
+            .read_union(reader, layer, &[expert])
+            .ok()
+            .filter(|batch| batch.buffers().other().len() == span_bytes)
+            .is_some_and(|batch| unsafe { span.fill_from(batch.buffers().other()) });
+        let mut pool = match summer_pool().lock() {
+            Ok(pool) => pool,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if ok {
+            pool.bytes += span.len() as u64;
+            pool.map.insert(
+                (layer, expert),
+                SummerEntry {
+                    guard: if summer_guard_enabled() { summer_fingerprint(&span) } else { 0 },
+                    span,
+                    slot,
+                    freq: 1,
+                    last: 0,
+                },
+            );
+            loaded += 1;
+        } else {
+            summer_slot_return(&mut pool.free_slots, slot);
+            failed += 1;
+        }
+    }
+    eprintln!(
+        "[native] summer-preload: loaded={loaded} failed={failed} full={full} \
+bytes={:.1}GB elapsed={:.1}s manifest={path}",
+        loaded as f64 * span_bytes as f64 / 1e9,
+        started.elapsed().as_secs_f64(),
+    );
+}
+
+fn summer_slot_return(free: &mut std::collections::VecDeque<usize>, slot: usize) {
+    if summer_slot_lifo() {
+        free.push_front(slot);
+    } else {
+        free.push_back(slot);
+    }
+}
+
+fn summer_admit_bar(resident_bytes: u64) -> u32 {
+    let lo = summer_min_hits();
+    let hi = summer_max_hits().max(lo);
+    ((resident_bytes >> 30) as u32).clamp(lo, hi)
+}
+
+/// Per-(layer, expert) SERVED counts — how many times each expert was handed
+/// to the execution path from the pool rather than read from SSD.
+///
+/// The aggregate counters answer "how much" (hits, served bytes); they cannot
+/// answer "which", and the two have very different implications. 4,509 hits
+/// spread thinly over 3,000 experts is a smear that no cache can exploit;
+/// the same 4,509 concentrated on 200 experts is a hot core worth pinning
+/// statically with no eviction machinery at all. Without this array the two
+/// are indistinguishable in the logs.
+fn summer_served_per() -> &'static [std::sync::atomic::AtomicU32] {
+    static SERVED: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU32>> =
+        std::sync::OnceLock::new();
+    SERVED.get_or_init(|| (0..93 * 1024).map(|_| std::sync::atomic::AtomicU32::new(0)).collect())
+}
+
+/// Dump the served histogram as CSV when K3_EXPERT_RAM_CACHE_SERVED_OUT is set.
+/// Only non-zero rows are written: the grid is 82,432 cells and a run typically
+/// serves a few thousand.
+fn summer_dump_served() {
+    let Ok(path) = std::env::var("K3_EXPERT_RAM_CACHE_SERVED_OUT") else {
+        return;
+    };
+    if path.trim().is_empty() {
+        return;
+    }
+    use std::io::Write;
+    let served = summer_served_per();
+    let mut out = String::from("layer,expert,served\n");
+    let mut rows = 0u64;
+    for (index, slot) in served.iter().enumerate() {
+        let n = slot.load(std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        rows += 1;
+        out.push_str(&format!("{},{},{}\n", index / 1024, index % 1024, n));
+    }
+    match std::fs::File::create(&path).and_then(|mut f| f.write_all(out.as_bytes())) {
+        Ok(()) => eprintln!("[summer-served] wrote {rows} rows -> {path}"),
+        Err(error) => eprintln!("[summer-served] FAILED to write {path}: {error}"),
+    }
+}
+
+/// Session route counts per (layer, expert), saturating at 255.
+///
+/// 92 layers x 1024 expert slots x 1 byte = 94 KB — small enough to be
+/// unconditional, so the counter is available even when the cache is off and
+/// the gate can be reasoned about from a control arm's telemetry.
+fn summer_seen() -> &'static [std::sync::atomic::AtomicU8] {
+    static SEEN: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU8>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| (0..93 * 1024).map(|_| std::sync::atomic::AtomicU8::new(0)).collect())
+}
+
+/// Bump and return this expert's session route count (saturating).
+fn summer_note_route(layer: u32, expert: u16) -> u32 {
+    let index = (layer as usize) * 1024 + (expert as usize & 1023);
+    let seen = summer_seen();
+    let Some(slot) = seen.get(index) else { return u32::MAX };
+    let prior = slot.load(std::sync::atomic::Ordering::Relaxed);
+    if prior < u8::MAX {
+        slot.store(prior + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+    prior as u32 + 1
+}
+
+/// One contiguous, page-aligned host arena for the whole cache, allocated once
+/// and registered with Metal once.
+///
+/// This is the difference that matters. Metal keys its no-copy wrap cache by
+/// RAW POINTER (metal_moe.mm wrap_blob) and issues one `useResource` per
+/// distinct buffer per dispatch. Individually-allocated spans therefore cost
+/// one wrap and one residency call EACH: measured, g_cache grew 112 -> 1364
+/// entries and expert_kernel rose 13.75s -> 18.74s (+36%) purely with hits
+/// served, at copies=0. One registered arena costs one wrap and one residency
+/// call no matter how large the cache is.
+struct SummerArena {
+    base: *mut u8,
+    len: usize,
+    slots: usize,
+}
+// SAFETY: the arena is allocated once and never moved or freed; slot regions
+// are disjoint and each is written only by the thread holding its reservation.
+unsafe impl Send for SummerArena {}
+unsafe impl Sync for SummerArena {}
+
+fn summer_arena() -> Option<&'static SummerArena> {
+    static ARENA: std::sync::OnceLock<Option<SummerArena>> = std::sync::OnceLock::new();
+    ARENA
+        .get_or_init(|| {
+            if !summer_pool_enabled() {
+                return None;
+            }
+            let span = ExpertStorageLayout::RawV1.expert_span_bytes();
+            let slots = (summer_cap_bytes() / span.max(1) as u64) as usize;
+            if slots == 0 {
+                return None;
+            }
+            let len = slots.checked_mul(span)?;
+            let layout = std::alloc::Layout::from_size_align(len, 16 * 1024).ok()?;
+            // SAFETY: non-zero size, 16 KiB alignment (Metal requires page
+            // alignment for newBufferWithBytesNoCopy).
+            let base = unsafe { std::alloc::alloc_zeroed(layout) };
+            if base.is_null() {
+                return None;
+            }
+            let rc = crate::provider::register_metal_arena(base as *const u8, len as u64);
+            eprintln!(
+                "[native] summer-arena: slots={slots} bytes={:.1}GB metal_register_rc={rc}",
+                len as f64 / 1e9
+            );
+            if rc != 0 {
+                // Registration failed: the arena still works as plain host RAM,
+                // it just pays the per-pointer wrap tax. Reported, never silent.
+                eprintln!("[native] summer-arena: NOT registered with Metal (rc={rc}) — \
+per-span wraps will apply");
+            }
+            Some(SummerArena { base, len, slots })
+        })
+        .as_ref()
+}
+
+fn summer_pool() -> &'static std::sync::Mutex<SummerPool> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<SummerPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let mut pool = SummerPool { rng: 0x2026_0831, ..Default::default() };
+        // Every slot starts free; entries are VIEWS into the arena, so nothing
+        // is ever allocated or freed during decode.
+        if let Some(arena) = summer_arena() {
+            pool.free_slots = (0..arena.slots).collect();
+        }
+        std::sync::Mutex::new(pool)
+    })
+}
+
+static SUMMER_CONSULTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_WANTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_INSERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_RECYCLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_PINNED_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_GATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Most recent admission bar, so the ramp is observable rather than inferred.
+static SUMMER_BAR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Resolved Summer state for the startup line: (enabled, cap GiB, sample width).
+pub fn summer_config_report() -> (bool, u64, usize) {
+    (summer_pool_enabled(), summer_cap_bytes() >> 30, SUMMER_SAMPLE)
+}
+
+/// End-of-run Summer summary: (consults, wanted, hits, inserts, evictions,
+/// bytes served from RAM, bytes copied in, live entries, live bytes).
+pub fn summer_run_report() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    let (entries, bytes) = summer_pool()
+        .lock()
+        .map(|p| (p.map.len() as u64, p.bytes))
+        .unwrap_or((0, 0));
+    (
+        SUMMER_CONSULTS.load(Ordering::Relaxed),
+        SUMMER_WANTED.load(Ordering::Relaxed),
+        SUMMER_HITS.load(Ordering::Relaxed),
+        SUMMER_INSERTS.load(Ordering::Relaxed),
+        SUMMER_EVICTIONS.load(Ordering::Relaxed),
+        SUMMER_SERVED.load(Ordering::Relaxed),
+        SUMMER_COPIED.load(Ordering::Relaxed),
+        entries,
+        bytes,
+        SUMMER_RECYCLED.load(Ordering::Relaxed),
+        SUMMER_ALLOCS.load(Ordering::Relaxed),
+        SUMMER_PINNED_SKIPS.load(Ordering::Relaxed),
+        SUMMER_GATED.load(Ordering::Relaxed),
+        SUMMER_BAR.load(Ordering::Relaxed),
+    )
+}
+
+/// Partition `wanted` against the Summer pool. Returns host-RAM spans, which
+/// the caller merges into the lease's `pinned` slot — an existing, already
+/// plumbed, un-wrapped path.
+/// Suppressed prefetch submissions — reads the cache made unnecessary.
+static SUMMER_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn summer_suppressed_report() -> u64 {
+    SUMMER_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Is this expert already resident? A PEEK: it does not count a consult, does
+/// not count a hit, and does not touch recency — so calling it at planning time
+/// cannot distort the hit-rate telemetry that the same pool reports later.
+///
+/// WHY THIS EXISTS. The cache consult (`summer_take_hits`) runs when the tile is
+/// CONSUMED, which is downstream of prefetch scheduling. Demand reads were
+/// already suppressed correctly — a hit is moved into `pinned` and never enters
+/// `streamed`. But the PREFETCH pool had already opened and read the same expert
+/// several layers earlier, so the bytes were paid for anyway: at a 10.9% hit rate
+/// `expert file opens` moved 77,804 -> 77,789. Fifteen opens out of 77,800.
+/// That is why a cache with a real hit rate still cost 21%: it was paying for the
+/// read AND the copy, and serving from RAM only after both.
+///
+/// Prior art in-tree: the retain path tries ticket CANCELLATION
+/// (`engine.rs:6934`) and it does not help — cancellation reclaims the read but
+/// not the `openat`, and the prefetch thread has often already started. The
+/// suppression has to happen at planning time, before submission.
+/// K3_SUMMER_SUPPRESS=1 — DEFAULT OFF, and off for a correctness reason.
+///
+/// Enabled on 2026-08-31 it produced:
+///   `deltafin: full-target Qwen verifier rerun disagreed with the saved
+///    authoritative prefix`
+/// at 40 tokens, with `suppressed=645` proving the skip had acted. The nine
+/// summer arms recorded before the change abort zero times, so the divergence is
+/// this code, not a pre-existing pool defect.
+///
+/// MECHANISM (unproven in detail, but the shape is clear): suppressing the
+/// prefetch for a resident expert leaves that expert with no ticket. If the entry
+/// is then recycled before the tile is consumed — the same arm shows
+/// `recycled=379` and `gated=13151`, so the pool churns hard at 8 GiB — the
+/// consumer must fall back to a demand read. The brief judged this "low risk"
+/// on ~64 inserts against 1,835 slots at 30 GB; at 8 GiB with this churn it is
+/// evidently not. Either the fallback does not fire, or a partial
+/// `ExpertPrefetchSet` violates an invariant downstream.
+///
+/// The correct fix is to PIN the entry when its prefetch is suppressed and
+/// release at consume, so the bytes cannot vanish between planning and use.
+/// Until that exists this stays off: a cache that is fast and wrong is worse
+/// than one that is slow and right.
+/// K3_SUMMER_MODEL=1 (2026-09-02, KP's pivot-derived model). Eviction ranks by
+/// the SESSION ROUTE COUNT (the u8 table every routed expert bumps), not by
+/// served-hit freq, with LRU as the tiebreak, scanned over the whole pool —
+/// sampling was WARP's answer for caches 100x larger. A PROTECTED tier:
+/// entries routed >= K3_SUMMER_PROTECT_HITS (default 8) can only be displaced
+/// by a higher-count candidate, and only once the tier holds
+/// K3_SUMMER_PROTECT_SLOTS (default 400) entries or probation is empty; a
+/// probationary candidate that finds no probationary victim is DECLINED.
+/// Counts (table + entry freq) halve every K3_SUMMER_HALFLIFE_TOKENS generated
+/// tokens (default 0 = never) so a prompt shift turns the pool over.
+/// K3_SUMMER_PRELOAD_DYNAMIC=1 lets dynamic admission run on top of a preload
+/// manifest; seeds enter as MIN_HITS-count probationers.
+fn summer_model_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_MODEL").is_ok_and(|v| v == "1"))
+}
+
+fn summer_protect_hits() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("K3_SUMMER_PROTECT_HITS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(8, |n| n.clamp(2, 255))
+    })
+}
+
+fn summer_protect_slots() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("K3_SUMMER_PROTECT_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(400)
+    })
+}
+
+fn summer_halflife_tokens() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("K3_SUMMER_HALFLIFE_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn summer_preload_dynamic() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_PRELOAD_DYNAMIC").is_ok_and(|v| v == "1"))
+}
+
+fn summer_seen_count(layer: u32, expert: u16) -> u32 {
+    let index = (layer as usize) * 1024 + (expert as usize & 1023);
+    summer_seen()
+        .get(index)
+        .map_or(0, |slot| slot.load(std::sync::atomic::Ordering::Relaxed) as u32)
+}
+
+static SUMMER_AGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SUMMER_TOPUP_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Rule 2's memory: halve every session route count and every entry's
+/// served freq once per half-life of generated tokens. Called per chunk.
+fn summer_age_tick(generated_tokens: u64) {
+    use std::sync::atomic::Ordering;
+    let half = summer_halflife_tokens();
+    if half == 0 || !summer_pool_enabled() {
+        return;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if generated_tokens < last.saturating_add(half) {
+        return;
+    }
+    LAST.store(generated_tokens, Ordering::Relaxed);
+    for slot in summer_seen() {
+        let v = slot.load(Ordering::Relaxed);
+        if v != 0 {
+            slot.store(v / 2, Ordering::Relaxed);
+        }
+    }
+    if let Ok(mut pool) = summer_pool().lock() {
+        for entry in pool.map.values_mut() {
+            entry.freq /= 2;
+        }
+    }
+    SUMMER_AGED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Entries currently in the protected tier (route count >= PROTECT_HITS).
+fn summer_protected_count() -> usize {
+    if !summer_pool_enabled() {
+        return 0;
+    }
+    let protect = summer_protect_hits();
+    match summer_pool().lock() {
+        Ok(pool) => pool
+            .map
+            .keys()
+            .filter(|(l, e)| summer_seen_count(*l, *e) >= protect)
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// K3_SUMMER_READ_INTO_SLOT=1 (2026-09-02, the 08-31 brief built): an
+/// expert that qualifies for admission is read by the storage workers
+/// DIRECTLY into its reserved pool slot (storage.rs borrowed destination),
+/// served from that slot this tile, and published — no memcpy on any path.
+/// The copying admit path is disabled while this is on (`copied` -> 0).
+/// K3_SUMMER_PREFILL_ADMIT=1 (2026-09-03): let read-into-slot admit from
+/// PREFILL tiles too. Measured: a ~830-token prefill re-reads each layer's
+/// experts once per 64-position tile (807 s, ~10 TB); a pool that holds a
+/// layer's working set turns the later tiles of the same layer into hits.
+/// Use with MIN_HITS=1 MAX_HITS=1 (admit on first touch) and a cap that
+/// holds one layer's unique experts. Default off.
+fn summer_prefill_admit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_PREFILL_ADMIT").is_ok_and(|v| v == "1"))
+}
+
+fn summer_read_into_slot_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_READ_INTO_SLOT").is_ok_and(|v| v == "1"))
+}
+
+static SUMMER_INTO_SUBMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SUMMER_INTO_PUBLISHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SUMMER_INTO_ABORTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Make room for one span (caller holds the pool lock). Mirrors the
+/// eviction in summer_admit (model + sampled variants); true = declined.
+fn summer_evict_for(pool: &mut SummerPool, span_bytes: usize, cap: u64, seen: u32) -> bool {
+    use std::sync::atomic::Ordering;
+    while pool.bytes + span_bytes as u64 > cap && !pool.map.is_empty() {
+        let mut victim: Option<((u32, u16), u32, u64)> = None;
+        let n = pool.map.len();
+        if summer_model_enabled() {
+            let protect = summer_protect_hits();
+            let cap_slots = summer_protect_slots();
+            let protected_n = pool
+                .map
+                .keys()
+                .filter(|(l, e)| summer_seen_count(*l, *e) >= protect)
+                .count();
+            let probation_empty = protected_n == n;
+            let allow_protected_victims =
+                seen >= protect && (protected_n >= cap_slots || probation_empty);
+            for (&key, entry) in pool.map.iter() {
+                if Arc::strong_count(&entry.span) > 1 {
+                    SUMMER_PINNED_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let count = summer_seen_count(key.0, key.1);
+                if count >= protect && !(allow_protected_victims && count < seen) {
+                    continue;
+                }
+                let better = match victim {
+                    None => true,
+                    Some((_, f, l)) => count < f || (count == f && entry.last < l),
+                };
+                if better {
+                    victim = Some((key, count, entry.last));
+                }
+            }
+            if victim.is_none() {
+                return true;
+            }
+        } else {
+            for _ in 0..SUMMER_SAMPLE.min(n) {
+                pool.rng ^= pool.rng << 13;
+                pool.rng ^= pool.rng >> 7;
+                pool.rng ^= pool.rng << 17;
+                let skip = (pool.rng as usize) % n;
+                if let Some((&key, entry)) = pool.map.iter().nth(skip) {
+                    if Arc::strong_count(&entry.span) > 1 {
+                        SUMMER_PINNED_SKIPS.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let better = match victim {
+                        None => true,
+                        Some((_, f, l)) => entry.freq < f || (entry.freq == f && entry.last < l),
+                    };
+                    if better {
+                        victim = Some((key, entry.freq, entry.last));
+                    }
+                }
+            }
+            if victim.is_none() {
+                return true;
+            }
+        }
+        let Some((key, _, _)) = victim else { return true };
+        if let Some(old) = pool.map.remove(&key) {
+            pool.bytes = pool.bytes.saturating_sub(old.span.len() as u64);
+            SUMMER_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+            summer_slot_return(&mut pool.free_slots, old.slot);
+        }
+    }
+    false
+}
+
+/// Admission decision + slot reservation for a read-into-slot: the expert's
+/// NEXT route count (peeked, not bumped — promote_from_batch bumps once per
+/// tile) must clear the admission bar; the slot is parked in `pending`.
+fn summer_into_slot_candidate(
+    layer: u32,
+    expert: u16,
+    span_bytes: usize,
+) -> Option<(Arc<PageAlignedSpan>, usize)> {
+    if !summer_read_into_slot_enabled() || !summer_pool_enabled() || span_bytes == 0 {
+        return None;
+    }
+    if summer_preload_manifest().is_some() && !summer_preload_dynamic() {
+        return None;
+    }
+    if !summer_decode_tile() && !summer_prefill_admit_enabled() {
+        return None;
+    }
+    let seen = summer_seen_count(layer, expert).saturating_add(1);
+    let arena = summer_arena()?;
+    let cap = summer_cap_bytes();
+    let mut pool = match summer_pool().lock() {
+        Ok(pool) => pool,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if seen < summer_admit_bar(pool.bytes) {
+        SUMMER_GATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    if pool.map.contains_key(&(layer, expert)) || pool.pending.contains_key(&(layer, expert)) {
+        return None;
+    }
+    if summer_evict_for(&mut pool, span_bytes, cap, seen) {
+        SUMMER_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let slot = pool.free_slots.pop_front()?;
+    // SAFETY: the arena outlives the process, slot regions are disjoint, and
+    // this slot was on the free list so no live entry or lease references it.
+    let span = unsafe { PageAlignedSpan::view_into(arena.base.add(slot * span_bytes), span_bytes) };
+    let Some(span) = span else {
+        summer_slot_return(&mut pool.free_slots, slot);
+        return None;
+    };
+    pool.pending.insert((layer, expert), (Arc::clone(&span), slot));
+    Some((span, slot))
+}
+
+/// The read landed and validated: move the reservation into the map.
+fn summer_publish_pending(layer: u32, expert: u16) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut pool = match summer_pool().lock() {
+        Ok(pool) => pool,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some((span, slot)) = pool.pending.remove(&(layer, expert)) else { return false };
+    pool.tick = pool.tick.wrapping_add(1);
+    let tick = pool.tick;
+    pool.bytes += span.len() as u64;
+    let guard = if summer_guard_enabled() { summer_fingerprint(&span) } else { 0 };
+    pool.map.insert((layer, expert), SummerEntry { guard, span, slot, freq: 1, last: tick });
+    SUMMER_INSERTS.fetch_add(1, Ordering::Relaxed);
+    SUMMER_INTO_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// The read failed, was cancelled, or lost: return the slot.
+fn summer_abort_pending(layer: u32, expert: u16) {
+    let mut pool = match summer_pool().lock() {
+        Ok(pool) => pool,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((_, slot)) = pool.pending.remove(&(layer, expert)) {
+        summer_slot_return(&mut pool.free_slots, slot);
+        SUMMER_INTO_ABORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Reservations for earlier layers whose tickets are dead by now (cancelled
+/// stale sets, losers) — return their slots. Called at each tile read.
+fn summer_sweep_pending_before(layer: u32) {
+    if !summer_read_into_slot_enabled() {
+        return;
+    }
+    let mut pool = match summer_pool().lock() {
+        Ok(pool) => pool,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let stale: Vec<(u32, u16)> = pool.pending.keys().filter(|(l, _)| *l < layer).copied().collect();
+    for key in stale {
+        if let Some((_, slot)) = pool.pending.remove(&key) {
+            summer_slot_return(&mut pool.free_slots, slot);
+            SUMMER_INTO_ABORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Submit one read-into-slot for `expert` at `layer` if it qualifies.
+fn summer_try_read_into_slot(
+    experts: &RawExpertCorpus,
+    reader: &Reader,
+    layer: u32,
+    expert: u16,
+    priority: crate::storage::ReadPriority,
+) -> Option<ExpertUnionReadTicket> {
+    let span_bytes = experts.layout().expert_span_bytes();
+    let (span, _slot) = summer_into_slot_candidate(layer, expert, span_bytes)?;
+    let keepalive: Arc<dyn std::any::Any + Send + Sync> = span.clone();
+    let Some(pointer) = std::ptr::NonNull::new(span.as_mut_ptr()) else {
+        summer_abort_pending(layer, expert);
+        return None;
+    };
+    match experts.try_submit_one_into(reader, layer, expert, pointer, span.len(), keepalive, priority) {
+        Ok(Some(ticket))
+            if ticket.layer() == layer
+                && ticket.expert_ids() == [expert]
+                && ticket.layout() == experts.layout() =>
+        {
+            SUMMER_INTO_SUBMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(ticket)
+        }
+        _ => {
+            summer_abort_pending(layer, expert);
+            None
+        }
+    }
+}
+
+/// Wait the demand-path read-into-slot tickets: a validated batch is
+/// published and served from its slot; a failure returns the slot and
+/// re-reads the expert through the ordinary checked path.
+fn summer_wait_into_slot(
+    experts: &RawExpertCorpus,
+    reader: &Reader,
+    layer: u32,
+    tickets: Vec<(u16, ExpertUnionReadTicket)>,
+) -> Result<Vec<ExpertUnionReadBatch>> {
+    let span_bytes = experts.layout().expert_span_bytes();
+    let mut batches = Vec::with_capacity(tickets.len());
+    for (expert, ticket) in tickets {
+        let stall_started = Instant::now();
+        let waited = ticket.wait();
+        expert_read_stall_add(elapsed_ns(stall_started));
+        match waited {
+            Ok(batch)
+                if batch.layer() == layer
+                    && batch.expert_ids() == [expert]
+                    && batch.layout() == experts.layout()
+                    && batch.buffers().other().len() == span_bytes =>
+            {
+                summer_publish_pending(layer, expert);
+                batches.push(batch);
+            }
+            _ => {
+                summer_abort_pending(layer, expert);
+                let stall_started = Instant::now();
+                let batch = experts.read_union(reader, layer, &[expert]);
+                expert_read_stall_add(elapsed_ns(stall_started));
+                batches.push(batch?);
+            }
+        }
+    }
+    Ok(batches)
+}
+
+fn summer_suppress_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("K3_SUMMER_SUPPRESS").is_ok_and(|v| v == "1"))
+}
+
+fn summer_is_ready(layer: u32, expert: u16) -> bool {
+    if !summer_pool_enabled() || !summer_suppress_enabled() {
+        return false;
+    }
+    let Ok(pool) = summer_pool().lock() else {
+        return false;
+    };
+    pool.map.contains_key(&(layer, expert))
+}
+
+fn summer_take_hits(layer: u32, wanted: &[u16]) -> Vec<(u16, Arc<PageAlignedSpan>)> {
+    use std::sync::atomic::Ordering;
+    if !summer_pool_enabled() || wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut pool = match summer_pool().lock() {
+        Ok(pool) => pool,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    pool.tick = pool.tick.wrapping_add(1);
+    let tick = pool.tick;
+    let mut hits = Vec::new();
+    for &expert in wanted {
+        if let Some(entry) = pool.map.get_mut(&(layer, expert)) {
+            // GUARD: verify before serving. A key mismatch means the map points
+            // at a slot holding a different expert; a fingerprint mismatch means
+            // the bytes changed after admit. Reported, never silently served.
+            if entry.guard != 0 {
+                use std::sync::atomic::Ordering as O;
+                SUMMER_GUARD_CHECKED.fetch_add(1, O::Relaxed);
+                if summer_fingerprint(&entry.span) != entry.guard {
+                    SUMMER_GUARD_HASHMISS.fetch_add(1, O::Relaxed);
+                    eprintln!(
+                        "[summer-guard] TORN/STALE layer={layer} expert={expert} slot={}",
+                        entry.slot
+                    );
+                    continue;
+                }
+            }
+            entry.freq = entry.freq.saturating_add(1);
+            entry.last = tick;
+            SUMMER_SERVED.fetch_add(entry.span.len() as u64, Ordering::Relaxed);
+            if let Some(slot) = summer_served_per()
+                .get((layer as usize) * 1024 + (expert as usize & 1023))
+            {
+                slot.fetch_add(1, Ordering::Relaxed);
+            }
+            // Provenance: this expert was served from RAM, so no drive read
+            // happens for it and it will never appear in the mirror counters.
+            // dur_ns=0 marks "no I/O performed" — a RAM hit is not a fast read,
+            // it is the absence of one, and averaging it into read latency
+            // would understate the drive distribution it displaced.
+            crate::storage::trace_read(
+                0,
+                layer,
+                expert,
+                crate::storage::SRC_SUMMER,
+                0,
+            );
+            hits.push((expert, Arc::clone(&entry.span)));
+        }
+    }
+    SUMMER_CONSULTS.fetch_add(1, Ordering::Relaxed);
+    SUMMER_WANTED.fetch_add(wanted.len() as u64, Ordering::Relaxed);
+    SUMMER_HITS.fetch_add(hits.len() as u64, Ordering::Relaxed);
+    hits
+}
+
+/// Admit a freshly-read batch into the Summer pool, copying each expert span
+/// into host RAM. Fail-soft everywhere: a shape surprise or a failed
+/// allocation skips the entry and leaves the authoritative path untouched.
+fn summer_admit(
+    layer: u32,
+    expert_ids: &[u16],
+    other: &[u8],
+    span_bytes: usize,
+    layout: ExpertStorageLayout,
+) {
+    use std::sync::atomic::Ordering;
+    if !summer_pool_enabled() || span_bytes == 0 {
+        return;
+    }
+    // DECODE ONLY. Without this the first build admitted PREFILL unions — up
+    // to 112 experts x 92 layers — and copied 1.03 TB through an 8.6 GiB pool
+    // in a single 40-token run: 58,664 inserts against 58,175 evictions, a 6.0%
+    // hit rate and -12.2% speed. A tile wider than TOP_K is a prefill union or
+    // a drafted multi-position tile, neither of which represents one token's
+    // working set, and admitting them evicts everything that does.
+    // K3_SUMMER_FULL_ONLY=1 — admit only from a COMPLETE top-16 union.
+    //
+    // The loop below locates each expert's bytes positionally:
+    //     start = index * span_bytes
+    // which is correct only if the buffer holds every id in `expert_ids`, in
+    // order, contiguously. But read_expert_tile_with_prefetch PARTITIONS the
+    // union — summer hits go to `pinned`, retain hits to `retained`, and only
+    // `streamed` reaches the demand batch. As the cache fills, more ids leave
+    // `streamed` and the positional mapping drifts, storing expert A's bytes
+    // under expert B's key.
+    //
+    // That fits every observation: deterministic, fails only once the cache has
+    // warmed (token 22), never at small pool sizes, and the serve-side guard
+    // shows served bytes == admitted bytes because the ADMIT was already wrong.
+    //
+    // This is a diagnostic, not the fix. If corruption stops under it, the
+    // proper repair is to locate spans by expert identity rather than position.
+    if summer_full_only() && expert_ids.len() != K3_EXPERT_TOP_K {
+        return;
+    }
+    if expert_ids.len() > K3_EXPERT_TOP_K
+        && !(summer_wide_admit_enabled() && summer_decode_tile())
+    {
+        return;
+    }
+    // Static-band mode: the manifest is the whole pool. Dynamic admission
+    // would evict preloaded entries for churn the MH1 pricing arm showed
+    // buys nothing at this cap (61k inserts, 1.07 TB copied, same hit rate).
+    if summer_preload_manifest().is_some() && !summer_preload_dynamic() {
+        return;
+    }
+    // The pool is keyed (layer, expert) globally, which is only sound while
+    // every entry shares one layout and span width.
+    if layout != ExpertStorageLayout::RawV1 {
+        return;
+    }
+    let cap = summer_cap_bytes();
+    for (index, &expert) in expert_ids.iter().enumerate() {
+        let Some(start) = index.checked_mul(span_bytes) else { continue };
+        let Some(end) = start.checked_add(span_bytes) else { continue };
+        if end > other.len() {
+            continue;
+        }
+        // Admission gate. Counting happens for EVERY routed expert; admitting
+        // happens only once an expert has proved it recurs. A single-use expert
+        // now costs one byte of counter instead of a 17.5 MB copy plus an
+        // eviction.
+        let seen = summer_note_route(layer, expert);
+        if summer_read_into_slot_enabled() {
+            // Counting only: admission happens at read submission (into the
+            // slot); the copying path below is what this mode retires.
+            continue;
+        }
+        let resident = summer_pool()
+            .lock()
+            .map(|pool| pool.bytes)
+            .unwrap_or(0);
+        let bar = summer_admit_bar(resident);
+        if seen < bar {
+            SUMMER_GATED.fetch_add(1, Ordering::Relaxed);
+            SUMMER_BAR.store(bar as u64, Ordering::Relaxed);
+            continue;
+        }
+        SUMMER_BAR.store(bar as u64, Ordering::Relaxed);
+
+        // ---- brief lock #1: decide, evict, and hand out a buffer ----------
+        // The 17.5 MB memcpy happens OUTSIDE this lock. Holding a single
+        // global mutex across up to 16 x 17.5 MB of copying serialises all 64
+        // expert reader threads behind one critical section, which is what the
+        // first build did.
+        let reserved: Option<(Arc<PageAlignedSpan>, usize)> = {
+            let mut pool = match summer_pool().lock() {
+                Ok(pool) => pool,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if pool.map.contains_key(&(layer, expert)) {
+                None
+            } else {
+                let mut declined = false;
+                while pool.bytes + span_bytes as u64 > cap && !pool.map.is_empty() {
+                    let mut victim: Option<((u32, u16), u32, u64)> = None;
+                    let n = pool.map.len();
+                    if summer_model_enabled() {
+                        // K3_SUMMER_MODEL: whole-pool scan, rank by session
+                        // route count then LRU, protected-tier rules.
+                        let protect = summer_protect_hits();
+                        let cap_slots = summer_protect_slots();
+                        let candidate = seen;
+                        let protected_n = pool
+                            .map
+                            .keys()
+                            .filter(|(l, e)| summer_seen_count(*l, *e) >= protect)
+                            .count();
+                        let probation_empty = protected_n == n;
+                        let allow_protected_victims =
+                            candidate >= protect && (protected_n >= cap_slots || probation_empty);
+                        for (&key, entry) in pool.map.iter() {
+                            if Arc::strong_count(&entry.span) > 1 {
+                                SUMMER_PINNED_SKIPS.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let count = summer_seen_count(key.0, key.1);
+                            if count >= protect && !(allow_protected_victims && count < candidate) {
+                                continue;
+                            }
+                            let better = match victim {
+                                None => true,
+                                Some((_, f, l)) => count < f || (count == f && entry.last < l),
+                            };
+                            if better {
+                                victim = Some((key, count, entry.last));
+                            }
+                        }
+                        if victim.is_none() {
+                            declined = true;
+                            break;
+                        }
+                    } else {
+                    for _ in 0..SUMMER_SAMPLE.min(n) {
+                        pool.rng ^= pool.rng << 13;
+                        pool.rng ^= pool.rng >> 7;
+                        pool.rng ^= pool.rng << 17;
+                        let skip = (pool.rng as usize) % n;
+                        if let Some((&key, entry)) = pool.map.iter().nth(skip) {
+                            // Never select a span the execution path still
+                            // holds: strong_count > 1 means a live lease.
+                            if Arc::strong_count(&entry.span) > 1 {
+                                SUMMER_PINNED_SKIPS.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let better = match victim {
+                                None => true,
+                                Some((_, f, l)) => {
+                                    entry.freq < f || (entry.freq == f && entry.last < l)
+                                }
+                            };
+                            if better {
+                                victim = Some((key, entry.freq, entry.last));
+                            }
+                        }
+                    }
+                    }
+                    let Some((key, _, _)) = victim else { break };
+                    if let Some(old) = pool.map.remove(&key) {
+                        pool.bytes = pool.bytes.saturating_sub(old.span.len() as u64);
+                        SUMMER_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                        // The arena slot returns to the free list. Nothing is
+                        // freed: the arena lives for the process.
+                        summer_slot_return(&mut pool.free_slots, old.slot);
+                    }
+                }
+                if declined {
+                    SUMMER_DECLINED.fetch_add(1, Ordering::Relaxed);
+                    None
+                } else {
+                match (summer_arena(), pool.free_slots.pop_front()) {
+                    (Some(arena), Some(slot)) => {
+                        SUMMER_RECYCLED.fetch_add(1, Ordering::Relaxed);
+                        // SAFETY: the arena outlives the process, slot regions
+                        // are disjoint, and this slot was on the free list so
+                        // no live entry or lease references it.
+                        let view = unsafe {
+                            PageAlignedSpan::view_into(
+                                arena.base.add(slot * span_bytes),
+                                span_bytes,
+                            )
+                        };
+                        view.map(|span| (span, slot))
+                    }
+                    _ => None,
+                }
+                }
+            }
+        };
+        let Some((span, slot)) = reserved else { continue };
+
+        // ---- copy outside the lock ----------------------------------------
+        // SAFETY: `span` was either freshly allocated or popped from the free
+        // list with strong_count == 1, so this thread holds the only
+        // reference and no reader can observe a partial write.
+        if !unsafe { span.fill_from(&other[start..end]) } {
+            continue;
+        }
+        SUMMER_COPIED.fetch_add(span_bytes as u64, Ordering::Relaxed);
+
+        // ---- brief lock #2: publish ---------------------------------------
+        {
+            let mut pool = match summer_pool().lock() {
+                Ok(pool) => pool,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if pool.map.contains_key(&(layer, expert)) {
+                summer_slot_return(&mut pool.free_slots, slot);
+                continue;
+            }
+            let tick = pool.tick;
+            pool.bytes += span.len() as u64;
+            SUMMER_INSERTS.fetch_add(1, Ordering::Relaxed);
+            pool.map
+                .insert((layer, expert), SummerEntry {
+                    guard: if summer_guard_enabled() { summer_fingerprint(&span) } else { 0 },
+                    span,
+                    slot,
+                    freq: 1,
+                    last: tick,
+                });
+        }
+    }
+}
+
+/// K3_EXPERT_RETAIN=1: previous-token expert retention. Decode routes
+/// re-select ~35% of each layer's 16 experts token over token (measured on a
+/// 64-token router trace), and every one of those repeats currently re-reads
+/// its 17.5MB from disk because F_NOCACHE leaves no cache behind. Retention
+/// keeps the previous token's authenticated expert bytes alive — zero-copy:
+/// the arena ALLOCATIONS survive via `RetainedAllocation` while their slots
+/// release normally — and serves repeats before any ticket or demand read.
+/// Unlike the pin tier (whose per-expert promotion memcpy made it slower at
+/// depth) this copies nothing and ranks nothing: one generation per layer,
+/// replaced by each token's tile, bounded by construction to about one
+/// token's unions (~26GB ceiling, typically less).
+/// Widest mailbox retention will hold (K3_RETAIN_MAX_POSITIONS, default 1,
+/// clamped 1..=32).
+///
+/// Default 1 reproduces the original `position_count() == 1` test exactly, so
+/// the champion is byte-identical until opted in. Raising it admits DRAFTED
+/// decode tiles (~6.75 positions at SPEC_DEPTH=8) while still excluding PREFILL,
+/// which is what the original guard was really protecting against — measured at
+/// 112 experts x 92 layers, the ~100GB of leases that OOM-killed the first
+/// flag-on gate. Drafted decode is nothing like that, and `retain_expert_tile`
+/// now caps itself at TOP_K entries regardless of tile width.
+fn retain_max_positions() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("K3_RETAIN_MAX_POSITIONS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(1, |max| max.clamp(1, 32))
+    })
+}
+
+fn expert_retain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_EXPERT_RETAIN").is_ok_and(|value| value == "1"))
+}
+
+struct RetainedExpertTile {
+    layout: ExpertStorageLayout,
+    span_bytes: usize,
+    /// Monotonic insertion sequence for stalest-first eviction under the
+    /// byte cap.
+    seq: u64,
+    /// (expert, keep-alive allocation, byte offset of the span in `other`).
+    entries: Vec<(u16, Arc<RetainedAllocation>, usize)>,
+}
+
+/// Hard ceiling on retained bytes (K3_EXPERT_RETAIN_GB, default 8). The
+/// MPS watermark counts Metal-wrapped shared-pool memory against its
+/// budget, and the 50GiB resident spine under the 0.70 ratio leaves only
+/// single-digit GiB of headroom on a 128GB host: an uncapped retained
+/// generation (~26GB) OOMed decode on its first gate run. Coverage — and
+/// therefore hit rate — scales with this knob.
+fn retain_cap_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("K3_EXPERT_RETAIN_GB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map_or(8 << 30, |gb| gb.clamp(1, 64) << 30)
+    })
+}
+
+/// Fixed retained-layer subset. Insert-as-you-go with stalest eviction is a
+/// sliding window that structurally trails the consult pointer (measured:
+/// 0 hits at any sub-token cap), so retention instead commits to the N
+/// deepest routed layers that fit the cap — each replaces only itself,
+/// nothing evicts, and a subset tile always survives to its next-token
+/// consult. The deep layers are where the measured external-straggler
+/// top-ups concentrate.
+fn retain_layer_in_set(layer: u32, span_bytes: usize) -> bool {
+    static FIRST_LAYER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let first = *FIRST_LAYER.get_or_init(|| {
+        let tile_bytes = (K3_EXPERT_TOP_K * span_bytes) as u64;
+        let layers = (retain_cap_bytes() / tile_bytes.max(1)).clamp(1, 92) as u32;
+        // Routed layers are 1..=92; retain the deepest `layers` of them.
+        92_u32.saturating_sub(layers).saturating_add(1)
+    });
+    layer >= first
+}
+
+/// One retained generation per routed layer. Process-global is deliberate:
+/// expert bytes are immutable corpus content keyed by (layer, expert,
+/// layout), so serving across sequences and sessions is exact by identity.
+/// Touched once per layer per token from the single decode thread.
+fn retained_expert_store()
+-> &'static std::sync::Mutex<std::collections::HashMap<u32, RetainedExpertTile>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, RetainedExpertTile>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Flush-before-free custody for replaced retained allocations. Detached
+/// slabs may still be aliased by no-copy Metal expert wrappers, so freeing
+/// them must follow the same flush-before-retire discipline as the arenas:
+/// outgoing allocations accumulate here and are released only after one
+/// invocation of the session's expert-cache flush hook (per ~threshold
+/// bytes, not per layer). Without a hook (CPU backend) they free directly.
+struct RetainGraveyard {
+    hook: Option<BufferRetireHook>,
+    drop_hook: Option<BufferDropHook>,
+    pending: Vec<Arc<RetainedAllocation>>,
+    /// Expert-span base addresses whose wrappers must be evicted before the
+    /// pending allocations may be freed (per-blob custody, one entry per
+    /// retained span; parallel to — not per — `pending`).
+    pending_blobs: Vec<usize>,
+    pending_bytes: u64,
+}
+
+fn retain_graveyard() -> &'static std::sync::Mutex<RetainGraveyard> {
+    static GRAVEYARD: std::sync::OnceLock<std::sync::Mutex<RetainGraveyard>> =
+        std::sync::OnceLock::new();
+    GRAVEYARD.get_or_init(|| {
+        std::sync::Mutex::new(RetainGraveyard {
+            hook: None,
+            drop_hook: None,
+            pending: Vec::new(),
+            pending_blobs: Vec::new(),
+            pending_bytes: 0,
+        })
+    })
+}
+
+/// Install the Metal expert-cache flush hook for retention's
+/// flush-before-free discipline. Called at session construction ONLY when
+/// K3_EXPERT_RETAIN=1 — the hook captures a provider session lease, and a
+/// flag-off engine must not park one in process-global state (leaking it
+/// past main reorders C++ static teardown; observed as a recursive_mutex
+/// abort at exit).
+fn retain_install_retire_hook(hook: Option<BufferRetireHook>, drop_hook: Option<BufferDropHook>) {
+    let mut graveyard = retain_graveyard()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    graveyard.hook = hook;
+    graveyard.drop_hook = drop_hook;
+}
+
+/// Engine-teardown half one: move every retained tile into the graveyard
+/// WITHOUT freeing (their spans may still be aliased by no-copy wrappers).
+/// The store also empties here so a later session with a different corpus
+/// can never resolve (layer, expert) to this model's bytes.
+fn retain_teardown_bury_all() {
+    let drained: Vec<RetainedExpertTile> = {
+        let mut store = retained_expert_store()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.drain().map(|(_, tile)| tile).collect()
+    };
+    let mut graveyard = retain_graveyard()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for tile in drained {
+        let span_bytes = tile.span_bytes;
+        for (_, allocation, _) in tile.entries {
+            if !graveyard
+                .pending
+                .iter()
+                .any(|have| Arc::ptr_eq(have, &allocation))
+            {
+                graveyard.pending_bytes = graveyard
+                    .pending_bytes
+                    .saturating_add(allocation.other().len() as u64);
+                // Record the wrapper surface so a LATER engine's per-blob
+                // threshold drop still covers these if this engine's
+                // teardown flush fails (2026-08-26 review, MEDIUM finding).
+                for address in retained_allocation_wrapper_surface(&allocation, span_bytes) {
+                    if !graveyard.pending_blobs.contains(&address) {
+                        graveyard.pending_blobs.push(address);
+                    }
+                }
+                graveyard.pending.push(allocation);
+            }
+        }
+    }
+}
+
+/// Engine-teardown half two, after the engine's own global Metal expert
+/// cache flush: release the graveyard when that flush succeeded, keep it
+/// resident until process exit when it did not (never free unflushed), and
+/// drop the session-holding hook either way.
+fn retain_teardown_release(flush_ok: bool) {
+    let mut graveyard = retain_graveyard()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if flush_ok {
+        graveyard.pending_blobs.clear();
+        graveyard.pending.clear();
+        graveyard.pending_bytes = 0;
+    }
+    graveyard.hook = None;
+    graveyard.drop_hook = None;
+}
+
+fn retain_flush_threshold_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("K3_RETAIN_FLUSH_GB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map_or(6 << 30, |gb| gb.clamp(1, 64) << 30)
+    })
+}
+
+/// Bury an outgoing tile's allocations. Frees happen immediately without a
+/// hook, otherwise only after a successful flush once the threshold is
+/// crossed; a failed flush keeps everything buried (never free unflushed).
+/// Every span-aligned address over an allocation's full ENVELOPE: a
+/// recycled slab's wrapper history covers earlier leases' packings too
+/// (wrapper caching is on for every Metal call under retention), so
+/// eviction-before-free must cover the whole surface, not just the final
+/// tile's spans (2026-08-26 review, CRITICAL finding).
+fn retained_allocation_wrapper_surface(
+    allocation: &RetainedAllocation,
+    span_bytes: usize,
+) -> Vec<usize> {
+    let base = allocation.other().as_ptr() as usize;
+    if span_bytes == 0 {
+        return vec![base];
+    }
+    let spans = allocation.other_envelope_len() / span_bytes;
+    (0..spans.max(1)).map(|k| base + k * span_bytes).collect()
+}
+
+fn retain_bury_tile(tile: RetainedExpertTile) {
+    let span_bytes = tile.span_bytes;
+    let mut unique: Vec<Arc<RetainedAllocation>> = Vec::new();
+    for (_, allocation, _) in tile.entries {
+        if !unique.iter().any(|have| Arc::ptr_eq(have, &allocation)) {
+            unique.push(allocation);
+        }
+    }
+    let mut span_addresses: Vec<Vec<usize>> = unique
+        .iter()
+        .map(|allocation| retained_allocation_wrapper_surface(allocation, span_bytes))
+        .collect();
+    span_addresses.reverse(); // consumed by pop() in allocation order below
+    // v1 recycle path: sole-owner allocations return to the storage
+    // donation pool — the next arena growth reuses their ADDRESSES, so the
+    // no-copy wrapper cache stays warm and nothing needs a flush (only
+    // freeing does). Shared allocations (still carried by the successor
+    // tile) and pool overflow fall through to the graveyard as before.
+    let mut leftover: Vec<(Arc<RetainedAllocation>, Vec<usize>)> = Vec::new();
+    for allocation in unique {
+        let addresses = span_addresses.pop().unwrap_or_default();
+        match Arc::try_unwrap(allocation) {
+            Ok(sole) => {
+                if let Some(returned) = sole.donate() {
+                    // Pool full or storage shared: custody came back —
+                    // route through the eviction-before-free graveyard.
+                    leftover.push((Arc::new(returned), addresses));
+                }
+                // Donated: addresses recycle, wrappers deliberately stay warm.
+            }
+            Err(shared) => leftover.push((shared, addresses)),
+        }
+    }
+    let mut graveyard = retain_graveyard()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if graveyard.hook.is_none() && graveyard.drop_hook.is_none() {
+        drop(graveyard);
+        drop(leftover);
+        return;
+    }
+    for (allocation, addresses) in leftover {
+        graveyard.pending_bytes = graveyard
+            .pending_bytes
+            .saturating_add(allocation.other().len() as u64);
+        graveyard.pending.push(allocation);
+        for address in addresses {
+            if !graveyard.pending_blobs.contains(&address) {
+                graveyard.pending_blobs.push(address);
+            }
+        }
+    }
+    if graveyard.pending_bytes < retain_flush_threshold_bytes() {
+        return;
+    }
+    // Per-blob drop first (evicts only the retiring spans' wrappers — the
+    // 2026-08-25 counter gate measured the global flush's churn as
+    // super-linear in coverage); the global flush remains as fallback so
+    // "never free unflushed" custody is preserved on any drop failure.
+    let released = match (graveyard.drop_hook.clone(), graveyard.hook.clone()) {
+        (Some(drop_hook), fallback) => {
+            let blobs = std::mem::take(&mut graveyard.pending_blobs);
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop_hook(&blobs)
+            }));
+            match dropped {
+                Ok(Ok(())) => true,
+                _ => {
+                    graveyard.pending_blobs = blobs;
+                    fallback.is_some_and(|hook| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()))
+                            .map_or(false, |result| result.is_ok())
+                    })
+                }
+            }
+        }
+        (None, Some(hook)) => hook().is_ok(),
+        (None, None) => false,
+    };
+    if released {
+        graveyard.pending.clear();
+        graveyard.pending_blobs.clear();
+        graveyard.pending_bytes = 0;
+    }
+}
+
+/// Replace layer's retained generation with the just-consumed tile's
+/// storage. Fail-soft by construction: any shape surprise skips the entry —
+/// retention must never affect the authoritative path. Raw-v1 only (the
+/// span-per-expert `other` layout the scattered lease already serves).
+fn retain_expert_tile(layer: u32, lease: &ExpertTileLease) {
+    if !expert_retain_enabled() {
+        return;
+    }
+    let mut entries: Vec<(u16, Arc<RetainedAllocation>, usize)> = Vec::new();
+    let layout = match lease {
+        ExpertTileLease::Contiguous(batch) => batch.layout(),
+        ExpertTileLease::ContiguousArrival(ticket) => ticket.layout(),
+        ExpertTileLease::Scattered { layout, .. } => *layout,
+    };
+    if layout != ExpertStorageLayout::RawV1 {
+        return;
+    }
+    let span_bytes = layout.expert_span_bytes();
+    if !retain_layer_in_set(layer, span_bytes) {
+        return;
+    }
+    let mut retain_batch = |batch: &ExpertUnionReadBatch| {
+        if batch.layout() != layout {
+            return;
+        }
+        let ids = batch.expert_ids();
+        // Defensive ceiling: a decode tile's batches never exceed the
+        // top-K width; anything larger is a union shape retention must
+        // not hold.
+        if ids.len() > K3_EXPERT_TOP_K {
+            return;
+        }
+        let Some(expected) = ids.len().checked_mul(span_bytes) else {
+            return;
+        };
+        if batch.buffers().other().len() < expected {
+            return;
+        }
+        // Detach: the allocation leaves its arena slot so no future read
+        // can recycle it underneath these spans (the slot re-allocates
+        // fresh on its next acquire). Fail-soft on None.
+        let Some(detached) = batch.buffers().detach_allocation_for_retention() else {
+            return;
+        };
+        let allocation = Arc::new(detached);
+        for (index, &expert) in ids.iter().enumerate() {
+            // TOTAL ceiling, not just per batch. A single-position tile has one
+            // batch of <=TOP_K so this never bites; a DRAFTED tile carries
+            // ~6.75 positions and would otherwise retain ~60 experts — 3.75x
+            // what retain_cap_bytes() budgets, since that assumes TOP_K * span
+            // per layer. Keeping the first TOP_K bounds the generation to the
+            // intended size by construction, whatever the tile width.
+            if entries.len() >= K3_EXPERT_TOP_K {
+                return;
+            }
+            entries.push((expert, Arc::clone(&allocation), index * span_bytes));
+        }
+    };
+    match lease {
+        ExpertTileLease::Contiguous(batch) => retain_batch(batch),
+        // An in-flight arrival union owns its slab until the tile finishes;
+        // nothing to detach for retention.
+        ExpertTileLease::ContiguousArrival(_) => {}
+        ExpertTileLease::Scattered {
+            hits,
+            demand,
+            retained,
+            ..
+        } => {
+            for batch in hits {
+                retain_batch(batch);
+            }
+            if let Some(batch) = demand {
+                retain_batch(batch);
+            }
+            // Experts served from retention this token stay retained for the
+            // next one: carry their entries forward. Pin-tier spans are
+            // permanently resident and are deliberately NOT retained.
+            for (expert, allocation, offset) in retained {
+                entries.push((*expert, Arc::clone(allocation), *offset));
+            }
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    let tile_bytes = entries.len() as u64 * span_bytes as u64;
+    if tile_bytes > retain_cap_bytes() {
+        return;
+    }
+    let mut buried: Vec<RetainedExpertTile> = Vec::new();
+    {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut store = retained_expert_store()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(old) = store.remove(&layer) {
+            buried.push(old);
+        }
+        // Stalest-first eviction until the fresh tile fits under the cap.
+        let occupancy = |store: &std::collections::HashMap<u32, RetainedExpertTile>| {
+            store
+                .values()
+                .map(|tile| tile.entries.len() as u64 * tile.span_bytes as u64)
+                .sum::<u64>()
+        };
+        while occupancy(&store) + tile_bytes > retain_cap_bytes() {
+            let Some(stalest) = store
+                .iter()
+                .min_by_key(|(_, tile)| tile.seq)
+                .map(|(&stale_layer, _)| stale_layer)
+            else {
+                break;
+            };
+            if let Some(old) = store.remove(&stalest) {
+                buried.push(old);
+            }
+        }
+        RETAIN_INSERTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        store.insert(
+            layer,
+            RetainedExpertTile {
+                layout,
+                span_bytes,
+                seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                entries,
+            },
+        );
+    }
+    // Outgoing generations may still be aliased by no-copy Metal expert
+    // wrappers: route them through the flush-before-free graveyard instead
+    // of dropping them here.
+    for old in buried {
+        retain_bury_tile(old);
+    }
+}
+
+/// Partition `wanted` against layer's retained generation, returning the
+/// servable hits. Fail-soft: any mismatch leaves the expert on the ordinary
+/// read path.
+fn take_retained_hits(
+    layer: u32,
+    layout: ExpertStorageLayout,
+    wanted: &[u16],
+) -> Vec<(u16, Arc<RetainedAllocation>, usize)> {
+    if !expert_retain_enabled() || layout != ExpertStorageLayout::RawV1 || wanted.is_empty() {
+        return Vec::new();
+    }
+    if !retain_layer_in_set(layer, layout.expert_span_bytes()) {
+        return Vec::new();
+    }
+    let store = retained_expert_store()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(tile) = store.get(&layer) else {
+        return Vec::new();
+    };
+    if tile.layout != layout || tile.span_bytes != layout.expert_span_bytes() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for &expert in wanted {
+        if let Some((_, allocation, offset)) =
+            tile.entries.iter().find(|(id, _, _)| *id == expert)
+        {
+            let Some(end) = offset.checked_add(tile.span_bytes) else {
+                continue;
+            };
+            if allocation.other().len() >= end {
+                hits.push((expert, Arc::clone(allocation), *offset));
+            }
+        }
+    }
+    retain_probe_note(wanted.len(), hits.len(), tile.span_bytes);
+    hits
+}
+
+// Retain-pool counters. Module-level rather than function-local statics so the
+// startup line and the per-run summary can read them.
+//
+// 2026-08-31: the pool was measured twice (4 arms, 40 tokens) and moved NOTHING
+// — `expert file opens=18669` was identical to the unit with it on and off. It
+// was impossible to tell whether the pool had run and missed, or never engaged,
+// because the ONLY output was a probe that fires every 92 consults AND only
+// after a tile already exists in the store. Zero inserts therefore printed zero
+// lines, which is indistinguishable from the knob being off. Same failure shape
+// as the Qwen `last_error` that no caller printed, and the stale mirror
+// constants: state that exists and is never shown. Every counter below is now
+// reported unconditionally at end of run, INCLUDING when it is zero — a zero
+// that is printed is a measurement; a zero that is silent is not.
+static RETAIN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_WANTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_INSERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETAIN_SPAN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Resolved retain state for the startup line: (enabled, cap GiB, first
+/// retained layer). Emitted whether or not retention is on, so a stale or
+/// unapplied knob cannot sit invisible in a run again.
+pub fn retain_config_report() -> (bool, u64, u32) {
+    let enabled = expert_retain_enabled();
+    let cap_gb = retain_cap_bytes() >> 30;
+    // Mirrors retain_layer_in_set's arithmetic on the RawV1 span.
+    let span = ExpertStorageLayout::RawV1.expert_span_bytes() as u64;
+    let tile_bytes = (K3_EXPERT_TOP_K as u64) * span;
+    let layers = (retain_cap_bytes() / tile_bytes.max(1)).clamp(1, 92) as u32;
+    (enabled, cap_gb, 92_u32.saturating_sub(layers).saturating_add(1))
+}
+
+/// End-of-run retain summary: (calls, wanted, hits, inserts, bytes served).
+pub fn retain_run_report() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    let hits = RETAIN_HITS.load(Ordering::Relaxed);
+    (
+        RETAIN_CALLS.load(Ordering::Relaxed),
+        RETAIN_WANTED.load(Ordering::Relaxed),
+        hits,
+        RETAIN_INSERTS.load(Ordering::Relaxed),
+        hits * RETAIN_SPAN_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// [retain] probe: per 92 consults print the mean wanted/hit counts and the
+/// bytes served from retention instead of storage.
+fn retain_probe_note(wanted: usize, hits: usize, span_bytes: usize) {
+    use std::sync::atomic::Ordering;
+    let calls = RETAIN_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    RETAIN_WANTED.fetch_add(wanted as u64, Ordering::Relaxed);
+    RETAIN_HITS.fetch_add(hits as u64, Ordering::Relaxed);
+    RETAIN_SPAN_BYTES.store(span_bytes as u64, Ordering::Relaxed);
+    if calls % 92 == 0 {
+        let n = calls as f64;
+        let hit_total = RETAIN_HITS.load(Ordering::Relaxed);
+        eprintln!(
+            "[retain] calls={calls} wanted_mean={:.2} hit_mean={:.2} saved_mean={:.1}MB",
+            RETAIN_WANTED.load(Ordering::Relaxed) as f64 / n,
+            hit_total as f64 / n,
+            hit_total as f64 / n * span_bytes as f64 / 1e6,
+        );
+    }
+}
+
+thread_local! {
+    /// Host-blocking read-stall nanoseconds accumulated by
+    /// `read_expert_tile_with_prefetch` on this thread: prefetch-hit claim
+    /// waits, the demand-union wait, and the synchronous fallback unions.
+    /// Deliberately excludes loser cancel/drain, pin-tier promotion
+    /// memcpys and submission — the over-inclusion the old
+    /// `expert_demand_read` timer billed as demand read (§4.1).
+    static EXPERT_READ_STALL_NS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+fn expert_read_stall_add(nanoseconds: u64) {
+    EXPERT_READ_STALL_NS.with(|cell| cell.set(cell.get().saturating_add(nanoseconds)));
+}
+
+fn expert_read_stall_take() -> u64 {
+    EXPERT_READ_STALL_NS.with(|cell| cell.replace(0))
 }
 
 fn read_expert_tile_with_prefetch(
     experts: &RawExpertCorpus,
     expert_reader: &Reader,
+    expert_prefetch_reader: Option<&Reader>,
     expert_pin_tier: Option<&ExpertPinTier>,
     layer: u32,
     canonical_expert_ids: &[u16],
     prefetch: Option<ExpertPrefetchSet>,
 ) -> Result<ExpertTileLease> {
+    // One barrier = one layer's top-16 union. Opened here so every read the
+    // union triggers carries the same id and the offline reducer can compute
+    // Tmax/T2 per barrier. Reads issued by the PREFETCH pool for a future layer
+    // will carry whatever barrier is current when they land, so treat the id as
+    // exact for demand reads and approximate under prefetch — cluster on
+    // (layer, t_us) offline rather than trusting it blindly across pools.
+    let _barrier = crate::storage::trace_barrier_begin(layer);
     // Partition against the permanent tier before any submission: a resident
     // span was authenticated when it was promoted and needs no file I/O this
     // pass. `streamed` keeps canonical ascending order for the demand union.
     let mut pinned: Vec<(u16, Arc<PageAlignedSpan>)> = Vec::new();
-    let streamed: Vec<u16> = match expert_pin_tier {
+    let tier_streamed: Vec<u16> = match expert_pin_tier {
         Some(tier) => canonical_expert_ids
             .iter()
             .copied()
@@ -5674,33 +8748,117 @@ fn read_expert_tile_with_prefetch(
             .collect(),
         None => canonical_expert_ids.to_vec(),
     };
-    let read_streamed_demand =
-        |lease_pinned: Vec<(u16, Arc<PageAlignedSpan>)>| -> Result<ExpertTileLease> {
-            if lease_pinned.is_empty() {
-                let batch = experts.read_union(expert_reader, layer, canonical_expert_ids)?;
-                promote_from_batch(expert_pin_tier, layer, &batch);
-                return Ok(ExpertTileLease::Contiguous(batch));
-            }
-            let demand = if streamed.is_empty() {
-                None
-            } else {
-                let batch = experts.read_union(expert_reader, layer, &streamed)?;
-                promote_from_batch(expert_pin_tier, layer, &batch);
-                Some(batch)
-            };
-            Ok(ExpertTileLease::Scattered {
-                layout: experts.layout(),
-                pinned: lease_pinned,
-                hits: Vec::new(),
-                demand,
-            })
+    // Summer pool partitions next (K3_SUMMER_POOL=1). Its hits are host-RAM
+    // copies, so they join `pinned` — the same un-wrapped slot the permanent
+    // pin tier uses — and never touch the Metal-wrapped retain path.
+    let tier_streamed: Vec<u16> = {
+        let summer = if summer_narrow_only()
+            && canonical_expert_ids.len() > K3_EXPERT_TOP_K
+        {
+            SUMMER_WIDE_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        } else {
+            summer_take_hits(layer, &tier_streamed)
         };
+        if summer.is_empty() {
+            tier_streamed
+        } else {
+            let served: Vec<u16> = summer.iter().map(|(expert, _)| *expert).collect();
+            pinned.extend(summer);
+            tier_streamed
+                .into_iter()
+                .filter(|expert| !served.contains(expert))
+                .collect()
+        }
+    };
+    // Previous-token retention partitions next (K3_EXPERT_RETAIN=1): a
+    // retained span was authenticated by the read that produced it one token
+    // ago and its bytes are immutable corpus content. Removing these ids
+    // here also turns any in-flight prefetch tickets for them into losers
+    // below, reclaiming reads the filesystem has not started.
+    let retained = take_retained_hits(layer, experts.layout(), &tier_streamed);
+    let streamed: Vec<u16> = if retained.is_empty() {
+        tier_streamed
+    } else {
+        tier_streamed
+            .iter()
+            .copied()
+            .filter(|expert| !retained.iter().any(|(hit, _, _)| hit == expert))
+            .collect()
+    };
+    // K3_SUMMER_READ_INTO_SLOT: experts that qualify for admission are read
+    // straight into their reserved pool slot instead of the arena, served
+    // from that slot this tile, and published on validated completion.
+    let mut into_slot: Vec<(u16, ExpertUnionReadTicket)> = Vec::new();
+    let streamed: Vec<u16> = if summer_read_into_slot_enabled() && !streamed.is_empty() {
+        summer_sweep_pending_before(layer);
+        let mut rest = Vec::with_capacity(streamed.len());
+        for &expert in &streamed {
+            match summer_try_read_into_slot(
+                experts,
+                expert_reader,
+                layer,
+                expert,
+                crate::storage::ReadPriority::Demand,
+            ) {
+                Some(ticket) => into_slot.push((expert, ticket)),
+                None => rest.push(expert),
+            }
+        }
+        rest
+    } else {
+        streamed
+    };
+    let read_streamed_demand = |lease_pinned: Vec<(u16, Arc<PageAlignedSpan>)>,
+                                lease_retained: Vec<(u16, Arc<RetainedAllocation>, usize)>,
+                                into_slot: Vec<(u16, ExpertUnionReadTicket)>|
+     -> Result<ExpertTileLease> {
+        let arrival = arrival_groups() > 0;
+        if lease_pinned.is_empty() && lease_retained.is_empty() && into_slot.is_empty() {
+            if arrival {
+                let ticket = experts.submit_union(expert_reader, layer, canonical_expert_ids)?;
+                return Ok(ExpertTileLease::ContiguousArrival(ticket));
+            }
+            let stall_started = Instant::now();
+            let batch = experts.read_union(expert_reader, layer, canonical_expert_ids);
+            expert_read_stall_add(elapsed_ns(stall_started));
+            let batch = batch?;
+            promote_from_batch(expert_pin_tier, layer, &batch);
+            return Ok(ExpertTileLease::Contiguous(batch));
+        }
+        let mut demand_ticket = None;
+        let demand = if streamed.is_empty() {
+            None
+        } else if arrival {
+            demand_ticket = Some(experts.submit_union(expert_reader, layer, &streamed)?);
+            None
+        } else {
+            let stall_started = Instant::now();
+            let batch = experts.read_union(expert_reader, layer, &streamed);
+            expert_read_stall_add(elapsed_ns(stall_started));
+            let batch = batch?;
+            promote_from_batch(expert_pin_tier, layer, &batch);
+            Some(batch)
+        };
+        let hits = summer_wait_into_slot(experts, expert_reader, layer, into_slot)?;
+        for batch in &hits {
+            promote_from_batch(expert_pin_tier, layer, batch);
+        }
+        Ok(ExpertTileLease::Scattered {
+            layout: experts.layout(),
+            pinned: lease_pinned,
+            retained: lease_retained,
+            hits,
+            demand,
+            demand_ticket,
+        })
+    };
     let Some(prefetch) = prefetch else {
-        return read_streamed_demand(pinned);
+        return read_streamed_demand(pinned, retained, into_slot);
     };
     if prefetch.target_layer != layer {
         prefetch.cancel_and_drain();
-        return read_streamed_demand(pinned);
+        return read_streamed_demand(pinned, retained, into_slot);
     }
 
     // A speculative ticket for a tier-resident expert is a loser: cancelling
@@ -5724,11 +8882,17 @@ fn read_expert_tile_with_prefetch(
     // final writer is drained.
     hit_tickets.sort_unstable_by_key(|(expert, _)| *expert);
     let mut provisional_misses = Vec::new();
+    let mut fanout_singles: Vec<(u16, ExpertUnionReadTicket)> = Vec::new();
+    let loser_probe = loser_probe_enabled();
+    let drop_losers = loser_drop_enabled();
+    let mut loser_count = 0_usize;
+    let mut loser_ready = 0_usize;
+    let mut loser_wait_ns = 0_u64;
     let demand_ticket = match cancel_submit_drain(
         loser_tickets,
         |(_, ticket)| ticket.cancel_unclaimed(),
         || {
-            provisional_misses = streamed
+            let mut misses: Vec<u16> = streamed
                 .iter()
                 .copied()
                 .filter(|expert| {
@@ -5737,6 +8901,33 @@ fn read_expert_tile_with_prefetch(
                         .is_err()
                 })
                 .collect();
+            // K3_DEMAND_FANOUT: move the tail half of the miss set onto the
+            // prefetch pool as Demand-class singles (queued losers were just
+            // cancelled, freeing span slots there). Non-blocking: a declined
+            // submission folds its expert back into the residual union, so
+            // correctness never depends on the second pool. Both lists stay
+            // canonically ascending.
+            if misses.len() >= 2 && demand_fanout_enabled() {
+                if let Some(reader) = expert_prefetch_reader {
+                    let keep = misses.len() - misses.len() / 2;
+                    let mut residual = misses[..keep].to_vec();
+                    for &expert in &misses[keep..] {
+                        match experts.try_submit_local_demand_one(reader, layer, expert) {
+                            Ok(Some(ticket))
+                                if ticket.layer() == layer
+                                    && ticket.expert_ids() == [expert]
+                                    && ticket.layout() == experts.layout() =>
+                            {
+                                fanout_singles.push((expert, ticket));
+                            }
+                            _ => residual.push(expert),
+                        }
+                    }
+                    residual.sort_unstable();
+                    misses = residual;
+                }
+            }
+            provisional_misses = misses;
             if provisional_misses.is_empty() {
                 Ok(None)
             } else {
@@ -5745,14 +8936,36 @@ fn read_expert_tile_with_prefetch(
                     .map(Some)
             }
         },
-        |(_, ticket)| ticket.drain_cancelled(),
+        |(expert, ticket)| {
+            let probe_started = loser_probe.then(|| {
+                loser_count += 1;
+                loser_ready += usize::from(ticket.is_ready());
+                Instant::now()
+            });
+            if drop_losers {
+                drop(ticket);
+            } else {
+                ticket.drain_cancelled();
+            }
+            summer_abort_pending(layer, expert);
+            if let Some(started) = probe_started {
+                loser_wait_ns = loser_wait_ns.saturating_add(elapsed_ns(started));
+            }
+        },
     ) {
         Ok(ticket) => ticket,
         Err(error) => {
             cancel_and_drain_prefetch_tickets(hit_tickets);
+            cancel_and_drain_prefetch_tickets(fanout_singles);
             return Err(error);
         }
     };
+    if loser_probe {
+        loser_probe_note(loser_count, loser_ready, loser_wait_ns);
+    }
+    // Fan-out singles are waited, validated, and assembled exactly like
+    // speculative hits; a failure takes the same complete checked retry.
+    hit_tickets.extend(fanout_singles);
 
     // A speculative read error is not an authoritative failure. Treat it as
     // a miss and retry the complete canonical union through the ordinary
@@ -5760,35 +8973,66 @@ fn read_expert_tile_with_prefetch(
     // so its private arena cannot outlive this failed merge attempt.
     let mut hits = Vec::with_capacity(hit_tickets.len());
     let mut speculative_failure = false;
+    let claim_probe = claim_probe_enabled().then(Instant::now);
+    let mut claim_wait_total_ns = 0_u64;
+    let mut claim_wait_max_ns = 0_u64;
+    let mut claim_wait_max_expert = 0_u16;
     for (expert, ticket) in hit_tickets {
-        match ticket.wait() {
+        let wait_started = claim_probe.is_some().then(Instant::now);
+        let stall_started = Instant::now();
+        let waited = ticket.wait();
+        expert_read_stall_add(elapsed_ns(stall_started));
+        if let Some(started) = wait_started {
+            let elapsed = elapsed_ns(started);
+            claim_wait_total_ns = claim_wait_total_ns.saturating_add(elapsed);
+            if elapsed > claim_wait_max_ns {
+                claim_wait_max_ns = elapsed;
+                claim_wait_max_expert = expert;
+            }
+        }
+        match waited {
             Ok(batch)
                 if batch.layer() == layer
                     && batch.expert_ids() == [expert]
                     && batch.layout() == experts.layout()
                     && batch.buffers().other().len() == experts.layout().expert_span_bytes() =>
             {
+                summer_publish_pending(layer, expert);
                 hits.push(batch);
             }
             _ => speculative_failure = true,
         }
     }
+    let into_batches = summer_wait_into_slot(experts, expert_reader, layer, into_slot)?;
     if speculative_failure {
+        let stall_started = Instant::now();
         if let Some(ticket) = demand_ticket {
             let _ = ticket.wait();
         }
         // The retry reads the complete canonical union — including any
         // tier-resident experts — so this fallback stays byte-identical to
         // the established path.
-        let batch = experts.read_union(expert_reader, layer, canonical_expert_ids)?;
+        let batch = experts.read_union(expert_reader, layer, canonical_expert_ids);
+        expert_read_stall_add(elapsed_ns(stall_started));
+        let batch = batch?;
         promote_from_batch(expert_pin_tier, layer, &batch);
         return Ok(ExpertTileLease::Contiguous(batch));
     }
 
+    hits.extend(into_batches);
     hits.sort_unstable_by_key(|batch| batch.expert_ids()[0]);
+    let demand_wait_started = claim_probe.is_some().then(Instant::now);
+    let mut arrival_ticket: Option<ExpertUnionReadTicket> = None;
     let demand = match demand_ticket {
+        Some(ticket) if arrival_groups() > 0 => {
+            arrival_ticket = Some(ticket);
+            None
+        }
         Some(ticket) => {
-            let batch = ticket.wait()?;
+            let stall_started = Instant::now();
+            let waited = ticket.wait();
+            expert_read_stall_add(elapsed_ns(stall_started));
+            let batch = waited?;
             if batch.layer() != layer
                 || batch.expert_ids() != provisional_misses
                 || batch.layout() != experts.layout()
@@ -5801,13 +9045,27 @@ fn read_expert_tile_with_prefetch(
         }
         None => None,
     };
+    if let Some(started) = claim_probe {
+        let demand_ns = demand_wait_started.map_or(0, elapsed_ns);
+        claim_probe_note(
+            elapsed_ns(started),
+            claim_wait_total_ns,
+            claim_wait_max_ns,
+            claim_wait_max_expert,
+            demand_ns,
+            provisional_misses.len(),
+        );
+    }
     for batch in &hits {
         promote_from_batch(expert_pin_tier, layer, batch);
     }
     if let Some(batch) = &demand {
         promote_from_batch(expert_pin_tier, layer, batch);
     }
-    if hits.is_empty() && pinned.is_empty() {
+    if hits.is_empty() && pinned.is_empty() && retained.is_empty() {
+        if let Some(ticket) = arrival_ticket {
+            return Ok(ExpertTileLease::ContiguousArrival(ticket));
+        }
         return demand.map(ExpertTileLease::Contiguous).ok_or_else(|| {
             DeltafinError::new("expert tile merge produced neither resident nor demand bytes")
         });
@@ -5815,8 +9073,10 @@ fn read_expert_tile_with_prefetch(
     Ok(ExpertTileLease::Scattered {
         layout: experts.layout(),
         pinned,
+        retained,
         hits,
         demand,
+        demand_ticket: arrival_ticket,
     })
 }
 
@@ -5828,6 +9088,8 @@ fn finish_expert_mailbox(
     expert_reader: &Reader,
     expert_prefetch_reader: Option<&Reader>,
     pending_expert_prefetch: &mut Option<ExpertPrefetchSet>,
+    oracle_step: Option<u64>,
+    oracle_pending: &mut Vec<ExpertPrefetchSet>,
     mut pilot_gate: Option<&mut PilotGate>,
     expert_heat: &ExpertHeat,
     expert_pin_tier: Option<&ExpertPinTier>,
@@ -5836,8 +9098,15 @@ fn finish_expert_mailbox(
     metal_source_selector: Option<&str>,
     metal_expert_wrapper_retention: bool,
     complete_expert_union: CompleteExpertUnion,
+    parked_expert_lease: &mut Option<ExpertTileLease>,
     mut profile: Option<&mut TargetLayerPhaseProfile>,
 ) -> Result<()> {
+    // Multi-row prefill pass under K3_PREFILL_FANOUT: routes are fully
+    // known, prediction is waste, and the fan-out below replaces it.
+    let prefill_wide = prefill_fanout_enabled()
+        && sequence.mode() == TargetSequenceMode::Prefill
+        && mailbox.position_count() > 1;
+    summer_set_decode_tile(sequence.mode() != TargetSequenceMode::Prefill);
     // The authoritative routes are the free scoring signal: they settle any
     // outstanding lookahead prediction for this layer and reseed the
     // previous-token predictor, before a single expert byte is read.
@@ -5858,6 +9127,266 @@ fn finish_expert_mailbox(
             .filter_map(|row| mailbox.route(row))
             .map(|route| route.ordered_experts()),
     );
+    // K3_ROUTE_ORACLE: (a) tripwire — recorded routes must equal the
+    // authoritative mailbox routes or the replay is misaligned and the arm
+    // is invalid; (b) merge any oracle set due for THIS layer into
+    // pending_expert_prefetch BEFORE the true-route topup diff below, so
+    // topup sees the union and cannot double-submit oracle-covered experts.
+    if let (Some(oracle), Some(step)) = (crate::route_oracle::route_oracle(), oracle_step) {
+        if let Some(recorded) = oracle.routes_for(step, mailbox.layer_index()) {
+            let mut truth: Vec<u16> = (0..mailbox.position_count())
+                .filter_map(|row| mailbox.route(row))
+                .flat_map(|route| route.ordered_experts().iter().copied())
+                .collect();
+            truth.sort_unstable();
+            truth.dedup();
+            if truth != recorded {
+                crate::route_oracle::note_mismatch();
+            }
+        }
+        let mut index = 0;
+        while index < oracle_pending.len() {
+            if oracle_pending[index].target_layer <= mailbox.layer_index() {
+                let due = oracle_pending.swap_remove(index);
+                if due.target_layer != mailbox.layer_index() {
+                    crate::route_oracle::note_stale();
+                    due.cancel_and_drain();
+                    continue;
+                }
+                match pending_expert_prefetch.as_mut() {
+                    None => {
+                        crate::route_oracle::note_merged(due.tickets.len() as u64);
+                        *pending_expert_prefetch = Some(due);
+                    }
+                    Some(pending) if pending.target_layer == due.target_layer => {
+                        let mut duplicates = Vec::new();
+                        let mut merged = 0_u64;
+                        for (expert, ticket) in due.tickets {
+                            if pending.tickets.iter().any(|(have, _)| *have == expert) {
+                                duplicates.push((expert, ticket));
+                            } else {
+                                pending.tickets.push((expert, ticket));
+                                merged += 1;
+                            }
+                        }
+                        crate::route_oracle::note_merged(merged);
+                        crate::route_oracle::note_duplicates(duplicates.len() as u64);
+                        cancel_and_drain_prefetch_tickets(duplicates);
+                    }
+                    Some(_) => {
+                        crate::route_oracle::note_stale();
+                        due.cancel_and_drain();
+                    }
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+    // True-route TOP-UP (K3_TRUE_ROUTE_TOPUP=1): the mailbox routes ARE the
+    // authoritative truth for this layer, while the pending set was submitted
+    // one host window earlier from the pilot's prediction. Submit the set
+    // difference as extra per-expert tickets BEFORE the first tile consumes
+    // the set: the predicted misses then read on the prefetch pool alongside
+    // the planned hits instead of serializing as a demand union at the tail
+    // of the tile's read path.
+    if true_route_topup_enabled() {
+        if let (Some(reader), Some(set)) =
+            (expert_prefetch_reader, pending_expert_prefetch.as_mut())
+        {
+            if set.target_layer == mailbox.layer_index() {
+                let mut missing: Vec<u16> = (0..mailbox.position_count())
+                    .filter_map(|row| mailbox.route(row))
+                    .flat_map(|route| route.ordered_experts().iter().copied())
+                    .filter(|id| !set.tickets.iter().any(|(have, _)| have == id))
+                    .collect();
+                missing.sort_unstable();
+                missing.dedup();
+                if !missing.is_empty() {
+                    topup_log_note(set.target_layer, &missing);
+                    if let Some(extra) =
+                        try_schedule_expert_topup(experts, reader, set.target_layer, &missing)
+                    {
+                        topup_probe_note(extra.len());
+                        set.tickets.extend(extra);
+                    }
+                }
+            }
+        }
+    }
+    // K3_PILOT_EARLY=1: take the pilot hint and submit the next layer's
+    // speculative reads at mailbox-open instead of at this layer's final
+    // tile. The pilot chain was committed alongside the route CB during
+    // prepare and the route wait has already drained it, so the readback is
+    // near-free here — while the submission moves ahead of the entire claim
+    // loop, giving next layer's reads the full current-layer read window of
+    // lead time instead of the few milliseconds after finish.
+    let mut hoisted_due: Option<ExpertPrefetchSet> = None;
+    let early_active = pilot_early_enabled() && expert_prefetch_reader.is_some();
+    if early_active {
+        let hint_started = profile.as_ref().map(|_| Instant::now());
+        hoisted_due = take_due_expert_prefetch(pending_expert_prefetch, mailbox.layer_index());
+        // K3_ROUTE_ORACLE injection — BEFORE the pilot's own scheduling so a
+        // L+1, submit the RECORDED routes of layer L+1+depth (at layer 1,
+        // prime the whole window L+2..=L+1+depth). Targets clamp to <=92;
+        // steps without clean 16-expert records stay oracle-free. Fail-soft:
+        // a full arena drops the whole set and the demand path covers it.
+        if let (Some(oracle), Some(step), Some(reader)) = (
+            crate::route_oracle::route_oracle(),
+            oracle_step,
+            expert_prefetch_reader,
+        ) {
+            let layer = mailbox.layer_index();
+            let depth = oracle.depth();
+            // depth=0: the WASTE-vs-LEAD control arm — replace the pilot's
+            // L+1 submission with perfect recorded routes at the SAME
+            // one-wall lead. Any gain here is accuracy/waste-elimination;
+            // the depth>=1 gains beyond it are attributable to LEAD.
+            let (range_first, deepest) = if depth == 0 {
+                (layer + 1, (layer + 1).min(92))
+            } else {
+                let deepest = (layer + 1 + depth).min(92);
+                let first = if layer == 1 { layer + 2 } else { deepest };
+                (first.max(layer + 2), deepest)
+            };
+            for target in range_first..=deepest {
+                if oracle_pending.iter().any(|set| set.target_layer == target)
+                    || pending_expert_prefetch
+                        .as_ref()
+                        .is_some_and(|set| set.target_layer == target)
+                {
+                    continue;
+                }
+                let Some(ids) = oracle.routes_for(step, target) else {
+                    continue;
+                };
+                match try_schedule_expert_topup(experts, reader, target, ids) {
+                    Some(tickets) => {
+                        crate::route_oracle::note_submitted();
+                        oracle_pending.push(ExpertPrefetchSet {
+                            target_layer: target,
+                            tickets,
+                        });
+                    }
+                    None => crate::route_oracle::note_dropped(),
+                }
+            }
+        }
+        // expert_plan decomposition (§4.1 brief item 5): the hint FFI —
+        // whose pilot readback the provider now times separately — vs. the
+        // speculative read submission below.
+        let hint_ffi_started = profile.as_ref().map(|_| Instant::now());
+        let next_hint = sequence.take_prefetch_hint();
+        add_profile_elapsed(profile.as_deref_mut(), hint_ffi_started, |profile| {
+            &mut profile.expert_plan_hint_ns
+        });
+        let next_hint = match next_hint {
+            Ok(hint) => hint,
+            Err(error) => {
+                if let Some(due) = hoisted_due.take() {
+                    due.cancel_and_drain();
+                }
+                if let Some(pending) = pending_expert_prefetch.take() {
+                    pending.cancel_and_drain();
+                }
+                for set in oracle_pending.drain(..) {
+                    set.cancel_and_drain();
+                }
+                return Err(error);
+            }
+        };
+        let pilot_plan = next_hint
+            .as_ref()
+            .and_then(|hint| ExpertPrefetchPlan::new(hint.target_layer(), hint.expert_ids()));
+        let next_plan = match pilot_gate.as_deref_mut() {
+            Some(gate) => gate.admit(mailbox.layer_index(), pilot_plan),
+            None => pilot_plan,
+        };
+        if let (true, Some(reader), Some(plan)) = (
+            pending_expert_prefetch.is_none(),
+            expert_prefetch_reader,
+            next_plan,
+        ) {
+            // K3_ROUTE_ORACLE: when an oracle set already covers the
+            // pilot's target with perfect recorded truth, the pilot's
+            // prediction is redundant — skip it rather than reading the
+            // overlap twice. A pilot failure under oracle arena pressure is
+            // counted so a degraded arm cannot pass silently.
+            let oracle_covers_target = oracle_step.is_some()
+                && oracle_pending
+                    .iter()
+                    .any(|set| set.target_layer == plan.target_layer());
+            if !oracle_covers_target && !prefill_wide {
+                let sched_started = profile.as_ref().map(|_| Instant::now());
+                *pending_expert_prefetch = try_schedule_expert_prefetch(experts, reader, plan);
+                add_profile_elapsed(profile.as_deref_mut(), sched_started, |profile| {
+                    &mut profile.expert_plan_sched_ns
+                });
+                if pending_expert_prefetch.is_none() && oracle_step.is_some() {
+                    crate::route_oracle::note_pilot_suppressed();
+                }
+            }
+        }
+        add_profile_elapsed(profile.as_deref_mut(), hint_started, |profile| {
+            &mut profile.authoritative_expert_read_prefetch_ns
+        });
+        add_profile_elapsed(profile.as_deref_mut(), hint_started, |profile| {
+            &mut profile.expert_plan_ns
+        });
+    }
+    // K3_PREFILL_FANOUT: pre-submit the layer's full missing union as
+    // Demand-class singles on the prefetch pool (span-sized slots; the
+    // pilot is suppressed for this pass so the arena is free). Fail-soft:
+    // an arena decline stops the fan-out and the tile loop's residual
+    // unions cover the remainder exactly as before.
+    let mut prefill_fanout: Vec<(u16, ExpertUnionReadTicket)> = Vec::new();
+    if prefill_wide {
+        if let Some(reader) = expert_prefetch_reader {
+            let mut union: Vec<u16> = (0..mailbox.position_count())
+                .filter_map(|row| mailbox.route(row))
+                .flat_map(|route| route.ordered_experts().iter().copied())
+                .collect();
+            union.sort_unstable();
+            union.dedup();
+            // Review findings: cap counts only actually-submitted experts
+            // (pin residents don't consume budget), and experts already
+            // covered by a pending/hoisted set for THIS layer are skipped —
+            // at layer 1 the sequence-start seed (widened by true-route
+            // topup) can otherwise duplicate a whole union.
+            let already_covered = |expert: u16| {
+                hoisted_due.as_ref().is_some_and(|set| {
+                    set.target_layer == mailbox.layer_index()
+                        && set.tickets.iter().any(|(have, _)| *have == expert)
+                }) || pending_expert_prefetch.as_ref().is_some_and(|set| {
+                    set.target_layer == mailbox.layer_index()
+                        && set.tickets.iter().any(|(have, _)| *have == expert)
+                })
+            };
+            let mut submitted = 0_usize;
+            for &expert in union.iter() {
+                if submitted >= prefill_fanout_max() {
+                    break;
+                }
+                if already_covered(expert)
+                    || expert_pin_tier
+                        .is_some_and(|tier| tier.lookup(mailbox.layer_index(), expert).is_some())
+                {
+                    continue;
+                }
+                match experts.try_submit_local_demand_one(reader, mailbox.layer_index(), expert) {
+                    Ok(Some(ticket))
+                        if ticket.layer() == mailbox.layer_index()
+                            && ticket.expert_ids() == [expert]
+                            && ticket.layout() == experts.layout() =>
+                    {
+                        prefill_fanout.push((expert, ticket));
+                        submitted += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
     let mut first_row = 0_usize;
     // The established Python/Metal verifier fetches one sorted unique expert
     // union for all candidate rows. Reproduce that topology only for exact
@@ -5932,6 +9461,9 @@ fn finish_expert_mailbox(
             add_profile_elapsed(profile.as_deref_mut(), planning_started, |profile| {
                 &mut profile.authoritative_expert_read_prefetch_ns
             });
+            add_profile_elapsed(profile.as_deref_mut(), planning_started, |profile| {
+                &mut profile.expert_plan_ns
+            });
             if let Some(profile) = profile.as_deref_mut() {
                 let misses = plan.missing_experts().len() as u64;
                 profile.expert_plan_misses = profile.expert_plan_misses.saturating_add(misses);
@@ -5940,6 +9472,7 @@ fn finish_expert_mailbox(
                     .saturating_add((tile.expert_ids().len() as u64).saturating_sub(misses));
             }
             let read_started = profile.as_ref().map(|_| Instant::now());
+            let demand_begin = mono_raw_seconds();
             let misses = if plan.missing_experts().is_empty() {
                 None
             } else {
@@ -5958,9 +9491,19 @@ fn finish_expert_mailbox(
                 }
                 Some(batch)
             };
-            add_profile_elapsed(profile.as_deref_mut(), read_started, |profile| {
-                &mut profile.authoritative_expert_read_prefetch_ns
-            });
+            if misses.is_some() {
+                phase_trace_demand(demand_begin, mono_raw_seconds());
+            }
+            if let (Some(profile), Some(started)) = (profile.as_deref_mut(), read_started) {
+                let elapsed = elapsed_ns(started);
+                profile.authoritative_expert_read_prefetch_ns = profile
+                    .authoritative_expert_read_prefetch_ns
+                    .saturating_add(elapsed);
+                profile.expert_read_gross_ns =
+                    profile.expert_read_gross_ns.saturating_add(elapsed);
+                profile.expert_demand_read_ns =
+                    profile.expert_demand_read_ns.saturating_add(elapsed);
+            }
             let kernel_started = profile.as_ref().map(|_| Instant::now());
             sequence.finish_planned_expert_tile(
                 mailbox,
@@ -5981,18 +9524,65 @@ fn finish_expert_mailbox(
         // next same-layer tile, which correctly rejected and canceled it as a
         // layer mismatch.  Consume only a generation that is due now (or an
         // impossible stale generation, so the existing fail-safe drains it).
-        let due_prefetch = take_due_expert_prefetch(pending_expert_prefetch, mailbox.layer_index());
+        let mut due_prefetch = hoisted_due
+            .take()
+            .or_else(|| take_due_expert_prefetch(pending_expert_prefetch, mailbox.layer_index()));
+        // Hand this tile its share of the prefill fan-out: tickets whose
+        // experts belong to the tile's canonical union ride the existing
+        // hit-claim path; the rest stay queued for later tiles.
+        if !prefill_fanout.is_empty() {
+            let tile_ids = tile.expert_ids();
+            let mut claimed = Vec::new();
+            let mut index = 0;
+            while index < prefill_fanout.len() {
+                if tile_ids.binary_search(&prefill_fanout[index].0).is_ok() {
+                    claimed.push(prefill_fanout.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if !claimed.is_empty() {
+                due_prefetch = match due_prefetch {
+                    Some(mut due) if due.target_layer == mailbox.layer_index() => {
+                        due.tickets.extend(claimed);
+                        Some(due)
+                    }
+                    other => {
+                        if let Some(stale) = other {
+                            stale.cancel_and_drain();
+                        }
+                        Some(ExpertPrefetchSet {
+                            target_layer: mailbox.layer_index(),
+                            tickets: claimed,
+                        })
+                    }
+                };
+            }
+        }
+        let _ = expert_read_stall_take();
         let lease = read_expert_tile_with_prefetch(
             experts,
             expert_reader,
+            expert_prefetch_reader,
             expert_pin_tier,
             mailbox.layer_index(),
             tile.expert_ids(),
             due_prefetch,
         )?;
-        add_profile_elapsed(profile.as_deref_mut(), read_started, |profile| {
-            &mut profile.authoritative_expert_read_prefetch_ns
-        });
+        let read_stall_ns = expert_read_stall_take();
+        if let (Some(profile), Some(started)) = (profile.as_deref_mut(), read_started) {
+            let elapsed = elapsed_ns(started);
+            profile.authoritative_expert_read_prefetch_ns = profile
+                .authoritative_expert_read_prefetch_ns
+                .saturating_add(elapsed);
+            // 2026-09-02 (§4.1): demand read now bills only the host-blocking
+            // read stalls inside the tile read. The whole-call wall it used
+            // to report survives as `expert_read_gross_ns`.
+            profile.expert_read_gross_ns =
+                profile.expert_read_gross_ns.saturating_add(elapsed);
+            profile.expert_demand_read_ns =
+                profile.expert_demand_read_ns.saturating_add(read_stall_ns);
+        }
         // The provider materializes the optional scheduling hint only after
         // Rust has the real current-layer route and its authoritative bytes.
         // An ABI error is terminal because the sequence cancels itself; a
@@ -6000,14 +9590,27 @@ fn finish_expert_mailbox(
         let final_tile = first_row
             .checked_add(tile.row_count)
             .is_some_and(|end| end == mailbox.position_count());
+        // K3_TRUE_ROUTE_HINT=1 defers the hint until AFTER finish: the
+        // provider's pre-commit orchestration chains the successor layer's
+        // route CB inside finish, and the deferred hint then carries that
+        // TRUE top-16 instead of the pilot's one-further prediction.
+        let defer_hint_for_true_route =
+            true_route_hint_enabled() && expert_prefetch_reader.is_some();
         let hint_started = profile.as_ref().map(|_| Instant::now());
-        let next_hint = if expert_prefetch_reader.is_some() && final_tile {
+        let next_hint = if expert_prefetch_reader.is_some()
+            && final_tile
+            && !defer_hint_for_true_route
+            && !early_active
+        {
             sequence.take_prefetch_hint()?
         } else {
             None
         };
         add_profile_elapsed(profile.as_deref_mut(), hint_started, |profile| {
             &mut profile.authoritative_expert_read_prefetch_ns
+        });
+        add_profile_elapsed(profile.as_deref_mut(), hint_started, |profile| {
+            &mut profile.expert_hint_ns
         });
         // Match the proven scheduler only at L's final tile: once every
         // authoritative demand tile and the provider-owned hint have landed,
@@ -6024,7 +9627,7 @@ fn finish_expert_mailbox(
         // better-scoring predictor, or suppresses this layer's speculative
         // reads. Without a governor the hint passes through unchanged.
         let submit_started = profile.as_ref().map(|_| Instant::now());
-        let next_plan = if expert_prefetch_reader.is_some() && final_tile {
+        let next_plan = if expert_prefetch_reader.is_some() && final_tile && !prefill_wide {
             let pilot_plan = next_hint
                 .as_ref()
                 .and_then(|hint| ExpertPrefetchPlan::new(hint.target_layer(), hint.expert_ids()));
@@ -6045,6 +9648,9 @@ fn finish_expert_mailbox(
         };
         add_profile_elapsed(profile.as_deref_mut(), submit_started, |profile| {
             &mut profile.authoritative_expert_read_prefetch_ns
+        });
+        add_profile_elapsed(profile.as_deref_mut(), submit_started, |profile| {
+            &mut profile.expert_submit_ns
         });
 
         let kernel_started = profile.as_ref().map(|_| Instant::now());
@@ -6069,13 +9675,524 @@ fn finish_expert_mailbox(
             }
             return Err(error);
         }
+        // K3_EXPERT_RETAIN=1: the tile's bytes are consumed (synchronous
+        // tail contract) — keep them alive one token as the layer's
+        // retained generation before the lease's slots release below.
+        // Decode tiles only: prefill unions run to 64 experts × 92 layers
+        // (~100GB of leases — the first flag-on gate died to the OOM
+        // killer retaining them), and cross-token reuse is a decode
+        // phenomenon anyway.
+        // K3_RETAIN_DRAFTED=1 widens this to drafted decode tiles. The
+        // position_count()==1 test was written before drafting and excludes two
+        // very different things: PREFILL unions (measured 112 experts x 92
+        // layers — genuinely the OOM the comment above describes) and DRAFTED
+        // DECODE tiles (~6.75 positions, ~60 experts). Only the first is
+        // dangerous, and retain_expert_tile now bounds itself to TOP_K entries
+        // regardless of tile width, so the drafted case fits the same budget a
+        // single-position tile does.
+        //
+        // Why bother: retain measured +2.45%/+1.82% (two replicates, 200 tok,
+        // vs 2 controls) in CHAT — the only replicated positive in the corpus —
+        // but those arms predate drafting, so the champion never engages it.
+        if mailbox.position_count() <= retain_max_positions() {
+            retain_expert_tile(mailbox.layer_index(), &lease);
+        }
+        if tail_async_enabled() {
+            // The provider may have deferred this tile's tail CB. Parking the
+            // lease one layer keeps the staged expert byte spans alive until
+            // the successor tail's entry drain (or the runtime's eager drain
+            // when no successor chains) proves the GPU is done reading them —
+            // only then does the next park drop these spans.
+            *parked_expert_lease = Some(lease);
+        }
+        // Deferred true-route hint (K3_TRUE_ROUTE_HINT=1): the chained
+        // route CB now exists; the hint returns the successor layer's TRUE
+        // top-16 (pilot prediction as the provider-side fallback).
+        let next_prefetch = if next_prefetch.is_none()
+            && defer_hint_for_true_route
+            && final_tile
+            && !early_active
+            && !prefill_wide
+        {
+            let hint_started = profile.as_ref().map(|_| Instant::now());
+            let next_hint = sequence.take_prefetch_hint()?;
+            let pilot_plan = next_hint
+                .as_ref()
+                .and_then(|hint| ExpertPrefetchPlan::new(hint.target_layer(), hint.expert_ids()));
+            let next_plan = match pilot_gate.as_deref_mut() {
+                Some(gate) => gate.admit(mailbox.layer_index(), pilot_plan),
+                None => pilot_plan,
+            };
+            let scheduled = match (
+                pending_expert_prefetch.is_none(),
+                expert_prefetch_reader,
+                next_plan,
+            ) {
+                (true, Some(reader), Some(plan)) => {
+                    try_schedule_expert_prefetch(experts, reader, plan)
+                }
+                _ => None,
+            };
+            add_profile_elapsed(profile.as_deref_mut(), hint_started, |profile| {
+                &mut profile.authoritative_expert_read_prefetch_ns
+            });
+            add_profile_elapsed(profile.as_deref_mut(), hint_started, |profile| {
+                &mut profile.expert_submit_ns
+            });
+            scheduled
+        } else {
+            next_prefetch
+        };
         if let Some(prefetch) = next_prefetch {
             debug_assert!(pending_expert_prefetch.is_none());
             *pending_expert_prefetch = Some(prefetch);
         }
         first_row += tile.row_count;
     }
+    // Leftover fan-out tickets (defensive: every union expert belongs to
+    // some tile, so this should be empty) must not outlive the mailbox.
+    cancel_and_drain_prefetch_tickets(prefill_fanout);
     Ok(())
+}
+
+/// K3_TOPUP_LOG=<path>: append one "layer expert" line per topped-up expert.
+/// The aggregated frequency histogram is the placement priority for the
+/// hot-tier inversion — the experts that actually get topped up are the ones
+/// whose reads start latest and therefore deserve the fastest device.
+fn topup_log_note(layer: u32, missing: &[u16]) {
+    use std::io::Write;
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let Some(file) = LOG.get_or_init(|| {
+        let path = std::env::var("K3_TOPUP_LOG").ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(std::sync::Mutex::new(file))
+    }) else {
+        return;
+    };
+    let Ok(mut file) = file.lock() else {
+        return;
+    };
+    let mut buffer = String::with_capacity(missing.len() * 10);
+    for &expert in missing {
+        buffer.push_str(&format!("{layer} {expert}\n"));
+    }
+    let _ = file.write_all(buffer.as_bytes());
+}
+
+/// K3_ROUTE_SYNC_PROBE-gated telemetry for the true-route top-up: mean
+/// topped-up experts per layer, printed once per 92 layers.
+fn topup_probe_note(count: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static EXPERTS: AtomicU64 = AtomicU64::new(0);
+    if !*PROBING
+        .get_or_init(|| std::env::var("K3_ROUTE_SYNC_PROBE").is_ok_and(|value| value == "1"))
+    {
+        return;
+    }
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let experts = EXPERTS.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
+    if calls % 92 == 0 {
+        eprintln!(
+            "[topup] layers={calls} topped_up_mean={:.2}/layer",
+            experts as f64 / calls as f64
+        );
+    }
+}
+
+/// Companion to topup_probe_note on the paths that produce NOTHING. A declined
+/// top-up is invisible today — topup_probe_note only counts successes, so a run
+/// with K3_TRUE_ROUTE_TOPUP=1 and a top-up that never once fired reports the
+/// same silence as one that was never enabled. The two decline causes need
+/// separating because only the first is fixed by raising K3_TOPUP_MAX: the cap
+/// rejecting a batched union outright, versus the arena refusing a ticket
+/// mid-batch (which discards the whole set). Both fall through to the demand
+/// union. Oracle-path declines land here too and are also counted by
+/// route_oracle::note_dropped, so subtract that when both arms are enabled.
+fn topup_decline_note(missing: usize, arena_full: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static ARENA: AtomicU64 = AtomicU64::new(0);
+    static MISSING: AtomicU64 = AtomicU64::new(0);
+    static WORST: AtomicU64 = AtomicU64::new(0);
+    if !*PROBING
+        .get_or_init(|| std::env::var("K3_ROUTE_SYNC_PROBE").is_ok_and(|value| value == "1"))
+    {
+        return;
+    }
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let arena = ARENA.fetch_add(u64::from(arena_full), Ordering::Relaxed) + u64::from(arena_full);
+    let total = MISSING.fetch_add(missing as u64, Ordering::Relaxed) + missing as u64;
+    let worst = WORST
+        .fetch_max(missing as u64, Ordering::Relaxed)
+        .max(missing as u64);
+    if calls % 92 == 0 {
+        eprintln!(
+            "[topup] declined={calls} over_cap={} arena_full={arena} missing_mean={:.2} missing_max={worst} cap={}",
+            calls - arena,
+            total as f64 / calls as f64,
+            topup_max_experts(),
+        );
+    }
+}
+
+fn true_route_hint_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("K3_TRUE_ROUTE_HINT").is_ok_and(|value| value == "1")
+    })
+}
+
+/// K3_CLAIM_PROBE=1: decompose the expert-claim window. Per 92 calls prints
+/// mean window, mean summed ticket wait, mean/worst single-ticket wait (with
+/// the worst expert ID so its device tier can be identified offline), mean
+/// demand-union wait, and mean miss count — the numbers that separate "one
+/// straggler device" from "serialized claims" from "fixed host work".
+fn claim_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_CLAIM_PROBE").is_ok_and(|value| value == "1"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_probe_note(
+    window_ns: u64,
+    claim_sum_ns: u64,
+    claim_max_ns: u64,
+    claim_max_expert: u16,
+    demand_ns: u64,
+    miss_count: usize,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static WINDOW: AtomicU64 = AtomicU64::new(0);
+    static CLAIM_SUM: AtomicU64 = AtomicU64::new(0);
+    static CLAIM_MAX_SUM: AtomicU64 = AtomicU64::new(0);
+    static DEMAND: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+    static WORST: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    WINDOW.fetch_add(window_ns, Ordering::Relaxed);
+    CLAIM_SUM.fetch_add(claim_sum_ns, Ordering::Relaxed);
+    CLAIM_MAX_SUM.fetch_add(claim_max_ns, Ordering::Relaxed);
+    DEMAND.fetch_add(demand_ns, Ordering::Relaxed);
+    MISSES.fetch_add(miss_count as u64, Ordering::Relaxed);
+    let worst_packed = (claim_max_ns << 16) | u64::from(claim_max_expert);
+    WORST.fetch_max(worst_packed, Ordering::Relaxed);
+    if calls % 92 == 0 {
+        let n = calls as f64;
+        let worst = WORST.swap(0, Ordering::Relaxed);
+        eprintln!(
+            "[claim-probe] calls={calls} window_mean={:.2}ms claim_sum_mean={:.2}ms \
+             claim_max_mean={:.2}ms demand_mean={:.2}ms miss_mean={:.2} \
+             worst_single={:.2}ms@E{}",
+            WINDOW.load(Ordering::Relaxed) as f64 / n / 1e6,
+            CLAIM_SUM.load(Ordering::Relaxed) as f64 / n / 1e6,
+            CLAIM_MAX_SUM.load(Ordering::Relaxed) as f64 / n / 1e6,
+            DEMAND.load(Ordering::Relaxed) as f64 / n / 1e6,
+            MISSES.load(Ordering::Relaxed) as f64 / n,
+            (worst >> 16) as f64 / 1e6,
+            worst & 0xFFFF,
+        );
+    }
+}
+
+/// K3_DEMAND_FANOUT=1 (v6 audit §0.1): split each decode miss union across
+/// BOTH Reader pools — the residual union on the demand pool plus
+/// Demand-class single-expert tickets on the prefetch pool — so a 16-miss
+/// union reaches 16 workers in one service round instead of two. Demand
+/// class pops ahead of queued prefetch work; submissions are non-blocking
+/// and fold back into the residual union on a full arena. Default-off.
+fn demand_fanout_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_DEMAND_FANOUT").is_ok_and(|value| value == "1"))
+}
+
+/// K3_ARRIVAL_GROUPS=<n>: arrival-driven expert compute (default 0 = off).
+/// The expert tile is dispatched in groups as bytes land — resident spans
+/// (pin tier, retained, prefetch hits) first, then the demand union in `n`
+/// waves by arrival order — with the provider accumulating partial routed
+/// outputs and completing rows on the last group. Changes fp32 summation
+/// order: gated by token equivalence (K3_STEP_LOG + k3-equiv-gate.py), not
+/// md5 identity. Trace simulation 2026-09-04: 2 waves ≈ 89 ms/token, 4 waves
+/// ≈ 137 ms/token of read/compute overlap.
+/// Arrival-driven compute telemetry (cumulative, printed with [opens]):
+/// time the decode thread spent waiting for uncovered demand experts inside
+/// the wave loop vs time inside partial/final provider dispatches.
+static ARRIVAL_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ARRIVAL_DISPATCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ARRIVAL_WAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ARRIVAL_TILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn arrival_report() -> Option<(u64, u64, u64, u64)> {
+    if arrival_groups() == 0 {
+        return None;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    Some((
+        ARRIVAL_TILES.load(Relaxed),
+        ARRIVAL_WAVES.load(Relaxed),
+        ARRIVAL_WAIT_NS.load(Relaxed),
+        ARRIVAL_DISPATCH_NS.load(Relaxed),
+    ))
+}
+
+fn verify_admit_always() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_VERIFY_ADMIT_ALWAYS").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn arrival_groups() -> usize {
+    static GROUPS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GROUPS.get_or_init(|| {
+        std::env::var("K3_ARRIVAL_GROUPS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(0, |groups| groups.min(16))
+    })
+}
+
+/// K3_LOSER_DROP=1: release a cancelled speculative ticket instead of waiting
+/// for a pread a worker had already claimed. `cancel_unclaimed` cannot reclaim
+/// that job, and its bytes are discarded on both paths, so the wait buys
+/// nothing but a serialization of the decode thread behind wrong speculation.
+///
+/// Releasing early is memory-safe because the ticket never owned the arena
+/// slot: the slot is held by the batch's `Arc<BufferLeaseInner>`, and
+/// `worker_main` keeps its own `Arc<Batch>` across the whole of `run_job`,
+/// dropping it before it publishes completion (storage.rs). The slot is
+/// therefore released on the worker thread after the syscall returns, never
+/// under live I/O, and `ReadTicket::drop` already takes exactly this path.
+/// Default-off.
+fn loser_drop_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_LOSER_DROP").is_ok_and(|value| value == "1"))
+}
+
+/// K3_LOSER_PROBE=1: size the cancelled-loser drain before trusting it to
+/// K3_LOSER_DROP. Per 92 consults prints the mean loser count, how many were
+/// already quiesced when the drain reached them (a not-ready loser is one
+/// whose pread a worker had claimed, i.e. the only kind that blocks), and the
+/// mean time the decode thread spent there — the ceiling on the win.
+fn loser_probe_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_LOSER_PROBE").is_ok_and(|value| value == "1"))
+}
+
+fn loser_probe_note(losers: usize, ready: usize, wait_ns: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static LOSERS: AtomicU64 = AtomicU64::new(0);
+    static READY: AtomicU64 = AtomicU64::new(0);
+    static WAIT: AtomicU64 = AtomicU64::new(0);
+    static WORST: AtomicU64 = AtomicU64::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    LOSERS.fetch_add(losers as u64, Ordering::Relaxed);
+    READY.fetch_add(ready as u64, Ordering::Relaxed);
+    WAIT.fetch_add(wait_ns, Ordering::Relaxed);
+    WORST.fetch_max(wait_ns, Ordering::Relaxed);
+    if calls % 92 == 0 {
+        let n = calls as f64;
+        eprintln!(
+            "[loser-probe] calls={calls} loser_mean={:.2} ready_mean={:.2} \
+             blocked_mean={:.3}ms worst={:.2}ms",
+            LOSERS.load(Ordering::Relaxed) as f64 / n,
+            READY.load(Ordering::Relaxed) as f64 / n,
+            WAIT.load(Ordering::Relaxed) as f64 / n / 1e6,
+            WORST.swap(0, Ordering::Relaxed) as f64 / 1e6,
+        );
+    }
+}
+
+/// K3_PREFILL_FANOUT=1 (v6 audit §0.2, brief upgraded 2026-08-26): during
+/// multi-row PREFILL passes the layer's routes are fully known at
+/// mailbox-open, so (a) the pilot's speculative submission is suppressed —
+/// the 5 ms profile showed drives running 13-16 GB/s on near-pure
+/// speculative waste while the needed union crawled at ~0.5 GB/s effective
+/// through the one-union-per-tile barrier — and (b) the layer's full union
+/// is pre-submitted as Demand-class singles on the prefetch pool, consumed
+/// per tile as hits. Read order changes; bytes and kernel order do not.
+fn prefill_fanout_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_PREFILL_FANOUT").is_ok_and(|value| value == "1"))
+}
+
+/// Cap on in-flight prefill fan-out singles per layer (span-sized prefetch
+/// arena slots; 129 exist at K3_EXPERT_PREFETCH_GENERATIONS=4, and the
+/// pilot is suppressed for these passes so the arena is otherwise idle).
+fn prefill_fanout_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("K3_PREFILL_FANOUT_MAX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(96, |value| value.clamp(16, 120))
+    })
+}
+
+fn pilot_early_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_PILOT_EARLY").is_ok_and(|value| value == "1"))
+}
+
+/// K3_TAIL_ASYNC=1: the provider defers each loop MoE tail's host wait by
+/// one layer, so the staged expert bytes must stay alive one layer longer.
+/// The lease park below holds them, and the arenas grow one generation so
+/// the parked slots cannot starve the next layer's reads.
+fn tail_async_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_TAIL_ASYNC").is_ok_and(|value| value == "1"))
+}
+
+/// K3_EXPERT_ARENA_SLOTS=N (default 1 = upstream): demand-union arena
+/// depth. With one slot, layer N+1's authoritative union cannot be
+/// admitted until layer N's kernel drops its lease, so both enclosure
+/// pools idle through every expert kernel + route readback (measured
+/// 2026-08-24: enclosures at 47% of capability, internal 69%). A second
+/// slot lets the next layer's reads start inside that window — the same
+/// pattern the spine runtime already uses (SPINE_ARENA_SLOTS = 2). Costs
+/// one extra resident union slab (~280 MB) per slot. Clamped 1..=4;
+/// unparsable values fail closed to the upstream default.
+fn expert_arena_slots() -> usize {
+    static SLOTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let configured = *SLOTS.get_or_init(|| {
+        std::env::var("K3_EXPERT_ARENA_SLOTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|slots| (1..=4).contains(slots))
+            .unwrap_or(EXPERT_ARENA_SLOTS)
+    });
+    configured + usize::from(tail_async_enabled())
+}
+
+/// Resolved arena depths, for the `[native] expert arena:` line. Neither knob
+/// appears in `[config] resolved:`, so these are the only assertable record of
+/// what actually took effect.
+pub fn expert_arena_slots_report() -> usize {
+    expert_arena_slots()
+}
+
+pub fn expert_prefetch_slots_report() -> usize {
+    expert_prefetch_live_slots()
+}
+
+/// K3_EXPERT_PREFETCH_GENERATIONS=N (default 2 = upstream): how many layers
+/// of speculative expert reads may be in flight at once. Measured 2026-08-24:
+/// the early hint+schedule site costs 22.2s per 40 tokens (5.3ms/layer, ~19%
+/// of the token) and only 2.6s of that is file opens — the remainder is
+/// submission waiting for a free prefetch slot, i.e. the pipeline is depth-
+/// bound at two generations. Each extra generation costs 32 x 17.5 MiB =
+/// ~560 MB of resident buffers, charged through native_fixed_costs.
+/// Clamped 1..=8; unparsable values fail closed to upstream.
+fn expert_prefetch_live_slots() -> usize {
+    static GENERATIONS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let generations = *GENERATIONS.get_or_init(|| {
+        std::env::var("K3_EXPERT_PREFETCH_GENERATIONS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|generations| (1..=8).contains(generations))
+            .unwrap_or(EXPERT_PREFETCH_GENERATIONS)
+    });
+    // A top-up's tickets merge into the SAME generation as the pilot plan, so
+    // a raised K3_TOPUP_MAX needs slots for both or the arena fills and the
+    // fail-soft path silently drops the set back to the demand union — the
+    // exact cost the top-up exists to avoid. Costs 17.5 MiB per extra slot.
+    let per_generation = EXPERT_PREFETCH_MAX_EXPERTS
+        + topup_max_experts().saturating_sub(K3_EXPERT_TOP_K);
+    (generations + usize::from(tail_async_enabled())) * per_generation
+}
+
+fn expert_prefetch_arena_slots() -> usize {
+    expert_prefetch_live_slots() + 1
+}
+
+fn true_route_topup_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("K3_TRUE_ROUTE_TOPUP").is_ok_and(|value| value == "1")
+    })
+}
+
+/// Ceiling on a single true-route top-up (K3_TOPUP_MAX, default
+/// K3_EXPERT_TOP_K = 16, clamped 1..=128).
+///
+/// The original bound assumed a top-up is "a handful" — true for a
+/// single-position decode tile, where the pilot mispredicts a few of 16. Under
+/// drafting the mailbox carries ~6.75 positions, so `missing` is the set
+/// difference over the whole batched union: measured mean 41.8 against a ~60
+/// expert tile. Every top-up therefore hit `missing.len() > K3_EXPERT_TOP_K`
+/// and returned None, which is why K3_TRUE_ROUTE_TOPUP=1 has been inert in the
+/// champion recipe — the misses fell through to the demand union it exists to
+/// prevent (measured: demand is 96.6% of expert stall, 40.54ms of 41.96ms).
+///
+/// Default is unchanged so the champion stays byte-identical until opted in.
+fn topup_max_experts() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("K3_TOPUP_MAX")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(K3_EXPERT_TOP_K, |max| max.clamp(1, 128))
+    })
+}
+
+/// True-route top-up (read-depth work): submit one-expert prefetches for the
+/// handful of experts the pilot's plan missed, discovered from the chained
+/// route's true top-16 a few milliseconds after the tail instead of at
+/// plan time. No lower-bound gate: a top-up is deliberately small. The
+/// tickets merge into the SAME pending set as the pilot plan, so the tile
+/// read consumes one unified generation.
+fn try_schedule_expert_topup(
+    experts: &RawExpertCorpus,
+    reader: &Reader,
+    target_layer: u32,
+    missing: &[u16],
+) -> Option<Vec<(u16, ExpertUnionReadTicket)>> {
+    // K3_SUMMER_SUPPRESS (2026-09-02): a top-up for an expert the pool already
+    // holds is a wasted read — the demand path serves it from RAM. Hits were
+    // removing only ~half their file opens; this path was the other half.
+    let wanted: Vec<u16> = missing
+        .iter()
+        .copied()
+        .filter(|&expert| !summer_is_ready(target_layer, expert))
+        .collect();
+    let suppressed = missing.len().saturating_sub(wanted.len());
+    if suppressed > 0 {
+        SUMMER_SUPPRESSED.fetch_add(suppressed as u64, std::sync::atomic::Ordering::Relaxed);
+        SUMMER_TOPUP_SUPPRESSED.fetch_add(suppressed as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    if wanted.is_empty() {
+        return Some(Vec::new());
+    }
+    if wanted.len() > topup_max_experts() {
+        topup_decline_note(wanted.len(), false);
+        return None;
+    }
+    let mut tickets = Vec::with_capacity(wanted.len());
+    for &expert in &wanted {
+        let ticket = match experts.try_submit_local_prefetch_one(reader, target_layer, expert) {
+            Ok(Some(ticket))
+                if ticket.layer() == target_layer
+                    && ticket.expert_ids() == [expert]
+                    && ticket.layout() == experts.layout() =>
+            {
+                ticket
+            }
+            _ => {
+                cancel_and_drain_prefetch_tickets(tickets);
+                topup_decline_note(wanted.len(), true);
+                return None;
+            }
+        };
+        tickets.push((expert, ticket));
+    }
+    Some(tickets)
 }
 
 fn add_profile_elapsed<F>(
@@ -6313,7 +10430,15 @@ fn admit_dynamic_complete_verifier_union(
             provider_bytes: 0,
         },
         ResidencyOverride::default(),
-        ResidencyPolicy::default(),
+        // Fourth site of the reserve-policy family (growth-time, load-time,
+        // verify-width, and now the complete verifier union): honor
+        // K3_HOST_RESERVE_GB instead of the stock ~23 GiB floor. With the
+        // stock floor any dip in probed host memory (an external allocation,
+        // a Summer pool, a RAM ballast) refuses the complete union, the chunk
+        // splits into overlapping <=64-expert tiles and shared experts are
+        // read once per tile: measured 2026-09-04 as tiles 695 -> 987-1005,
+        // +10% requested bytes and -13% tok/s at a 12 GiB reservation.
+        host_reserve_policy_from_env("K3_HOST_RESERVE_GB"),
     );
     selection.stop == ResidencyStop::AllLayersFit
 }
@@ -6399,7 +10524,25 @@ fn cancel_after_error(sequence: TargetSequence, error: DeltafinError) -> Deltafi
     }
 }
 
+fn print_metal_expert_cache_stats(provider: &NativeProviderSession) {
+    // K3_EXPERT_RETAIN gate (handover 5c): decide whether the graveyard's
+    // GLOBAL k3_metal_flush is destroying warm wrappers super-linearly with
+    // coverage. Confirmed if copies/wraps-per-call climb sharply from 8 to
+    // 14 GiB retention. Err is expected and silent off-MPS.
+    if let Ok(cache_stats) = provider.metal_expert_cache_stats() {
+        eprintln!(
+            "[metal-cache] calls={} zero_copy_wraps={} copies={} cache_entries={} bindless={}",
+            cache_stats.calls,
+            cache_stats.zero_copy_wraps,
+            cache_stats.copies,
+            cache_stats.cache_entries,
+            cache_stats.bindless,
+        );
+    }
+}
+
 fn print_run_stats(counters: &NativeRunCounters, started: Instant) {
+    summer_age_tick(counters.generated_tokens);
     let elapsed = started.elapsed().as_secs_f64();
     let tokens_per_second = if elapsed > 0.0 {
         counters.generated_tokens as f64 / elapsed
@@ -6423,20 +10566,217 @@ fn print_run_stats(counters: &NativeRunCounters, started: Instant) {
         counters.expert_rows,
         counters.expert_tiles,
     );
+    if counters.verify_transactions != 0 {
+        let hist = &counters.verify_width_histogram;
+        let total: u64 = hist.iter().sum();
+        eprintln!(
+            "[verify-width] w1={} w2={} w3={} w4={} w5={} w6={} w7={} w8+={}              (w1 share {:.1}% of {total} transactions)",
+            hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7],
+            hist[8],
+            if total == 0 { 0.0 } else { 100.0 * hist[1] as f64 / total as f64 },
+        );
+    }
     if counters.target_profile.chunks != 0 {
         let totals = counters.target_profile.layer_totals();
+        {
+            let (open_ns, opens) = crate::storage::expert_open_totals();
+            if opens != 0 {
+                eprintln!(
+                    "[opens] expert file opens={} total={:.3}s mean={:.3}ms requested_bytes={} ({:.1} GB)",
+                    opens,
+                    ns_seconds(open_ns),
+                    open_ns as f64 / opens as f64 / 1.0e6,
+                    crate::storage::expert_read_bytes_total(),
+                    crate::storage::expert_read_bytes_total() as f64 / 1.0e9,
+                );
+                if let Some((hot, dir_c, dir_b, primary)) = crate::storage::split_eta_report() {
+                    eprintln!(
+                        "[split-eta] chunks served hot={hot} dir_c={dir_c} dir_b={dir_b} primary={primary}"
+                    );
+                }
+                if let Some(lines) = crate::storage::split_trace_report() {
+                    for line in lines {
+                        eprintln!("{line}");
+                    }
+                }
+                if let Some((tiles, waves, wait_ns, dispatch_ns)) = arrival_report() {
+                    eprintln!(
+                        "[arrival] tiles={tiles} waves={waves} uncovered_wait={:.3}s dispatch={:.3}s",
+                        ns_seconds(wait_ns),
+                        ns_seconds(dispatch_ns),
+                    );
+                }
+            }
+            // Emitted even when every counter is zero: a silent zero is
+            // indistinguishable from a knob that never applied, which is
+            // exactly how two retain A/Bs measured nothing on 2026-08-31.
+            {
+                let (enabled, cap_gb, first_layer) = retain_config_report();
+                let (calls, wanted, hits, inserts, bytes) = retain_run_report();
+                eprintln!(
+                    "[retain] enabled={enabled} cap_gb={cap_gb} layers={first_layer}..=92 \
+consults={calls} wanted={wanted} hits={hits} inserts={inserts} served={:.1}MB",
+                    bytes as f64 / 1e6,
+                );
+            }
+            {
+                let (enabled, cap_gb, sample) = summer_config_report();
+                let (
+                    consults, wanted, hits, inserts, evictions, served, copied, entries, bytes,
+                    recycled, allocs, pin_skips, gated, bar,
+                ) = summer_run_report();
+                // Named arguments throughout. The positional form silently
+                // shifted every field after `hit_rate` when the ramp was added,
+                // so a disabled pool reported "hit_rate=2% misses=50" — which
+                // were min_hits and max_hits landing in the wrong slots.
+                let hit_rate = if wanted == 0 {
+                    0.0
+                } else {
+                    100.0 * hits as f64 / wanted as f64
+                };
+                eprintln!(
+                    "[summer] enabled={enabled} cap_gb={cap_gb} sample={sample} \
+consults={consults} wanted={wanted} hits={hits} hit_rate={hit_rate:.1}% \
+misses={misses} inserts={inserts} evictions={evictions} recycled={recycled} \
+allocs={allocs} pin_skips={pin_skips} gated={gated} ramp={lo}..{hi} bar={bar} \
+suppressed={suppressed} wide_skips={wide_skips} \
+served={served_mb:.1}MB copied={copied_mb:.1}MB ssd_avoided={avoided_gb:.1}GB \
+live={entries}/{live_gb:.1}GB model={model} protected={protected} declined={declined} \
+topup_suppressed={topup_sup} aged={aged} into={into_sub}/{into_pub}/{into_abort} pending={pending_n}",
+                    misses = wanted.saturating_sub(hits),
+                    wide_skips =
+                        SUMMER_WIDE_SKIPS.load(std::sync::atomic::Ordering::Relaxed),
+                    // Prefetch submissions the cache made unnecessary. THE assertion
+                    // for this build: if suppressed==0 the planning-time skip did not
+                    // land and the arm reports nothing, whatever its tok/s says.
+                    suppressed = summer_suppressed_report(),
+                    lo = summer_min_hits(),
+                    hi = summer_max_hits(),
+                    served_mb = served as f64 / 1e6,
+                    copied_mb = copied as f64 / 1e6,
+                    avoided_gb = served as f64 / 1e9,
+                    live_gb = bytes as f64 / 1e9,
+                    model = summer_model_enabled() as u8,
+                    protected = summer_protected_count(),
+                    declined = SUMMER_DECLINED.load(std::sync::atomic::Ordering::Relaxed),
+                    topup_sup = SUMMER_TOPUP_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed),
+                    aged = SUMMER_AGED.load(std::sync::atomic::Ordering::Relaxed),
+                    into_sub = SUMMER_INTO_SUBMITTED.load(std::sync::atomic::Ordering::Relaxed),
+                    into_pub = SUMMER_INTO_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed),
+                    into_abort = SUMMER_INTO_ABORTED.load(std::sync::atomic::Ordering::Relaxed),
+                    pending_n = summer_pool().lock().map(|pool| pool.pending.len()).unwrap_or(0),
+                );
+                summer_dump_served();
+                crate::storage::trace_dump();
+            }
+            {
+                // Per-device dispatch, the diagnostic the two-way scheduler
+                // never had. Emitted always: a four-way clock that silently
+                // degenerates to one device is the exact failure this replaces.
+                let (i, c, b, a) = crate::storage::mirror_device_split();
+                let tot = (i + c + b + a).max(1);
+                eprintln!(
+                    "[mirror-split] internal={i} K3C={c} K3B={b} K3A={a}  \
+shares={:.0}%/{:.0}%/{:.0}%/{:.0}%",
+                    100.0 * i as f64 / tot as f64,
+                    100.0 * c as f64 / tot as f64,
+                    100.0 * b as f64 / tot as f64,
+                    100.0 * a as f64 / tot as f64,
+                );
+            }
+            if let Some(report) = crate::storage::stall_trace_report() {
+                eprintln!("{report}");
+            }
+            if let Some(report) = crate::route_oracle::oracle_report() {
+                eprintln!("{report}");
+            }
+        }
+        // Attention-timer split (2026-09-02): the provider's own clock over
+        // the prepare ABI call, summed over both tile-width paths. total ≈
+        // attention_resident minus FFI overhead; encode = host CPU on the
+        // critical path; wait = host blocked on THIS layer's GPU work;
+        // drain = blocked behind EARLIER GPU work. Cumulative like the rest.
+        let prep = crate::provider::prep_timer_report().unwrap_or_default();
+        let attn_total_ns = prep.single.total_ns.saturating_add(prep.wide.total_ns);
+        let attn_wait_all_ns = prep.single.wait_ns.saturating_add(prep.wide.wait_ns);
+        let attn_drain_ns = prep.single.drain_ns.saturating_add(prep.wide.drain_ns);
+        let kernel_total_ns = prep.finish_single.total_ns.saturating_add(prep.finish_wide.total_ns);
+        let kernel_wait_ns = prep.finish_single.wait_ns.saturating_add(prep.finish_wide.wait_ns);
+        let kernel_drain_ns = prep.finish_single.drain_ns.saturating_add(prep.finish_wide.drain_ns);
         eprintln!(
-            "[phases] chunks={} sequence={:.3}s read_wait={:.3}s bind_upload={:.3}s attention_resident={:.3}s expert_read_prefetch={:.3}s expert_kernel={:.3}s source_fence={:.3}s tail_head_sync={:.3}s layer_other={:.3}s",
+            "[phases] mono={:.6} chunks={} sequence={:.3}s read_wait={:.3}s bind_upload={:.3}s attention_resident={:.3}s expert_read_prefetch={:.3}s expert_demand_read={:.3}s expert_plan={:.3}s expert_hint={:.3}s expert_submit={:.3}s expert_kernel={:.3}s source_fence={:.3}s tail_head_sync={:.3}s layer_other={:.3}s expert_read_gross={:.3}s plan_hint={:.3}s plan_sched={:.3}s attn_total={:.3}s attn_encode={:.3}s attn_wait={:.3}s attn_drain={:.3}s kernel_total={:.3}s kernel_host={:.3}s kernel_wait={:.3}s kernel_drain={:.3}s",
+            mono_raw_seconds(),
             counters.target_profile.chunks,
             ns_seconds(counters.target_profile.sequence_total_ns),
             ns_seconds(totals.spine_read_wait_ns),
             ns_seconds(totals.spine_bind_upload_ns),
             ns_seconds(totals.attention_resident_compute_ns),
             ns_seconds(totals.authoritative_expert_read_prefetch_ns),
+            ns_seconds(totals.expert_demand_read_ns),
+            ns_seconds(totals.expert_plan_ns),
+            ns_seconds(totals.expert_hint_ns),
+            ns_seconds(totals.expert_submit_ns),
             ns_seconds(totals.expert_kernel_ns),
             ns_seconds(totals.source_fence_ns),
             ns_seconds(counters.target_profile.tail_head_sync_ns),
             ns_seconds(totals.other_control_ns()),
+            ns_seconds(totals.expert_read_gross_ns),
+            ns_seconds(totals.expert_plan_hint_ns),
+            ns_seconds(totals.expert_plan_sched_ns),
+            ns_seconds(attn_total_ns),
+            ns_seconds(attn_total_ns.saturating_sub(attn_wait_all_ns)),
+            ns_seconds(attn_wait_all_ns.saturating_sub(attn_drain_ns)),
+            ns_seconds(attn_drain_ns),
+            ns_seconds(kernel_total_ns),
+            ns_seconds(kernel_total_ns.saturating_sub(kernel_wait_ns)),
+            ns_seconds(kernel_wait_ns.saturating_sub(kernel_drain_ns)),
+            ns_seconds(kernel_drain_ns),
+        );
+        // Per-path detail: the single-position (loop/precommit) and wide
+        // (batched ATen) prepare regimes, plus the prefetch-hint FFI whose
+        // pilot readback sits under expert_plan. waits = hooked host waits;
+        // untimed = waits with no GPU timestamp (ATen syncs, drain unknown).
+        let bucket = |b: &crate::provider::PrepTimerBucket| {
+            format!(
+                "calls={} total={:.3}s encode={:.3}s wait={:.3}s drain={:.3}s waits={} untimed={}",
+                b.calls,
+                ns_seconds(b.total_ns),
+                ns_seconds(b.total_ns.saturating_sub(b.wait_ns)),
+                ns_seconds(b.wait_ns.saturating_sub(b.drain_ns)),
+                ns_seconds(b.drain_ns),
+                b.waits,
+                b.untimed_syncs,
+            )
+        };
+        eprintln!(
+            "[attn-split] single: {} | wide: {} | hint: {}",
+            bucket(&prep.single),
+            bucket(&prep.wide),
+            bucket(&prep.hint),
+        );
+        eprintln!(
+            "[kernel-split] single: {} | wide: {}",
+            bucket(&prep.finish_single),
+            bucket(&prep.finish_wide),
+        );
+        // Sub-regions of the finish call (wall, any tile width): the routed-
+        // input device->host copy, the MoE execute (encode + CB wait), the
+        // next layer's KDA precommit hook; rest = everything else on the host.
+        let finish_total_ns = prep
+            .finish_single
+            .total_ns
+            .saturating_add(prep.finish_wide.total_ns);
+        eprintln!(
+            "[kernel-sub] materialize={:.3}s moe={:.3}s precommit={:.3}s rest={:.3}s",
+            ns_seconds(prep.finish_materialize_ns),
+            ns_seconds(prep.finish_moe_ns),
+            ns_seconds(prep.finish_precommit_ns),
+            ns_seconds(
+                finish_total_ns
+                    .saturating_sub(prep.finish_materialize_ns)
+                    .saturating_sub(prep.finish_moe_ns)
+                    .saturating_sub(prep.finish_precommit_ns),
+            ),
         );
         if totals.expert_plan_hits != 0 || totals.expert_plan_misses != 0 {
             eprintln!(
@@ -6449,12 +10789,17 @@ fn print_run_stats(counters: &NativeRunCounters, started: Instant) {
 
 fn print_target_layer_profile(profile: &TargetLayerPhaseProfile, layer: usize, layer_count: usize) {
     eprintln!(
-        "[phase layer {layer:>2}/{last}] total={:.3}s read_wait={:.3}s bind_upload={:.3}s attention_resident={:.3}s expert_read_prefetch={:.3}s expert_kernel={:.3}s fence={:.3}s other={:.3}s",
+        "[phase layer {layer:>2}/{last}] total={:.3}s read_wait={:.3}s bind_upload={:.3}s attention_resident={:.3}s expert_read_prefetch={:.3}s expert_demand_read={:.3}s expert_read_gross={:.3}s expert_plan={:.3}s expert_hint={:.3}s expert_submit={:.3}s expert_kernel={:.3}s fence={:.3}s other={:.3}s",
         ns_seconds(profile.layer_total_ns),
         ns_seconds(profile.spine_read_wait_ns),
         ns_seconds(profile.spine_bind_upload_ns),
         ns_seconds(profile.attention_resident_compute_ns),
         ns_seconds(profile.authoritative_expert_read_prefetch_ns),
+        ns_seconds(profile.expert_demand_read_ns),
+        ns_seconds(profile.expert_read_gross_ns),
+        ns_seconds(profile.expert_plan_ns),
+        ns_seconds(profile.expert_hint_ns),
+        ns_seconds(profile.expert_submit_ns),
         ns_seconds(profile.expert_kernel_ns),
         ns_seconds(profile.source_fence_ns),
         ns_seconds(profile.other_control_ns()),
@@ -6464,6 +10809,57 @@ fn print_target_layer_profile(profile: &TargetLayerPhaseProfile, layer: usize, l
 
 fn ns_seconds(nanoseconds: u64) -> f64 {
     nanoseconds as f64 / 1_000_000_000.0
+}
+
+/// K3_SPINE_TRANSIENT_SPREAD=1: keep the budgeted resident COUNT but spread the
+/// transient (streamed) layers evenly through the pass instead of taking them
+/// as the suffix. Default off = the historical prefix.
+fn spine_transient_spread_enabled() -> bool {
+    std::env::var("K3_SPINE_TRANSIENT_SPREAD").is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true"))
+}
+
+/// K3_SPINE_HOMES=<root>[,<root>...]: model-root-shaped directories (each with
+/// k3-resident-int8/tensors as REGULAR files — the loader rejects symlinks)
+/// that transient layers are streamed from, round-robin by transient ordinal.
+fn configured_spine_homes() -> Vec<PathBuf> {
+    std::env::var("K3_SPINE_HOMES")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Per-layer residency for `resident` retained layers out of K3_LAYER_COUNT.
+fn spine_residency_mask(resident: u32) -> Vec<bool> {
+    let total = crate::program::K3_LAYER_COUNT;
+    let resident = (resident as usize).min(total);
+    let transient = total - resident;
+    let mut mask = vec![true; total];
+    if transient == 0 {
+        return mask;
+    }
+    if spine_transient_spread_enabled() && resident > 0 {
+        // Evenly spaced: transient ordinal i sits at floor((i + 0.5) * total / transient).
+        let mut placed = std::collections::BTreeSet::new();
+        for ordinal in 0..transient {
+            placed.insert(((ordinal as f64 + 0.5) * total as f64 / transient as f64).floor() as usize);
+        }
+        if placed.len() == transient {
+            for layer in placed {
+                mask[layer.min(total - 1)] = false;
+            }
+            return mask;
+        }
+    }
+    for layer in resident..total {
+        mask[layer] = false;
+    }
+    mask
 }
 
 fn output_error(operation: &str, error: io::Error) -> DeltafinError {
@@ -6558,13 +10954,13 @@ fn fixed_costs(
 ) -> Result<FixedCosts> {
     let layer_slot = component_high_water(spine.layers())?;
     let spine_arenas = layer_slot
-        .checked_mul(SPINE_ARENA_SLOTS as u64)
+        .checked_mul(spine_arena_slots() as u64)
         .ok_or_else(|| DeltafinError::new("spine arena budget overflows u64"))?;
     let expert_slot = (K3_EXPERT_SOURCE_BYTES as u64)
         .checked_mul(K3_EXPERT_BASE_UNION_MAX as u64)
         .ok_or_else(|| DeltafinError::new("expert arena slot budget overflows u64"))?;
     let expert_arenas = expert_slot
-        .checked_mul(EXPERT_ARENA_SLOTS as u64)
+        .checked_mul(expert_arena_slots() as u64)
         .ok_or_else(|| DeltafinError::new("expert arena budget overflows u64"))?;
     let persistent_reader_arenas = spine_arenas
         .checked_add(expert_arenas)
@@ -6731,17 +11127,11 @@ fn select_residency_with_transient(
     layer_bytes: &[u64],
     base_fixed: FixedCosts,
     request: ResidencyOverride,
+    policy: ResidencyPolicy,
 ) -> Result<(ResidencySelection, u64)> {
     if layer_bytes.is_empty() {
         return Ok((
-            select_resident_prefix(
-                host,
-                provider,
-                layer_bytes,
-                base_fixed,
-                request,
-                ResidencyPolicy::default(),
-            ),
+            select_resident_prefix(host, provider, layer_bytes, base_fixed, request, policy),
             0,
         ));
     }
@@ -6769,13 +11159,63 @@ fn select_residency_with_transient(
                 provider_bytes,
             },
             request,
-            ResidencyPolicy::default(),
+            policy,
         );
         if selection.resident_layers >= candidate_layers {
             best = Some((selection, transient_layer_bytes));
         }
     }
     best.ok_or_else(|| DeltafinError::new("no safe transient-layer residency state exists"))
+}
+
+/// Read a whole-GiB host reserve floor from `var_name`, in the same shape as
+/// `K3_HOST_RESERVE_GB`, and build the corresponding policy. Probing (reading
+/// the environment) and policy (the pure clamp below) are kept separate so
+/// the policy half is deterministic in tests, matching `residency.rs`'s
+/// probe/policy split.
+fn host_reserve_policy_from_env(var_name: &str) -> ResidencyPolicy {
+    reserve_policy_from_gib(
+        std::env::var(var_name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok()),
+    )
+}
+
+/// Return a `ResidencyPolicy` with `reserve_gb` (whole GiB) as an exact host
+/// reserve floor -- zeroing the proportional permille so the reserve is
+/// exactly the requested floor, not `max(floor, 18% of total)` -- or
+/// `ResidencyPolicy::default()` when `reserve_gb` is `None`. Clamped to
+/// `[4 GiB, stock floor]`: this knob only ever *lowers* the reserve, since a
+/// caller asking for more than the stock floor should use the stock policy
+/// it already gets by default.
+fn reserve_policy_from_gib(reserve_gb: Option<u64>) -> ResidencyPolicy {
+    let mut policy = ResidencyPolicy::default();
+    if let Some(reserve_gb) = reserve_gb {
+        let floor = reserve_gb.saturating_mul(1024 * 1024 * 1024).clamp(
+            4 * 1024 * 1024 * 1024,
+            policy.host_reserve_floor_bytes.max(4 * 1024 * 1024 * 1024),
+        );
+        policy.host_reserve_floor_bytes = floor;
+        policy.host_reserve_permille = 0;
+    }
+    // K3_DEVICE_RESERVE_GB=<n>: exact device (Metal) reserve floor in GiB,
+    // replacing the stock max(2 GiB, 10% of unified memory) = 12.8 GiB on a
+    // 128 GiB host. The verify-width admission probes provider memory against
+    // this reserve on every drafter proposal; under arrival-driven compute the
+    // provider's in-flight footprint is larger and the stock reserve refused
+    // 16-28 verify batches per 200-token run (drafter fell back to narrow
+    // decode, chunks 49 -> 63-72, -5..-8%). Clamped to [1 GiB, stock].
+    static DEVICE_RESERVE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    if let Some(device_gb) = *DEVICE_RESERVE.get_or_init(|| {
+        std::env::var("K3_DEVICE_RESERVE_GB")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    }) {
+        policy.device_reserve_floor_bytes =
+            device_gb.saturating_mul(1024 * 1024 * 1024).max(1024 * 1024 * 1024);
+        policy.device_reserve_permille = 0;
+    }
+    policy
 }
 
 fn verify_snapshot_budget(model: &ModelSpec) -> Result<VerifySnapshotBudget> {
@@ -6996,7 +11436,18 @@ fn admit_live_context_growth(
         .staged_provider_bytes
         .checked_add(admission.growth_scratch_provider_bytes)
         .ok_or_else(|| DeltafinError::new("live MLA admission bytes overflow u64"))?;
-    let selection = select_resident_prefix(
+    // K3_HOST_RESERVE_GB lowers the host reserve floor for GROWTH admission
+    // only. Load-time spine-layer residency sizing has its own analogous
+    // knob, K3_SPINE_LOAD_RESERVE_GB (see `select_residency_with_transient`'s
+    // caller in the engine constructor) -- the stock 10 GiB floor / 18%
+    // permille yields ~23 GiB on a 128 GiB host, which a fully loaded K3
+    // cannot always leave free; growth requests here are hundreds of MiB.
+    let policy = host_reserve_policy_from_env("K3_HOST_RESERVE_GB");
+    // Scoped 2026-08-26: growth keeps a7512b5's watermark-style admission
+    // (request credited back into availability) via the explicitly named
+    // variant; every other residency caller reverted to the documented
+    // stock contract. Champion growth behavior is unchanged.
+    let selection = select_resident_prefix_crediting_request(
         host,
         provider,
         &[],
@@ -7005,7 +11456,7 @@ fn admit_live_context_growth(
             provider_bytes: live_new_provider_bytes,
         },
         ResidencyOverride::default(),
-        ResidencyPolicy::default(),
+        policy,
     );
     if selection.stop != ResidencyStop::AllLayersFit {
         return Err(DeltafinError::new(format!(
@@ -7180,6 +11631,9 @@ mod tests {
         first.tail_head_sync_ns = 100;
         first.layers[0] = TargetLayerPhaseProfile {
             passes: 1,
+            expert_plan_ns: 0,
+            expert_hint_ns: 0,
+            expert_submit_ns: 0,
             spine_read_bytes: 64,
             spine_read_active_ns: 700,
             spine_read_wait_ns: 100,
@@ -7187,6 +11641,10 @@ mod tests {
             spine_bind_upload_ns: 200,
             attention_resident_compute_ns: 150,
             authoritative_expert_read_prefetch_ns: 80,
+            expert_demand_read_ns: 60,
+            expert_read_gross_ns: 0,
+            expert_plan_hint_ns: 0,
+            expert_plan_sched_ns: 0,
             expert_kernel_ns: 200,
             source_fence_ns: 10,
             layer_total_ns: 800,
@@ -7668,6 +12126,7 @@ mod tests {
             &[6 * gib, 2 * gib],
             FixedCosts::default(),
             ResidencyOverride::default(),
+            ResidencyPolicy::default(),
         )
         .unwrap();
         assert_eq!(selection.resident_layers, 2);
@@ -7693,6 +12152,7 @@ mod tests {
             &layer_bytes,
             FixedCosts::default(),
             ResidencyOverride::default(),
+            ResidencyPolicy::default(),
         )
         .unwrap();
         assert_eq!(automatic.resident_layers, 2);
@@ -7708,6 +12168,7 @@ mod tests {
             &layer_bytes,
             FixedCosts::default(),
             zero_request,
+            ResidencyPolicy::default(),
         )
         .unwrap();
         assert_eq!(zero.resident_layers, 0);
@@ -7731,6 +12192,7 @@ mod tests {
             &layer_bytes,
             FixedCosts::default(),
             over_safe_limit,
+            ResidencyPolicy::default(),
         )
         .unwrap();
         assert_eq!(clamped.resident_layers, 0);
@@ -7767,13 +12229,97 @@ mod tests {
         };
 
         for costs in [base, qwen] {
-            let (selection, transient) =
-                select_residency_with_transient(host, provider, &layer_bytes, costs, control)
-                    .unwrap();
+            let (selection, transient) = select_residency_with_transient(
+                host,
+                provider,
+                &layer_bytes,
+                costs,
+                control,
+                ResidencyPolicy::default(),
+            )
+            .unwrap();
             assert_eq!(selection.resident_layers, 0);
             assert_eq!(selection.stop, ResidencyStop::ExplicitLayerLimit);
             assert_eq!(transient, 3 * gib);
         }
+    }
+
+    #[test]
+    fn reserve_gib_override_lowers_the_floor_and_zeroes_the_permille() {
+        let gib = 1_u64 << 30;
+        let stock = ResidencyPolicy::default();
+
+        // Unset keeps the stock policy exactly.
+        assert_eq!(reserve_policy_from_gib(None), stock);
+
+        // Mid-range requests land exactly on the requested floor with no
+        // proportional component left active.
+        let eight = reserve_policy_from_gib(Some(8));
+        assert_eq!(eight.host_reserve_floor_bytes, 8 * gib);
+        assert_eq!(eight.host_reserve_permille, 0);
+        assert_eq!(eight.device_reserve_floor_bytes, stock.device_reserve_floor_bytes);
+        assert_eq!(eight.device_reserve_permille, stock.device_reserve_permille);
+
+        // The knob only ever lowers the reserve: a request above the stock
+        // 10 GiB floor clamps back down to it (with the permille still
+        // zeroed, since it was explicitly requested).
+        let too_high = reserve_policy_from_gib(Some(64));
+        assert_eq!(too_high.host_reserve_floor_bytes, stock.host_reserve_floor_bytes);
+        assert_eq!(too_high.host_reserve_permille, 0);
+
+        // A request below the 4 GiB safety minimum clamps back up to it.
+        let too_low = reserve_policy_from_gib(Some(0));
+        assert_eq!(too_low.host_reserve_floor_bytes, 4 * gib);
+        assert_eq!(too_low.host_reserve_permille, 0);
+    }
+
+    #[test]
+    fn load_time_reserve_override_admits_a_prefix_the_stock_policy_would_refuse() {
+        // Reproduces the mechanism behind the spine-residency investigation:
+        // on a 128 GiB host the stock policy reserves ~23.04 GiB (18% of
+        // physical, which exceeds the 10 GiB floor). With 105 GiB available
+        // (representative of a loaded engine with headroom left), that
+        // leaves an ~81.96 GiB envelope -- not enough for a full 93 GiB
+        // resident prefix. The lowered, permille-free 8 GiB reserve an
+        // explicit override requests leaves ~97 GiB instead, which does fit
+        // the same 93-layer prefix.
+        let gib = 1_u64 << 30;
+        let host = HostMemory {
+            physical_bytes: Some(128 * gib),
+            available_bytes: Some(105 * gib),
+            cgroup_limit_bytes: None,
+            cgroup_available_bytes: None,
+            constraints_readable: true,
+        };
+        let layer_bytes = [1 * gib; 93];
+        let fixed = FixedCosts::default();
+        let request = ResidencyOverride::default();
+
+        let stock = select_resident_prefix(
+            host,
+            ProviderMemory::Host,
+            &layer_bytes,
+            fixed,
+            request,
+            ResidencyPolicy::default(),
+        );
+        assert!(
+            stock.resident_layers < 93,
+            "expected the stock 18% permille reserve to bind before all 93 layers fit, got {}",
+            stock.resident_layers
+        );
+
+        let relaxed = select_resident_prefix(
+            host,
+            ProviderMemory::Host,
+            &layer_bytes,
+            fixed,
+            request,
+            reserve_policy_from_gib(Some(8)),
+        );
+        assert_eq!(relaxed.resident_layers, 93);
+        assert_eq!(relaxed.stop, ResidencyStop::AllLayersFit);
+        assert!(stock.resident_layers < relaxed.resident_layers);
     }
 
     #[test]
@@ -8341,12 +12887,30 @@ mod tests {
 
     #[test]
     fn speculative_capacity_defaults_wide_but_remains_explicitly_bounded() {
-        assert_eq!(resolve_speculative_max_drafts(None).unwrap(), 8);
+        // Derived from the constants: the default must track
+        // DEFAULT_EXACT_DRAFTS and the rejection boundary MAX_EXACT_DRAFTS, so
+        // that raising the ceiling cannot silently move the default reserve.
+        assert_eq!(
+            resolve_speculative_max_drafts(None).unwrap(),
+            DEFAULT_EXACT_DRAFTS
+        );
+        assert!(DEFAULT_EXACT_DRAFTS <= MAX_EXACT_DRAFTS);
         assert_eq!(resolve_speculative_max_drafts(Some("1")).unwrap(), 1);
         assert_eq!(resolve_speculative_max_drafts(Some(" 7 ")).unwrap(), 7);
+        assert_eq!(
+            resolve_speculative_max_drafts(Some(&MAX_EXACT_DRAFTS.to_string())).unwrap(),
+            MAX_EXACT_DRAFTS
+        );
         assert!(resolve_speculative_max_drafts(Some("0")).is_err());
-        assert!(resolve_speculative_max_drafts(Some("9")).is_err());
+        assert!(
+            resolve_speculative_max_drafts(Some(&(MAX_EXACT_DRAFTS + 1).to_string())).is_err()
+        );
         assert!(resolve_speculative_max_drafts(Some("wide")).is_err());
+        // The ceiling itself must stay inside the provider ABI's tile-row
+        // bound: rows = drafts + 1 <= DELTAFIN_PROVIDER_TARGET_SEQUENCE_MAX_TILE_ROWS_V1 (16),
+        // and (drafts + 1) * top-16 <= K3_EXPERT_UNION_MAX.
+        assert!(MAX_EXACT_DRAFTS + 1 <= 16);
+        assert!(FULL_COMMIT_EXPERT_UNION_MAX <= K3_EXPERT_UNION_MAX);
     }
 
     #[test]
@@ -8952,10 +13516,18 @@ mod tests {
 
     #[test]
     fn complete_verifier_union_keeps_all_nine_rows_and_legacy_fallback_is_exact() {
+        // The admitted band is (base, ceiling]; the ceiling follows
+        // MAX_EXACT_DRAFTS, so assert the SHAPE rather than the old literals.
+        let ceiling = MAX_EXACT_DRAFTS + 1;
         assert_eq!(full_commit_union_upper_bound(4), None);
         assert_eq!(full_commit_union_upper_bound(5), Some(80));
+        assert_eq!(
+            full_commit_union_upper_bound(ceiling),
+            Some(ceiling * K3_EXPERT_TOP_K)
+        );
+        assert_eq!(full_commit_union_upper_bound(ceiling + 1), None);
+        // 9 rows stays admissible as it always was — the raise only widens.
         assert_eq!(full_commit_union_upper_bound(9), Some(144));
-        assert_eq!(full_commit_union_upper_bound(10), None);
         let routes: [[u16; K3_EXPERT_TOP_K]; 9] = core::array::from_fn(|row| {
             core::array::from_fn(|slot| (row * K3_EXPERT_TOP_K + slot) as u16)
         });
@@ -9607,6 +14179,7 @@ mod tests {
         let spans = assemble_expert_spans(
             &[3, 7, 11, 20],
             &pinned,
+            &[],
             &hits,
             Some((&demand_ids, &demand_bytes)),
             span_bytes,
@@ -9619,13 +14192,13 @@ mod tests {
         assert_eq!(spans[3], &[0x44_u8; 8][..]);
 
         // All-pinned tiles need no demand slab at all.
-        let alone = assemble_expert_spans(&[7], &pinned, &[], None, span_bytes).unwrap();
+        let alone = assemble_expert_spans(&[7], &pinned, &[], &[], None, span_bytes).unwrap();
         assert_eq!(alone, vec![&pinned_bytes[..]]);
 
         // A tile expert with no source is an authoritative failure.
-        assert!(assemble_expert_spans(&[7, 9], &pinned, &[], None, span_bytes).is_err());
+        assert!(assemble_expert_spans(&[7, 9], &pinned, &[], &[], None, span_bytes).is_err());
         // A pinned span whose length disagrees with the corpus is refused.
-        assert!(assemble_expert_spans(&[7], &pinned, &[], None, span_bytes + 1).is_err());
+        assert!(assemble_expert_spans(&[7], &pinned, &[], &[], None, span_bytes + 1).is_err());
     }
 
     #[test]
@@ -9673,7 +14246,7 @@ mod tests {
 
         // First route: everything streams, candidates promote stickily.
         let first =
-            read_expert_tile_with_prefetch(&corpus, &reader, Some(&tier), 1, &[3, 7, 11], None)
+            read_expert_tile_with_prefetch(&corpus, &reader, None, Some(&tier), 1, &[3, 7, 11], None)
                 .unwrap();
         assert!(matches!(first, ExpertTileLease::Contiguous(_)));
         drop(first);
@@ -9682,17 +14255,19 @@ mod tests {
 
         // Second route: both candidates come from RAM; only expert 11 reads.
         let second =
-            read_expert_tile_with_prefetch(&corpus, &reader, Some(&tier), 1, &[3, 7, 11], None)
+            read_expert_tile_with_prefetch(&corpus, &reader, None, Some(&tier), 1, &[3, 7, 11], None)
                 .unwrap();
         let ExpertTileLease::Scattered {
             layout,
             pinned,
+            retained,
             hits,
             demand,
         } = second
         else {
             panic!("tier-resident tile did not use the scattered lease");
         };
+        assert!(retained.is_empty());
         assert_eq!(layout, corpus.layout());
         assert_eq!(
             pinned.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
@@ -9704,9 +14279,11 @@ mod tests {
 
         // Byte-identical to the tier-free union, span by span.
         let hit_spans: Vec<(u16, &[u8])> = Vec::new();
+        let retained_spans: Vec<(u16, &[u8])> = Vec::new();
         let spans = assemble_expert_spans(
             &[3, 7, 11],
             &pinned,
+            &retained_spans,
             &hit_spans,
             Some((demand.expert_ids(), demand.buffers().other())),
             span_bytes,
@@ -9723,7 +14300,7 @@ mod tests {
 
         // An all-pinned tile performs no file I/O and still assembles.
         drop(demand);
-        let third = read_expert_tile_with_prefetch(&corpus, &reader, Some(&tier), 1, &[3, 7], None)
+        let third = read_expert_tile_with_prefetch(&corpus, &reader, None, Some(&tier), 1, &[3, 7], None)
             .unwrap();
         let ExpertTileLease::Scattered {
             pinned: third_pinned,
@@ -9737,8 +14314,15 @@ mod tests {
         assert_eq!(third_pinned.len(), 2);
         assert!(third_hits.is_empty());
         assert!(third_demand.is_none());
-        let spans =
-            assemble_expert_spans(&[3, 7], &third_pinned, &hit_spans, None, span_bytes).unwrap();
+        let spans = assemble_expert_spans(
+            &[3, 7],
+            &third_pinned,
+            &retained_spans,
+            &hit_spans,
+            None,
+            span_bytes,
+        )
+        .unwrap();
         assert_eq!(spans[0], &expected[..span_bytes]);
         assert_eq!(spans[1], &expected[span_bytes..2 * span_bytes]);
         assert_eq!(tier.hits(), 4);

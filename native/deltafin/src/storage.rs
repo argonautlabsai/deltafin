@@ -8,6 +8,7 @@
 //! dictionary, or memoryview per chunk.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
@@ -19,7 +20,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -462,6 +463,29 @@ impl std::fmt::Debug for DeferredSourceName {
 struct DeferredExactCatalogInner {
     directory: File,
     directory_path: PathBuf,
+    // Optional fast tier holding byte-identical copies of a subset of the
+    // sources. Probed first by openat; ENOENT falls back to `directory`.
+    // Wrong-size or non-regular hot entries fail closed like primary ones.
+    hot_directory: Option<File>,
+    hot_directory_path: Option<PathBuf>,
+    /// Optional second canonical expert volume (K3_EXPERT_DIR_B): probed
+    /// after the hot tier and before the primary directory. Part of the
+    /// canonical corpus in the de-striped two-volume layout.
+    secondary_directory: Option<File>,
+    secondary_directory_path: Option<PathBuf>,
+    /// Optional third canonical expert volume (K3_EXPERT_DIR_C): probed
+    /// BEFORE the hot tier, matching `resolve_expert_path`'s deliberate
+    /// dir_c-first order so a copy placed here takes the read without any
+    /// file having to be deleted from the tier it duplicates.
+    ///
+    /// Added 2026-08-29. Until now dir_c reached only the wide-union path
+    /// (`open_raw_cache_with_cache_policy`); the top-k decode path submits
+    /// from this catalog, which knew about hot and dir_b only. K3C was
+    /// therefore structurally unreachable on ~80% of reads: measured 4.1% of
+    /// bytes against 24.4% of routed edges, with the deficit landing on the
+    /// two volumes that cover the namespace by index parity.
+    tertiary_directory: Option<File>,
+    tertiary_directory_path: Option<PathBuf>,
     sources: Box<[DeferredSourceName]>,
     exact_source_length: u64,
     cache_policy: CachePolicy,
@@ -483,6 +507,26 @@ pub struct DeferredExactCatalog {
 impl DeferredExactCatalog {
     pub fn open(
         directory: &Path,
+        sources: impl IntoIterator<Item = DeferredSourceName>,
+        exact_source_length: u64,
+        cache_policy: CachePolicy,
+    ) -> Result<Self> {
+        Self::open_tiered(
+            directory,
+            None,
+            None,
+            None,
+            sources,
+            exact_source_length,
+            cache_policy,
+        )
+    }
+
+    pub fn open_tiered(
+        directory: &Path,
+        hot_directory: Option<&Path>,
+        secondary_directory: Option<&Path>,
+        tertiary_directory: Option<&Path>,
         sources: impl IntoIterator<Item = DeferredSourceName>,
         exact_source_length: u64,
         cache_policy: CachePolicy,
@@ -518,10 +562,91 @@ impl DeferredExactCatalog {
                 directory.display()
             )));
         }
+        let hot_directory_file = hot_directory
+            .map(|hot| -> Result<File> {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(open_cloexec_nofollow())
+                    .open(hot)
+                    .map_err(|error| {
+                        io_error(
+                            "open deferred hot-tier directory without following symlinks",
+                            hot,
+                            error,
+                        )
+                    })?;
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| io_error("stat deferred hot-tier directory", hot, error))?;
+                if !metadata.is_dir() {
+                    return Err(DeltafinError::new(format!(
+                        "deferred hot-tier catalog root is not a directory: {}",
+                        hot.display()
+                    )));
+                }
+                Ok(file)
+            })
+            .transpose()?;
+        let secondary_directory_file = secondary_directory
+            .map(|secondary| -> Result<File> {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(open_cloexec_nofollow())
+                    .open(secondary)
+                    .map_err(|error| {
+                        io_error(
+                            "open deferred secondary directory without following symlinks",
+                            secondary,
+                            error,
+                        )
+                    })?;
+                let metadata = file.metadata().map_err(|error| {
+                    io_error("stat deferred secondary directory", secondary, error)
+                })?;
+                if !metadata.is_dir() {
+                    return Err(DeltafinError::new(format!(
+                        "deferred secondary catalog root is not a directory: {}",
+                        secondary.display()
+                    )));
+                }
+                Ok(file)
+            })
+            .transpose()?;
+        let tertiary_directory_file = tertiary_directory
+            .map(|tertiary| -> Result<File> {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(open_cloexec_nofollow())
+                    .open(tertiary)
+                    .map_err(|error| {
+                        io_error(
+                            "open deferred tertiary directory without following symlinks",
+                            tertiary,
+                            error,
+                        )
+                    })?;
+                let metadata = file.metadata().map_err(|error| {
+                    io_error("stat deferred tertiary directory", tertiary, error)
+                })?;
+                if !metadata.is_dir() {
+                    return Err(DeltafinError::new(format!(
+                        "deferred tertiary catalog root is not a directory: {}",
+                        tertiary.display()
+                    )));
+                }
+                Ok(file)
+            })
+            .transpose()?;
         Ok(Self {
             inner: Arc::new(DeferredExactCatalogInner {
                 directory: directory_file,
                 directory_path: directory.to_path_buf(),
+                hot_directory: hot_directory_file,
+                hot_directory_path: hot_directory.map(Path::to_path_buf),
+                secondary_directory: secondary_directory_file,
+                secondary_directory_path: secondary_directory.map(Path::to_path_buf),
+                tertiary_directory: tertiary_directory_file,
+                tertiary_directory_path: tertiary_directory.map(Path::to_path_buf),
                 sources: sources.into_boxed_slice(),
                 exact_source_length,
                 cache_policy,
@@ -875,10 +1000,33 @@ struct Sources {
 
 #[derive(Debug, Clone, Copy)]
 enum JobSource {
-    File { source: usize, source_offset: u64 },
-    Vectored { source: usize, scatter: usize },
-    AuthenticatedScatter { source: usize },
-    DeferredCatalog { source: u32 },
+    File {
+        source: usize,
+        source_offset: u64,
+    },
+    Vectored {
+        source: usize,
+        scatter: usize,
+    },
+    AuthenticatedScatter {
+        source: usize,
+    },
+    DeferredCatalog {
+        source: u32,
+        /// Byte offset of this chunk within the source file. 0 for legacy
+        /// whole-file jobs (K3_SPLIT_READ absent/1).
+        source_offset: u64,
+        /// K3_SPLIT_READ home routing: Some(true) reads the hot/internal
+        /// copy, Some(false) reads the enclosure copy, each falling back to
+        /// the other when its home lacks the file (resolution stays total).
+        /// None keeps the legacy probe order (mirror scheduler or
+        /// tier-first) with a fresh open per job.
+        prefer_internal_home: Option<bool>,
+        /// Index of this job's source within its batch (NOT the catalog
+        /// index) — keys the batch's per-source home-descriptor cache so a
+        /// file's chunks share two opens instead of re-probing per chunk.
+        batch_slot: u16,
+    },
     Zero,
 }
 
@@ -903,6 +1051,15 @@ struct InlineReadJobs {
     len: usize,
     destination: BufferKind,
     source_length: usize,
+    /// K3_SPLIT_READ: jobs per source file. 1 = legacy whole-file jobs.
+    chunks_per_source: usize,
+    /// BUFFER_ALIGNMENT-rounded ceil(source_length / chunks_per_source);
+    /// equals source_length when chunks_per_source is 1.
+    chunk_length: usize,
+    /// The first `internal_chunks` chunk indices of every source prefer the
+    /// hot/internal home; the rest prefer the enclosures. Sized to the
+    /// measured device-rate ratio (internal ~13.73 vs enclosure ~5.58 GB/s).
+    internal_chunks: usize,
 }
 
 enum BatchJobs {
@@ -914,16 +1071,36 @@ impl BatchJobs {
     fn get(&self, index: usize) -> Option<ReadJob> {
         match self {
             Self::Shared(jobs) => jobs.get(index).copied(),
-            Self::Inline(jobs) if index < jobs.len => Some(ReadJob {
-                source: JobSource::DeferredCatalog {
-                    source: jobs.sources[index],
-                },
-                destination: jobs.destination,
-                destination_offset: index * jobs.source_length,
-                length: jobs.source_length,
-                expected_digest: None,
-                verification_index: None,
-            }),
+            Self::Inline(jobs) if index < jobs.len * jobs.chunks_per_source => {
+                // File-major striping: indices 0..len are chunk 0 of every
+                // source, len..2*len chunk 1, and so on. For multi-file
+                // batches, consecutive claims by one worker quantum therefore
+                // touch DIFFERENT files. Single-source tickets (len=1,
+                // prefetch) degrade to consecutive chunks of one file — the
+                // claim loop interleaves claims with I/O, so free workers
+                // still pick up remaining chunks concurrently; the stall
+                // trace shows prefetch claims are near-instant (queue 0.1%),
+                // so free workers are the common case.
+                let file = index % jobs.len;
+                let chunk = index / jobs.len;
+                let chunk_offset = chunk * jobs.chunk_length;
+                let length = (jobs.source_length - chunk_offset).min(jobs.chunk_length);
+                let prefer_internal_home = (jobs.chunks_per_source > 1)
+                    .then(|| chunk < jobs.internal_chunks);
+                Some(ReadJob {
+                    source: JobSource::DeferredCatalog {
+                        source: jobs.sources[file],
+                        source_offset: chunk_offset as u64,
+                        prefer_internal_home,
+                        batch_slot: file as u16,
+                    },
+                    destination: jobs.destination,
+                    destination_offset: file * jobs.source_length + chunk_offset,
+                    length,
+                    expected_digest: None,
+                    verification_index: None,
+                })
+            }
             Self::Inline(_) => None,
         }
     }
@@ -931,7 +1108,7 @@ impl BatchJobs {
     fn len(&self) -> usize {
         match self {
             Self::Shared(jobs) => jobs.len(),
-            Self::Inline(jobs) => jobs.len,
+            Self::Inline(jobs) => jobs.len * jobs.chunks_per_source,
         }
     }
 }
@@ -1623,7 +1800,17 @@ impl ReadPlan {
                     JobSource::AuthenticatedScatter { source } => {
                         JobSource::AuthenticatedScatter { source }
                     }
-                    JobSource::DeferredCatalog { source } => JobSource::DeferredCatalog { source },
+                    JobSource::DeferredCatalog {
+                        source,
+                        source_offset,
+                        prefer_internal_home,
+                        batch_slot,
+                    } => JobSource::DeferredCatalog {
+                        source,
+                        source_offset: source_offset + consumed as u64,
+                        prefer_internal_home,
+                        batch_slot,
+                    },
                     JobSource::Zero => JobSource::Zero,
                 };
                 jobs.push(ReadJob {
@@ -1883,6 +2070,10 @@ struct AlignedBuffer {
     pointer: NonNull<u8>,
     capacity: usize,
     layout: Layout,
+    /// false = the memory belongs to someone else (a Summer pool slot); Drop
+    /// must not free it. `keepalive` pins the owner for the buffer's life.
+    owned: bool,
+    keepalive: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl AlignedBuffer {
@@ -1899,6 +2090,33 @@ impl AlignedBuffer {
             pointer,
             capacity,
             layout,
+            owned: true,
+            keepalive: None,
+        })
+    }
+
+    /// A read destination over memory this reader does NOT own — the Summer
+    /// pool's registered arena slot (K3_SUMMER_READ_INTO_SLOT). `pointer`
+    /// must be BUFFER_ALIGNMENT-aligned and stay valid while `keepalive`
+    /// lives; the caller guarantees no other writer touches the range.
+    fn borrowed(
+        pointer: NonNull<u8>,
+        capacity: usize,
+        keepalive: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Self> {
+        if capacity == 0 || (pointer.as_ptr() as usize) % BUFFER_ALIGNMENT != 0 {
+            return Err(DeltafinError::new(
+                "borrowed read destination must be non-empty and page-aligned",
+            ));
+        }
+        let layout = Layout::from_size_align(capacity, BUFFER_ALIGNMENT)
+            .map_err(|_| DeltafinError::new("invalid borrowed-buffer layout"))?;
+        Ok(Self {
+            pointer,
+            capacity,
+            layout,
+            owned: false,
+            keepalive: Some(keepalive),
         })
     }
 
@@ -1948,6 +2166,11 @@ unsafe impl Sync for AlignedBuffer {}
 
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
+        if !self.owned {
+            // Borrowed destination: the owner (pinned by `keepalive`) frees it.
+            self.keepalive.take();
+            return;
+        }
         // SAFETY: `pointer` came from `alloc_zeroed(self.layout)` and has not
         // been deallocated or transferred.
         unsafe { dealloc(self.pointer.as_ptr(), self.layout) }
@@ -1973,6 +2196,23 @@ impl SharedBuffers {
     fn get(&self, kind: BufferKind) -> &AlignedBuffer {
         &self.values[kind.index()]
     }
+
+    /// Buffers whose `Other` destination is borrowed external memory (a
+    /// Summer pool slot); the other two kinds are minimal owned stubs.
+    fn external_other(
+        pointer: NonNull<u8>,
+        capacity: usize,
+        keepalive: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Self> {
+        let other = AlignedBuffer::borrowed(pointer, capacity, keepalive)?;
+        let mut values = [
+            AlignedBuffer::new(0)?,
+            AlignedBuffer::new(0)?,
+            AlignedBuffer::new(0)?,
+        ];
+        values[BufferKind::Other.index()] = other;
+        Ok(Self { values })
+    }
 }
 
 struct ArenaSlot {
@@ -1982,6 +2222,10 @@ struct ArenaSlot {
 }
 
 pub(crate) type BufferRetireHook = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+/// Per-blob variant for the retention graveyard: receives the retiring
+/// expert-span base pointers (as usizes — raw pointers are not Send) and
+/// evicts only their wrappers, leaving the rest of the cache warm.
+pub(crate) type BufferDropHook = Arc<dyn Fn(&[usize]) -> Result<()> + Send + Sync>;
 
 fn invoke_buffer_retire_hook(hook: &BufferRetireHook) -> Result<()> {
     match catch_unwind(AssertUnwindSafe(|| hook())) {
@@ -1990,6 +2234,62 @@ fn invoke_buffer_retire_hook(hook: &BufferRetireHook) -> Result<()> {
             "storage arena retirement hook panicked before releasing an externally aliased allocation",
         )),
     }
+}
+
+/// Process-global donation pool (K3_EXPERT_RETAIN v1): allocations whose
+/// retained generation was replaced return HERE instead of freeing, and
+/// every arena's growth path draws a fitting donation before allocating
+/// fresh. Addresses therefore cycle within a stable set — the address-keyed
+/// no-copy Metal wrapper cache stays permanently warm (reuse needs no
+/// flush; only FREEING does, and donated slabs are never freed on the
+/// steady path). Bounded; overflow falls back to the flush-before-free
+/// graveyard.
+const DONATION_POOL_LIMIT: usize = 96;
+
+fn expert_donation_pool() -> &'static Mutex<Vec<(Arc<SharedBuffers>, BufferLengths)>> {
+    static POOL: OnceLock<Mutex<Vec<(Arc<SharedBuffers>, BufferLengths)>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Donate a sole-owner allocation into the pool. On rejection (shared
+/// ownership, full pool) the Arc comes back to the caller so custody is
+/// never silently dropped.
+fn donate_expert_allocation_owned(
+    buffers: Arc<SharedBuffers>,
+) -> std::result::Result<(), Arc<SharedBuffers>> {
+    if Arc::strong_count(&buffers) != 1 {
+        return Err(buffers);
+    }
+    let capacities = BufferLengths::new(
+        buffers.get(BufferKind::Quantized).allocation_len(),
+        buffers.get(BufferKind::Scales).allocation_len(),
+        buffers.get(BufferKind::Other).allocation_len(),
+    );
+    let mut pool = expert_donation_pool().lock().unwrap();
+    if pool.len() >= DONATION_POOL_LIMIT {
+        return Err(buffers);
+    }
+    pool.push((buffers, capacities));
+    Ok(())
+}
+
+/// Pop the smallest donation whose every capacity fits `target`.
+fn take_fitting_donation(target: BufferLengths) -> Option<(Arc<SharedBuffers>, BufferLengths)> {
+    let mut pool = expert_donation_pool().lock().unwrap();
+    let mut best: Option<(usize, usize)> = None;
+    for (index, (_, capacities)) in pool.iter().enumerate() {
+        let fits = BufferKind::ALL
+            .iter()
+            .all(|&kind| capacities.get(kind) >= target.get(kind));
+        if !fits {
+            continue;
+        }
+        let size = capacities.quantized + capacities.scales + capacities.other;
+        if best.is_none_or(|(_, best_size)| size < best_size) {
+            best = Some((index, size));
+        }
+    }
+    best.map(|(index, _)| pool.swap_remove(index))
 }
 
 struct BufferArena {
@@ -2107,11 +2407,18 @@ impl BufferArena {
         // Arc can be released. Stable, fitting slabs never invoke the hook.
         drop(retired_buffers);
         let replacement = if needs_allocation {
-            match SharedBuffers::new(target_capacities) {
-                Ok(buffers) => Some((Arc::new(buffers), target_capacities)),
-                Err(error) => {
-                    self.release(slot_index);
-                    return Err(error);
+            // Donated allocations first: stable addresses keep the no-copy
+            // wrapper cache warm and cost no page faults. Fresh allocation
+            // remains the fallback.
+            if let Some(donated) = take_fitting_donation(target_capacities) {
+                Some(donated)
+            } else {
+                match SharedBuffers::new(target_capacities) {
+                    Ok(buffers) => Some((Arc::new(buffers), target_capacities)),
+                    Err(error) => {
+                        self.release(slot_index);
+                        return Err(error);
+                    }
                 }
             }
         } else {
@@ -2342,6 +2649,47 @@ pub struct LayerBuffers {
     lease: Arc<BufferLeaseInner>,
 }
 
+/// Cross-token keep-alive for a lease's underlying allocation WITHOUT the
+/// arena slot: dropping the `LayerBuffers` still releases its slot, and a
+/// waiter reusing that slot allocates a replacement allocation while these
+/// bytes stay alive here (the release path was designed for exactly this
+/// teardown order). Used by K3_EXPERT_RETAIN's previous-token expert tier —
+/// strictly read-only, strictly zero-copy.
+pub struct RetainedAllocation {
+    buffers: Arc<SharedBuffers>,
+    lengths: BufferLengths,
+}
+
+impl RetainedAllocation {
+    pub fn other(&self) -> &[u8] {
+        self.buffers
+            .get(BufferKind::Other)
+            .as_slice(self.lengths.other)
+    }
+
+    /// Full allocation envelope of the Other buffer — NOT the logical
+    /// length. A recycled slab's Metal wrapper history spans every
+    /// span-aligned address over the ENVELOPE (earlier leases packed
+    /// different union sizes from the same base), so per-blob eviction
+    /// before freeing must cover all of it (2026-08-26 review, CRITICAL).
+    pub(crate) fn other_envelope_len(&self) -> usize {
+        self.buffers.get(BufferKind::Other).allocation_len()
+    }
+
+    /// Return this allocation to the donation pool (v1 recycle path).
+    /// On failure (pool full, storage unexpectedly shared) custody comes
+    /// BACK to the caller — donated-or-returned, never silently dropped,
+    /// because dropping here would free wrapper-aliased pages without the
+    /// mandatory flush.
+    pub(crate) fn donate(self) -> Option<Self> {
+        let Self { buffers, lengths } = self;
+        match donate_expert_allocation_owned(buffers) {
+            Ok(()) => None,
+            Err(buffers) => Some(Self { buffers, lengths }),
+        }
+    }
+}
+
 impl LayerBuffers {
     pub fn quantized(&self) -> &[u8] {
         self.lease
@@ -2392,6 +2740,29 @@ impl LayerBuffers {
             self.lease.buffers().get(BufferKind::Other).allocation_len(),
         )
     }
+
+    /// Detach the underlying allocation from its arena slot for the
+    /// previous-token expert tier (K3_EXPERT_RETAIN). The slot is left
+    /// empty, so the NEXT acquire allocates a fresh slab through the
+    /// ordinary needs-allocation path (no retire, no external-cache hook) —
+    /// the arena can never recycle these bytes underneath the retained
+    /// spans. This lease's own reference stays intact for its remaining
+    /// lifetime; once it drops, retention is the sole owner. Returns None
+    /// when the arena is gone or the slot was already detached.
+    pub(crate) fn detach_allocation_for_retention(&self) -> Option<RetainedAllocation> {
+        let arena = self.lease.arena.upgrade()?;
+        let buffers = {
+            let mut slots = arena.inner.lock().unwrap();
+            let slot = slots.get_mut(self.lease.slot_index)?;
+            debug_assert!(slot.in_use, "detaching lease must still hold its slot");
+            slot.capacities = BufferLengths::default();
+            slot.buffers.take()?
+        };
+        Some(RetainedAllocation {
+            buffers,
+            lengths: self.lease.lengths,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2409,6 +2780,693 @@ pub struct ReadStats {
 pub enum ReadPriority {
     Demand,
     Prefetch,
+}
+
+// ---------------------------------------------------------------------------
+// K3_STALL_TRACE=1 — measure-only decomposition of blocking read waits.
+//
+// Prices the per-token blocking-read bucket by classifying, for every
+// ReadTicket::wait that actually blocks, where the wait window went:
+//   queue-late   — the batch's critical job (the one that finished last) was
+//                  still UNCLAIMED while the engine waited: workers/devices
+//                  were busy elsewhere. More spindles or workers could help.
+//   service-late — the critical job was CLAIMED and inside pread while the
+//                  engine waited: the read itself is the pole. Faster
+//                  per-file assembly (chunking/split-homing) could help.
+// Waits that find the batch already complete are counted as `ready` (the
+// read was fully hidden behind compute — nothing to fix). `lead` is how long
+// the batch existed before the engine blocked on it (submission lead time);
+// a small lead with large waits is the route/submit-late signature that no
+// storage change can fix. Totals are printed by print_run_stats via
+// stall_trace_report(). Default-off; when the env flag is absent the only
+// cost is one branch per site and a None field per batch.
+fn stall_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("K3_STALL_TRACE").is_some_and(|v| v == "1"))
+}
+
+// ---------------------------------------------------------------------------
+// K3_SPLIT_READ=N — split-homed chunked expert reads (default off).
+//
+// Splits every deferred-catalog expert read into N page-aligned chunk jobs
+// and routes the first K3_SPLIT_READ_INTERNAL of them hot-tier-first while
+// the rest probe the enclosures first (tier as final fallback). A dual-homed
+// expert therefore assembles from the internal SSD AND its enclosure
+// simultaneously; a single-homed expert degrades to same-device chunked
+// parallelism (measured neutral). Motivated by the 2026-08-25 stall trace
+// (prefetch waits 99.9% service-late, demand waits 69% queue-late) and the
+// k3-genbench gate (split assembly −13.7% p50 at 21.5 GB/s across 3
+// devices). Byte-identity is unaffected: chunks land in the same slab bytes
+// whichever home serves them.
+fn split_read_chunks() -> usize {
+    static CHUNKS: OnceLock<usize> = OnceLock::new();
+    *CHUNKS.get_or_init(|| {
+        std::env::var("K3_SPLIT_READ")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(1, |value| value.clamp(1, 8))
+    })
+}
+
+/// K3_SPLIT_READ_DEMAND=N — chunk DEMAND-priority batches only (the
+/// audit's surviving cell: demand blocked improved inside the negative
+/// prefetch experiment). Home-PRESERVING: every chunk probes internal
+/// first (the legacy tier-first order) via the per-batch descriptor
+/// cache — no bytes move between devices, only job granularity changes,
+/// making miss bursts preemptible at chunk size instead of whole files.
+fn split_read_demand_chunks() -> usize {
+    static CHUNKS: OnceLock<usize> = OnceLock::new();
+    *CHUNKS.get_or_init(|| {
+        std::env::var("K3_SPLIT_READ_DEMAND")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or_else(split_read_chunks, |value| value.clamp(1, 8))
+    })
+}
+
+fn split_read_internal_chunks(chunks: usize) -> usize {
+    static INTERNAL: OnceLock<Option<usize>> = OnceLock::new();
+    let configured = *INTERNAL.get_or_init(|| {
+        std::env::var("K3_SPLIT_READ_INTERNAL")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+    });
+    // Default: the measured device-rate split, internal 13.73 of an
+    // aggregate 19.31 GB/s ≈ 71% of the chunks, at least one to each side.
+    let default = ((chunks as f64) * 13.73 / (13.73 + 5.58)).round() as usize;
+    // K3_SPLIT_READ_INTERNAL=<chunks> is allowed: every prefetch chunk then
+    // probes the hot tier first, so a hot-resident expert is served whole by
+    // the hot device (the split-trace test of 2026-09-05 showed the hot half
+    // waiting ~5 ms for its dir_b partner). The default is unchanged.
+    configured
+        .unwrap_or(default.clamp(1, chunks.saturating_sub(1).max(1)))
+        .clamp(1, chunks.max(1))
+}
+
+// K3_SPLIT_ETA=1 — least-expected-completion homing for split chunks
+// (default off). Every chunk of a split read is homed on whichever tier
+// directory (hot, dir_c, dir_b, primary) holds the file and has the smallest
+// (in-flight chunks + 1) x chunk_bytes / rate, instead of the fixed
+// hot-first / enclosure-chain assignment. Rates in GB/s come from
+// K3_SPLIT_ETA_GBPS="hot,dir_c,dir_b,primary" (default 5.6,5.6,5.6,13.7).
+// Byte-identity is unaffected: chunks land in the same slab bytes whichever
+// tier serves them.
+fn split_eta_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_SPLIT_ETA").is_ok_and(|value| value.trim() == "1"))
+}
+
+fn split_eta_rates() -> &'static [f64; 4] {
+    static RATES: OnceLock<[f64; 4]> = OnceLock::new();
+    RATES.get_or_init(|| {
+        let mut rates = [5.6_f64, 5.6, 5.6, 13.7];
+        if let Ok(raw) = std::env::var("K3_SPLIT_ETA_GBPS") {
+            for (slot, value) in rates.iter_mut().zip(raw.split(',')) {
+                if let Ok(parsed) = value.trim().parse::<f64>() {
+                    if parsed > 0.0 {
+                        *slot = parsed;
+                    }
+                }
+            }
+        }
+        rates
+    })
+}
+
+/// K3_SPLIT_CAP="hot,dir_c,dir_b,primary" — per-tier in-flight chunk caps for
+/// the capped router (requires K3_SPLIT_ETA=1). Default off.
+fn split_caps() -> Option<&'static [u64; 4]> {
+    static CAPS: OnceLock<Option<[u64; 4]>> = OnceLock::new();
+    CAPS.get_or_init(|| {
+        let raw = std::env::var("K3_SPLIT_CAP").ok()?;
+        let mut caps = [u64::MAX; 4];
+        for (slot, value) in caps.iter_mut().zip(raw.split(',')) {
+            if let Ok(parsed) = value.trim().parse::<u64>() {
+                *slot = parsed.max(1);
+            }
+        }
+        Some(caps)
+    })
+    .as_ref()
+}
+
+static SPLIT_ETA_OUTSTANDING: [PaddedU64; 4] = [
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+];
+static SPLIT_ETA_SERVED: [PaddedU64; 4] = [
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+];
+
+/// Expected microseconds for `tier` to finish one more chunk of `bytes`.
+fn split_eta_us(tier: usize, bytes: u64) -> u64 {
+    let queued = SPLIT_ETA_OUTSTANDING[tier].0.load(Ordering::Relaxed);
+    let unit_us = (bytes as f64) / (split_eta_rates()[tier] * 1.0e3);
+    (unit_us * (queued as f64 + 1.0)).round() as u64
+}
+
+// ---------------------------------------------------------------------------
+// K3_PLAN_BALANCE=1 (2026-09-06) — the plan-path reads (45% of a run's expert
+// bytes: prefetch generations and every whole-file job) resolved their home
+// with a static chain, dir_c -> hot -> dir_b -> primary, first hit wins. That
+// is the defect behind White pinned at its ceiling (dir_b outranks the
+// internal for every file it holds) and behind every failed mirror layout
+// (a full dir_b takes everything). With the knob on, the plan path picks the
+// tier with the lowest expected completion time among the tiers that hold
+// the file — the same in-flight × bytes / rate cost the ETA router uses for
+// chunked reads, rates from K3_SPLIT_ETA_GBPS (hot, dir_c, dir_b, primary) —
+// charges that tier at plan time and retires it when the read lands.
+// ---------------------------------------------------------------------------
+pub fn plan_balance_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_PLAN_BALANCE").is_ok_and(|v| v.trim() == "1"))
+}
+
+static TIER_DIRS: OnceLock<Mutex<Vec<(PathBuf, usize)>>> = OnceLock::new();
+
+/// Register a tier's expert directory (0 hot, 1 dir_c, 2 dir_b, 3 primary) so
+/// a finished plan-path read can retire its in-flight charge by path.
+pub fn register_tier_dir(tier: usize, path: &Path) {
+    let dirs = TIER_DIRS.get_or_init(|| Mutex::new(Vec::new()));
+    let mut dirs = dirs.lock().unwrap();
+    dirs.retain(|(_, t)| *t != tier);
+    dirs.push((path.to_path_buf(), tier));
+}
+
+fn tier_of_path(path: &Path) -> Option<usize> {
+    let parent = path.parent()?;
+    let dirs = TIER_DIRS.get()?.lock().unwrap();
+    dirs.iter().find(|(dir, _)| dir == parent).map(|(_, t)| *t)
+}
+
+/// Pick the tier for one plan-path read among the tiers that hold the file
+/// (index = tier), charging it in flight. None when nothing holds it.
+pub fn plan_pick_tier(holds: [bool; 4], bytes: u64) -> Option<usize> {
+    let mut best: Option<(u64, usize)> = None;
+    for tier in 0..4 {
+        if !holds[tier] {
+            continue;
+        }
+        let cost = split_eta_us(tier, bytes);
+        if best.is_none_or(|(c, _)| cost < c) {
+            best = Some((cost, tier));
+        }
+    }
+    let (_, tier) = best?;
+    SPLIT_ETA_OUTSTANDING[tier].0.fetch_add(1, Ordering::Relaxed);
+    SPLIT_ETA_SERVED[tier].0.fetch_add(1, Ordering::Relaxed);
+    Some(tier)
+}
+
+fn plan_retire_path(path: &Path) {
+    if let Some(tier) = tier_of_path(path) {
+        SPLIT_ETA_OUTSTANDING[tier]
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)))
+            .ok();
+    }
+}
+
+/// In-flight accounting for one ETA-homed chunk; retired on drop (also on
+/// error paths), so a device can never be exiled by a leaked increment.
+struct SplitEtaGuard(usize);
+
+impl SplitEtaGuard {
+    fn issue(tier: usize) -> Self {
+        SPLIT_ETA_OUTSTANDING[tier].0.fetch_add(1, Ordering::Relaxed);
+        SPLIT_ETA_SERVED[tier].0.fetch_add(1, Ordering::Relaxed);
+        SplitEtaGuard(tier)
+    }
+}
+
+impl Drop for SplitEtaGuard {
+    fn drop(&mut self) {
+        SPLIT_ETA_OUTSTANDING[self.0]
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)))
+            .ok();
+    }
+}
+
+/// Chunks served per tier under K3_SPLIT_ETA: (hot, dir_c, dir_b, primary).
+pub fn split_eta_report() -> Option<(u64, u64, u64, u64)> {
+    if !split_eta_enabled() {
+        return None;
+    }
+    let n = |tier: usize| SPLIT_ETA_SERVED[tier].0.load(Ordering::Relaxed);
+    Some((n(0), n(1), n(2), n(3)))
+}
+
+// ---------------------------------------------------------------------------
+// K3_SPLIT_TRACE=1 — completion trace of split-read halves (diagnostic).
+//
+// A split expert is usable only when BOTH halves have landed, so the question
+// "does splitting with a slow device help?" is answered by which half arrives
+// last and by how much, grouped by the pair of tiers that served the halves.
+// Each chunk job records (batch, slot, chunk offset, tier, completion time on
+// the batch clock, transfer duration); the report pairs the chunks of every
+// source and prints per (priority, tier pair) percentiles. Default off; the
+// record is one mutex push per chunk (~2,500/s), invisible at run scale.
+// ---------------------------------------------------------------------------
+static SPLIT_TRACE_BATCH_SEQ: AtomicU64 = AtomicU64::new(1);
+const SPLIT_TRACE_FD_SLOTS: usize = 65_536;
+const SPLIT_TRACE_MAX_RECORDS: usize = 8_000_000;
+static SPLIT_FD_TIER: [AtomicU32; SPLIT_TRACE_FD_SLOTS] =
+    [const { AtomicU32::new(0) }; SPLIT_TRACE_FD_SLOTS];
+
+#[derive(Clone, Copy)]
+struct SplitTraceRecord {
+    batch: u64,
+    slot: u16,
+    chunk_offset: u64,
+    tier: u8,
+    prefetch: bool,
+    done_ns: u64,
+    read_ns: u64,
+}
+
+static SPLIT_TRACE: Mutex<Vec<SplitTraceRecord>> = Mutex::new(Vec::new());
+
+fn split_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_SPLIT_TRACE").is_ok_and(|value| value == "1"))
+}
+
+/// Remember which tier a descriptor came from (tier + 1; 0 = unknown).
+fn split_fd_tier_set(descriptor: i32, tier: u8) {
+    if descriptor >= 0 && (descriptor as usize) < SPLIT_TRACE_FD_SLOTS {
+        SPLIT_FD_TIER[descriptor as usize].store(u32::from(tier) + 1, Ordering::Relaxed);
+    }
+}
+
+fn split_fd_tier(descriptor: i32) -> u8 {
+    if descriptor >= 0 && (descriptor as usize) < SPLIT_TRACE_FD_SLOTS {
+        let stored = SPLIT_FD_TIER[descriptor as usize].load(Ordering::Relaxed);
+        if stored == 0 { 255 } else { (stored - 1) as u8 }
+    } else {
+        255
+    }
+}
+
+fn split_trace_record(record: SplitTraceRecord) {
+    let mut records = SPLIT_TRACE.lock().unwrap();
+    if records.len() < SPLIT_TRACE_MAX_RECORDS {
+        records.push(record);
+    }
+}
+
+fn split_trace_tier_name(tier: u8) -> &'static str {
+    match tier {
+        0 => "hot",
+        1 => "dir_c",
+        2 => "dir_b",
+        3 => "primary",
+        _ => "?",
+    }
+}
+
+fn split_trace_percentile_ms(values: &mut [u64], fraction: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_unstable();
+    let index = ((values.len() - 1) as f64 * fraction).round() as usize;
+    values[index] as f64 / 1.0e6
+}
+
+/// One-line statement of the split-read configuration for the startup log, so
+/// a run's telemetry shows these settings independently of the mirror,
+/// retain and summer feature lines.
+pub fn split_read_config_report() -> String {
+    let chunks = split_read_chunks();
+    let demand = split_read_demand_chunks();
+    let prefetch_internal = if chunks > 1 { split_read_internal_chunks(chunks) } else { 1 };
+    format!(
+        "chunks={} demand_chunks={} prefetch_hot_side_chunks={} demand_home=hot-first-both-chunks tier_balance={} split_eta={} trace={}",
+        chunks,
+        demand,
+        prefetch_internal,
+        u8::from(tier_balance_enabled()),
+        u8::from(split_eta_enabled()),
+        u8::from(split_trace_enabled()),
+    )
+}
+
+/// The K3_SPLIT_TRACE report: one line per (priority, tier of chunk 0, tier
+/// of chunk 1) with completion percentiles of each half on the batch clock,
+/// the share of sources whose second (enclosure-side) half landed last, the
+/// gap between the halves, and each half's transfer time; then one line per
+/// tier with the transfer-time percentiles of every chunk it served. None
+/// when the trace is off or nothing was recorded.
+pub fn split_trace_report() -> Option<Vec<String>> {
+    if !split_trace_enabled() {
+        return None;
+    }
+    let records = std::mem::take(&mut *SPLIT_TRACE.lock().unwrap());
+    if records.is_empty() {
+        return Some(vec!["[split] trace on, no chunked reads recorded".to_string()]);
+    }
+    let mut by_source: HashMap<(u64, u16), Vec<SplitTraceRecord>> = HashMap::new();
+    for record in &records {
+        by_source.entry((record.batch, record.slot)).or_default().push(*record);
+    }
+    struct PairStats {
+        n: u64,
+        c1_last: u64,
+        c0_done: Vec<u64>,
+        c1_done: Vec<u64>,
+        delta: Vec<u64>,
+        c0_read: Vec<u64>,
+        c1_read: Vec<u64>,
+    }
+    let mut pairs: HashMap<(bool, u8, u8), PairStats> = HashMap::new();
+    let mut unpaired = 0_u64;
+    for (_, mut chunks) in by_source {
+        if chunks.len() != 2 {
+            unpaired += 1;
+            continue;
+        }
+        chunks.sort_by_key(|record| record.chunk_offset);
+        let (first, second) = (chunks[0], chunks[1]);
+        let stats = pairs
+            .entry((first.prefetch, first.tier, second.tier))
+            .or_insert_with(|| PairStats {
+                n: 0,
+                c1_last: 0,
+                c0_done: Vec::new(),
+                c1_done: Vec::new(),
+                delta: Vec::new(),
+                c0_read: Vec::new(),
+                c1_read: Vec::new(),
+            });
+        stats.n += 1;
+        if second.done_ns > first.done_ns {
+            stats.c1_last += 1;
+        }
+        stats.c0_done.push(first.done_ns);
+        stats.c1_done.push(second.done_ns);
+        stats.delta.push(first.done_ns.abs_diff(second.done_ns));
+        stats.c0_read.push(first.read_ns);
+        stats.c1_read.push(second.read_ns);
+    }
+    let mut lines = Vec::new();
+    let mut keys: Vec<_> = pairs.keys().copied().collect();
+    keys.sort_by_key(|key| (key.0, std::cmp::Reverse(pairs[key].n)));
+    for key in keys {
+        let stats = pairs.get_mut(&key).unwrap();
+        lines.push(format!(
+            "[split] {} c0={} c1={} n={} c0_done p50/p90={:.2}/{:.2}ms c1_done p50/p90={:.2}/{:.2}ms c1_last={:.1}% gap p50/p90={:.2}/{:.2}ms c0_read p50/p90={:.2}/{:.2}ms c1_read p50/p90={:.2}/{:.2}ms",
+            if key.0 { "prefetch" } else { "demand" },
+            split_trace_tier_name(key.1),
+            split_trace_tier_name(key.2),
+            stats.n,
+            split_trace_percentile_ms(&mut stats.c0_done, 0.5),
+            split_trace_percentile_ms(&mut stats.c0_done, 0.9),
+            split_trace_percentile_ms(&mut stats.c1_done, 0.5),
+            split_trace_percentile_ms(&mut stats.c1_done, 0.9),
+            100.0 * stats.c1_last as f64 / stats.n as f64,
+            split_trace_percentile_ms(&mut stats.delta, 0.5),
+            split_trace_percentile_ms(&mut stats.delta, 0.9),
+            split_trace_percentile_ms(&mut stats.c0_read, 0.5),
+            split_trace_percentile_ms(&mut stats.c0_read, 0.9),
+            split_trace_percentile_ms(&mut stats.c1_read, 0.5),
+            split_trace_percentile_ms(&mut stats.c1_read, 0.9),
+        ));
+    }
+    for tier in [0_u8, 1, 2, 3, 255] {
+        let mut reads: Vec<u64> = records
+            .iter()
+            .filter(|record| record.tier == tier)
+            .map(|record| record.read_ns)
+            .collect();
+        if reads.is_empty() {
+            continue;
+        }
+        let n = reads.len();
+        lines.push(format!(
+            "[split] tier {} chunks={} read p50/p90/p99={:.2}/{:.2}/{:.2}ms",
+            split_trace_tier_name(tier),
+            n,
+            split_trace_percentile_ms(&mut reads, 0.5),
+            split_trace_percentile_ms(&mut reads, 0.9),
+            split_trace_percentile_ms(&mut reads, 0.99),
+        ));
+    }
+    lines.push(format!(
+        "[split] records={} sources_unpaired={} (a source counts as unpaired when it had one chunk or more than two)",
+        records.len(),
+        unpaired
+    ));
+    Some(lines)
+}
+
+/// Probe exactly one tier directory (0 hot, 1 dir_c, 2 secondary/dir_b,
+/// 3 primary) for `source`; Ok(None) = that tier does not hold the file.
+fn open_catalog_tier(
+    catalog: &DeferredExactCatalogInner,
+    source: &DeferredSourceName,
+    tier: usize,
+) -> Result<Option<File>> {
+    unsafe extern "C" {
+        fn openat(
+            directory: libc::c_int,
+            path: *const libc::c_char,
+            flags: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    let directory = match tier {
+        0 => catalog.hot_directory.as_ref(),
+        1 => catalog.tertiary_directory.as_ref(),
+        2 => catalog.secondary_directory.as_ref(),
+        _ => Some(&catalog.directory),
+    };
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let open_started = std::time::Instant::now();
+    // SAFETY: live directory descriptor retained by the catalog; validated
+    // NUL-terminated direct child name; flags never create a file.
+    let descriptor = unsafe {
+        openat(
+            directory.as_raw_fd(),
+            source.as_c_str().as_ptr(),
+            open_cloexec_nofollow(),
+        )
+    };
+    EXPERT_OPEN_NS.fetch_add(open_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    EXPERT_OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
+    if descriptor >= 0 {
+        // Tier tag for the read trace (ETA-mode opens bypass open_catalog_home,
+        // whose tag the trace's device record relies on; without it the
+        // record's source fell back to "read" and the device was lost).
+        split_fd_tier_set(descriptor, tier as u8);
+        return finish_catalog_open(catalog, source, descriptor).map(Some);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(catalog_io_error("open split-eta catalog source", catalog, source, error))
+    }
+}
+
+// K3_RDADVISE=1 — issue an F_RDADVISE advisory read for the exact byte range
+// of every expert pread before the copying read starts (default off). The
+// kernel then queues the whole range to the drive at once instead of feeding
+// it request-by-request as the synchronous pread progresses, which is the
+// difference between the ~0.7 GB/s per-stream rate the enclosures show under
+// the engine and the ~5.6 GB/s they show to a deep-queue raw reader.
+// Byte-identity is unaffected: the pread still copies the same bytes.
+fn rdadvise_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_RDADVISE").is_ok_and(|value| value.trim() == "1"))
+}
+
+fn advise_read_range(file: &File, offset: u64, length: usize) {
+    if !rdadvise_enabled() || length == 0 {
+        return;
+    }
+    let advisory = libc::radvisory {
+        ra_offset: offset as libc::off_t,
+        ra_count: length.min(i32::MAX as usize) as libc::c_int,
+    };
+    // SAFETY: valid descriptor and a fully initialized radvisory struct; the
+    // call never modifies user memory and failure is advisory-only.
+    unsafe {
+        libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &advisory as *const libc::radvisory);
+    }
+}
+
+fn stall_trace_now_ns() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+struct BatchTrace {
+    created_ns: u64,
+    critical_done_ns: AtomicU64,
+    critical_claim_ns: AtomicU64,
+}
+
+impl BatchTrace {
+    fn new_if_enabled() -> Option<Box<BatchTrace>> {
+        stall_trace_enabled().then(|| {
+            Box::new(BatchTrace {
+                created_ns: stall_trace_now_ns(),
+                critical_done_ns: AtomicU64::new(0),
+                critical_claim_ns: AtomicU64::new(0),
+            })
+        })
+    }
+
+    /// Record a finished job; keep the (claim, done) pair of whichever job
+    /// finished last. The claim store races benignly with a concurrent later
+    /// finisher — telemetry-grade accuracy is sufficient here.
+    fn record_job(&self, claim_ns: u64, done_ns: u64) {
+        let mut current = self.critical_done_ns.load(Ordering::Relaxed);
+        while done_ns > current {
+            match self.critical_done_ns.compare_exchange_weak(
+                current,
+                done_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.critical_claim_ns.store(claim_ns, Ordering::Relaxed);
+                    break;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+/// Lead-bucket upper bounds in ms; the last bucket is unbounded. The
+/// blocked-vs-lead curve discriminates the two demand-side models: if
+/// blocked ≈ max(0, backlog − lead), deeper hint lead converts to speed;
+/// if blocked is lead-independent, the oracle-depth ladder is not worth
+/// building (2026-08-25 second opinion, item 0).
+const STALL_LEAD_BUCKETS_MS: [u64; 7] = [10, 15, 20, 25, 30, 40, 60];
+
+#[derive(Default)]
+struct StallCounters {
+    waits: AtomicU64,
+    ready: AtomicU64,
+    wait_ns: AtomicU64,
+    lead_ns: AtomicU64,
+    queue_ns: AtomicU64,
+    service_ns: AtomicU64,
+    lead_bucket_waits: [AtomicU64; 8],
+    lead_bucket_blocked_ns: [AtomicU64; 8],
+}
+
+fn stall_counters() -> &'static [StallCounters; 2] {
+    static COUNTERS: OnceLock<[StallCounters; 2]> = OnceLock::new();
+    COUNTERS.get_or_init(|| [StallCounters::default(), StallCounters::default()])
+}
+
+fn stall_trace_record(
+    priority: ReadPriority,
+    wait_start_ns: u64,
+    wait_end_ns: u64,
+    was_ready: bool,
+    trace: &BatchTrace,
+) {
+    let counters = &stall_counters()[match priority {
+        ReadPriority::Demand => 0,
+        ReadPriority::Prefetch => 1,
+    }];
+    counters.waits.fetch_add(1, Ordering::Relaxed);
+    counters
+        .lead_ns
+        .fetch_add(wait_start_ns.saturating_sub(trace.created_ns), Ordering::Relaxed);
+    if was_ready {
+        counters.ready.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let blocked_ns = wait_end_ns.saturating_sub(wait_start_ns);
+    counters.wait_ns.fetch_add(blocked_ns, Ordering::Relaxed);
+    let lead_ms = wait_start_ns.saturating_sub(trace.created_ns) / 1_000_000;
+    let bucket = STALL_LEAD_BUCKETS_MS
+        .iter()
+        .position(|&bound| lead_ms < bound)
+        .unwrap_or(STALL_LEAD_BUCKETS_MS.len());
+    counters.lead_bucket_waits[bucket].fetch_add(1, Ordering::Relaxed);
+    counters.lead_bucket_blocked_ns[bucket].fetch_add(blocked_ns, Ordering::Relaxed);
+    let critical_done = trace.critical_done_ns.load(Ordering::Relaxed);
+    if critical_done == 0 {
+        return;
+    }
+    let critical_claim = trace.critical_claim_ns.load(Ordering::Relaxed);
+    let claim_clamped = critical_claim.clamp(wait_start_ns, wait_end_ns);
+    counters
+        .queue_ns
+        .fetch_add(claim_clamped - wait_start_ns, Ordering::Relaxed);
+    counters
+        .service_ns
+        .fetch_add(wait_end_ns.saturating_sub(claim_clamped), Ordering::Relaxed);
+}
+
+/// Formatted totals for print_run_stats, or None when tracing is off.
+pub fn stall_trace_report() -> Option<String> {
+    if !stall_trace_enabled() {
+        return None;
+    }
+    let seconds = |ns: u64| ns as f64 / 1.0e9;
+    let mut lines = String::new();
+    for (label, counters) in [("demand", &stall_counters()[0]), ("prefetch", &stall_counters()[1])]
+    {
+        let waits = counters.waits.load(Ordering::Relaxed);
+        if waits == 0 {
+            continue;
+        }
+        let ready = counters.ready.load(Ordering::Relaxed);
+        let wait_ns = counters.wait_ns.load(Ordering::Relaxed);
+        let queue_ns = counters.queue_ns.load(Ordering::Relaxed);
+        let service_ns = counters.service_ns.load(Ordering::Relaxed);
+        let share = |part: u64| {
+            if wait_ns == 0 { 0.0 } else { part as f64 * 100.0 / wait_ns as f64 }
+        };
+        if !lines.is_empty() {
+            lines.push('\n');
+        }
+        lines.push_str(&format!(
+            "[stall-trace] {label}: waits={waits} ready={ready} blocked_wait={:.3}s queue={:.3}s ({:.1}%) service={:.3}s ({:.1}%) mean_lead={:.3}ms",
+            seconds(wait_ns),
+            seconds(queue_ns),
+            share(queue_ns),
+            seconds(service_ns),
+            share(service_ns),
+            seconds(counters.lead_ns.load(Ordering::Relaxed)) * 1.0e3 / waits as f64,
+        ));
+        // The blocked-vs-lead curve: per lead bucket, blocked-wait count and
+        // MEAN blocked ms. Falling mean with rising lead = depth converts.
+        let mut curve = format!("\n[stall-lead] {label}:");
+        for (index, waits_in_bucket) in counters.lead_bucket_waits.iter().enumerate() {
+            let bucket_waits = waits_in_bucket.load(Ordering::Relaxed);
+            if bucket_waits == 0 {
+                continue;
+            }
+            let blocked = counters.lead_bucket_blocked_ns[index].load(Ordering::Relaxed);
+            let label = if index < STALL_LEAD_BUCKETS_MS.len() {
+                format!("<{}ms", STALL_LEAD_BUCKETS_MS[index])
+            } else {
+                format!(">={}ms", STALL_LEAD_BUCKETS_MS[STALL_LEAD_BUCKETS_MS.len() - 1])
+            };
+            curve.push_str(&format!(
+                " {label} n={bucket_waits} mean={:.2}ms |",
+                blocked as f64 / bucket_waits as f64 / 1.0e6,
+            ));
+        }
+        lines.push_str(&curve);
+    }
+    (!lines.is_empty()).then_some(lines)
 }
 
 // Split out from Batch so a worker can hand off its own strong reference to
@@ -2447,7 +3505,29 @@ struct Batch {
     priority: ReadPriority,
     next_job: AtomicUsize,
     completion: Arc<BatchCompletion>,
+    trace: Option<Box<BatchTrace>>,
+    /// K3_SPLIT_READ only: per-source [internal, enclosure] descriptor cache
+    /// so a file's chunk jobs share at most two opens instead of re-probing
+    /// the directory chain per chunk (the v1 regression: 310k opens at
+    /// 0.205 ms mean = 63.6 s/rung of worker time). Ok(None) = that home
+    /// does not hold the file.
+    chunk_home_files: Option<Box<[[HomeSlot; 2]]>>,
+    /// K3_SPLIT_ETA only: per-source descriptor cache with one slot per tier
+    /// directory (hot, dir_c, dir_b, primary) so a chunk can be homed on the
+    /// tier with the least expected completion time.
+    chunk_tier_files: Option<Box<[[HomeSlot; 4]]>>,
+    /// Arrival-driven compute support (inline union batches only): chunks
+    /// completed per source, and how many sources have every chunk done.
+    /// Waiters on `completion.condvar` are woken whenever a source completes.
+    source_chunks_done: Option<Box<[AtomicUsize]>>,
+    sources_ready: AtomicUsize,
+    /// K3_SPLIT_TRACE=1: batch identity and start stamp so each chunk's
+    /// completion can be placed on the batch's own clock.
+    batch_seq: u64,
+    started_ns: u64,
 }
+
+type HomeSlot = OnceLock<Result<Option<File>>>;
 
 /// Requeue: unclaimed jobs remain, push this Arc<Batch> back onto the queue.
 /// Idle: nothing left to claim right now (someone else may still be finishing
@@ -2484,6 +3564,13 @@ impl Batch {
             priority,
             next_job: AtomicUsize::new(0),
             completion: Arc::new(BatchCompletion::new(plan.jobs.len())),
+            trace: BatchTrace::new_if_enabled(),
+            chunk_home_files: None,
+            chunk_tier_files: None,
+            source_chunks_done: None,
+            sources_ready: AtomicUsize::new(0),
+            batch_seq: SPLIT_TRACE_BATCH_SEQ.fetch_add(1, Ordering::Relaxed),
+            started_ns: stall_trace_now_ns(),
         }
     }
 
@@ -2505,6 +3592,35 @@ impl Batch {
         debug_assert_eq!(source_length as u64, catalog.inner.exact_source_length);
         let mut sources = [0_u32; MAX_INLINE_DEFERRED_FILES];
         sources[..source_indices.len()].copy_from_slice(source_indices);
+        // K3_SPLIT_READ chunking applies only to page-multiple sources large
+        // enough that a chunk stays a long sequential run; everything else
+        // keeps the legacy single whole-file job per source.
+        let requested_chunks = match priority {
+            ReadPriority::Demand => split_read_demand_chunks(),
+            ReadPriority::Prefetch => split_read_chunks(),
+        };
+        let (chunks_per_source, chunk_length, internal_chunks) = if requested_chunks > 1
+            && source_length % BUFFER_ALIGNMENT == 0
+            && source_length >= requested_chunks * 2 * 1024 * 1024
+        {
+            let raw = source_length.div_ceil(requested_chunks);
+            let chunk_length = raw.next_multiple_of(BUFFER_ALIGNMENT);
+            let chunks = source_length.div_ceil(chunk_length);
+            if chunks > 1 {
+                // Demand batches stay home-preserving: every chunk keeps the
+                // legacy internal-first probe order. Only prefetch batches
+                // (K3_SPLIT_READ, measured negative) ever split homes.
+                let internal = match priority {
+                    ReadPriority::Demand => chunks,
+                    ReadPriority::Prefetch => split_read_internal_chunks(chunks),
+                };
+                (chunks, chunk_length, internal)
+            } else {
+                (1, source_length, 1)
+            }
+        } else {
+            (1, source_length, 1)
+        };
         Self {
             sources: BatchSources::DeferredCatalog(Arc::clone(&catalog.inner)),
             jobs: BatchJobs::Inline(InlineReadJobs {
@@ -2512,6 +3628,9 @@ impl Batch {
                 len: source_indices.len(),
                 destination,
                 source_length,
+                chunks_per_source,
+                chunk_length,
+                internal_chunks,
             }),
             vectored_reads: None,
             // Raw-v1 is guarded by exact length/type/name contracts rather
@@ -2521,7 +3640,31 @@ impl Batch {
             lease,
             priority,
             next_job: AtomicUsize::new(0),
-            completion: Arc::new(BatchCompletion::new(source_indices.len())),
+            completion: Arc::new(BatchCompletion::new(
+                source_indices.len() * chunks_per_source,
+            )),
+            trace: BatchTrace::new_if_enabled(),
+            chunk_home_files: (chunks_per_source > 1).then(|| {
+                (0..source_indices.len())
+                    .map(|_| [HomeSlot::new(), HomeSlot::new()])
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            }),
+            chunk_tier_files: (chunks_per_source > 1 && split_eta_enabled()).then(|| {
+                (0..source_indices.len())
+                    .map(|_| [HomeSlot::new(), HomeSlot::new(), HomeSlot::new(), HomeSlot::new()])
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            }),
+            source_chunks_done: Some(
+                (0..source_indices.len())
+                    .map(|_| AtomicUsize::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            sources_ready: AtomicUsize::new(0),
+            batch_seq: SPLIT_TRACE_BATCH_SEQ.fetch_add(1, Ordering::Relaxed),
+            started_ns: stall_trace_now_ns(),
         }
     }
 
@@ -2535,12 +3678,17 @@ impl Batch {
             let Some(job) = self.jobs.get(index) else {
                 return QuantumOutcome::Idle;
             };
+            let trace_claim_ns = self.trace.as_deref().map(|_| stall_trace_now_ns());
             if let Err(error) = self.run_job(job) {
                 let mut first_error = self.completion.first_error.lock().unwrap();
                 if first_error.is_none() {
                     *first_error = Some(error);
                 }
             }
+            if let (Some(trace), Some(claim_ns)) = (self.trace.as_deref(), trace_claim_ns) {
+                trace.record_job(claim_ns, stall_trace_now_ns());
+            }
+            self.note_source_progress(index);
             if self.completion.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                 return QuantumOutcome::Finished(Arc::clone(&self.completion));
             }
@@ -2549,6 +3697,65 @@ impl Batch {
             QuantumOutcome::Requeue
         } else {
             QuantumOutcome::Idle
+        }
+    }
+
+    /// Record one finished chunk job for its source (inline union batches:
+    /// file-major striping, so job `index` belongs to source `index % len`).
+    /// When a source's last chunk lands, bump `sources_ready` and wake waiters.
+    fn note_source_progress(&self, index: usize) {
+        let (Some(done), BatchJobs::Inline(jobs)) = (self.source_chunks_done.as_deref(), &self.jobs)
+        else {
+            return;
+        };
+        if jobs.len == 0 {
+            return;
+        }
+        let source = index % jobs.len;
+        if let Some(counter) = done.get(source)
+            && counter.fetch_add(1, Ordering::AcqRel) + 1 == jobs.chunks_per_source
+        {
+            self.sources_ready.fetch_add(1, Ordering::AcqRel);
+            let _guard = self.completion.lock.lock().unwrap();
+            self.completion.condvar.notify_all();
+        }
+    }
+
+    /// Indices (into the batch's source list) whose every chunk has landed.
+    fn ready_sources(&self) -> Vec<usize> {
+        let (Some(done), BatchJobs::Inline(jobs)) = (self.source_chunks_done.as_deref(), &self.jobs)
+        else {
+            // No per-source tracking on this batch kind: everything is ready
+            // exactly when the whole read has completed.
+            if self.completion.remaining.load(Ordering::Acquire) == 0 {
+                let n = match &self.jobs {
+                    BatchJobs::Inline(jobs) => jobs.len,
+                    BatchJobs::Shared(jobs) => jobs.len(),
+                };
+                return (0..n).collect();
+            }
+            return Vec::new();
+        };
+        done.iter()
+            .enumerate()
+            .filter(|(_, c)| c.load(Ordering::Acquire) >= jobs.chunks_per_source)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Block until at least `minimum` sources are complete, every job has
+    /// finished, or the batch was cancelled. Returns the ready count.
+    fn wait_ready_sources(&self, minimum: usize) -> usize {
+        let mut guard = self.completion.lock.lock().unwrap();
+        loop {
+            let ready = self.sources_ready.load(Ordering::Acquire);
+            if ready >= minimum
+                || self.completion.remaining.load(Ordering::Acquire) == 0
+                || self.completion.cancelled.load(Ordering::Acquire)
+            {
+                return ready;
+            }
+            guard = self.completion.condvar.wait(guard).unwrap();
         }
     }
 
@@ -2661,6 +3868,7 @@ impl Batch {
                         Err(error) => return Err(error.clone()),
                     }
                 };
+                let plan_read_started = std::time::Instant::now();
                 let mut completed = 0_usize;
                 while completed < destination.len() {
                     let count = match file.read_at(
@@ -2671,6 +3879,7 @@ impl Batch {
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(error) => return Err(io_error("pread", &source.path, error)),
                     };
+                    EXPERT_READ_BYTES.fetch_add(count as u64, Ordering::Relaxed);
                     if count == 0 {
                         return Err(DeltafinError::new(format!(
                             "short pread {}/{} from {} at {}",
@@ -2681,6 +3890,40 @@ impl Batch {
                         )));
                     }
                     completed += count;
+                }
+                if plan_balance_enabled() {
+                    plan_retire_path(&source.path);
+                }
+                // Device record for the per-read provenance trace (2026-09-06):
+                // this plan-path read carried 45% of a run's expert bytes and
+                // was invisible to the trace. Device from the source's volume,
+                // layer/expert from its file name, priority unknown ("-"), and
+                // the whole job length is one record (bytes = full file unless
+                // the plan chunked it).
+                if trace_enabled() {
+                    let name = source.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if let Some((layer, expert)) = parse_expert_name(name) {
+                        let path_str = source.path.to_string_lossy();
+                        let code = if path_str.starts_with("/Volumes/Yellow") {
+                            SRC_K3A
+                        } else if path_str.starts_with("/Volumes/Green") {
+                            SRC_K3B
+                        } else if path_str.starts_with("/Volumes/White") {
+                            SRC_K3C
+                        } else {
+                            SRC_INTERNAL
+                        };
+                        trace_read_prio(
+                            TRACE_BARRIER.load(Ordering::Relaxed),
+                            layer,
+                            expert,
+                            code,
+                            plan_read_started.elapsed().as_nanos() as u64,
+                            Some(matches!(self.priority, ReadPriority::Prefetch)),
+                            source_offset,
+                            destination.len() as u64,
+                        );
+                    }
                 }
                 if let (true, Some(expected), Some(index)) = (
                     verify_after_read,
@@ -2712,7 +3955,12 @@ impl Batch {
             JobSource::Vectored { .. } => unreachable!(
                 "vectored jobs are handled before creating one contiguous destination slice"
             ),
-            JobSource::DeferredCatalog { source } => {
+            JobSource::DeferredCatalog {
+                source,
+                source_offset,
+                prefer_internal_home,
+                batch_slot,
+            } => {
                 let BatchSources::DeferredCatalog(catalog) = &self.sources else {
                     return Err(DeltafinError::new(
                         "catalog read job is attached to the wrong source set",
@@ -2721,29 +3969,183 @@ impl Batch {
                 let source_name = catalog.sources.get(source as usize).ok_or_else(|| {
                     DeltafinError::new("catalog read job refers to an unknown source")
                 })?;
-                let file = open_deferred_catalog_source(catalog, source_name)?;
+                // Chunk jobs share per-(source, home) descriptors cached on
+                // the batch; legacy whole-file jobs keep a fresh open with
+                // the legacy probe order.
+                let legacy_file;
+                let mut eta_guard: Option<SplitEtaGuard> = None;
+                let file: &File = if let (Some(tiers), true) =
+                    (self.chunk_tier_files.as_deref(), prefer_internal_home.is_some())
+                {
+                    // K3_SPLIT_ETA: home this chunk on the tier directory that
+                    // can finish it first — (in-flight chunks + 1) x chunk cost
+                    // at that tier's configured rate — probing tiers in ETA
+                    // order and taking the first that holds the file.
+                    let slots = tiers.get(batch_slot as usize).ok_or_else(|| {
+                        DeltafinError::new("chunk read job refers to an unknown batch slot")
+                    })?;
+                    let mut order = [0_usize, 1, 2, 3];
+                    let bytes = destination.len() as u64;
+                    if let Some(caps) = split_caps() {
+                        // K3_SPLIT_CAP: prefer the fastest tier whose in-flight
+                        // depth is under its cap (primary first, then dir_b,
+                        // dir_c, hot); tiers at cap fall back to ETA order.
+                        // Enclosure queues stay short (bounded tails) and the
+                        // internal absorbs the overflow.
+                        order.sort_by_key(|&tier| {
+                            let queued = SPLIT_ETA_OUTSTANDING[tier].0.load(Ordering::Relaxed);
+                            let under_cap = queued < caps[tier];
+                            (!under_cap, if under_cap { 3 - tier as u64 } else { split_eta_us(tier, bytes) })
+                        });
+                    } else {
+                        order.sort_by_key(|&tier| split_eta_us(tier, bytes));
+                    }
+                    let mut chosen: Option<(&File, usize)> = None;
+                    for tier in order {
+                        match slots[tier].get_or_init(|| open_catalog_tier(catalog, source_name, tier)) {
+                            Err(error) => return Err(error.clone()),
+                            Ok(Some(file)) => {
+                                chosen = Some((file, tier));
+                                break;
+                            }
+                            Ok(None) => continue,
+                        }
+                    }
+                    let Some((file, tier)) = chosen else {
+                        return Err(DeltafinError::new(format!(
+                            "deferred source {}/{} missing from every tier",
+                            catalog.directory_path.display(),
+                            source_name.as_str(),
+                        )));
+                    };
+                    eta_guard = Some(SplitEtaGuard::issue(tier));
+                    file
+                } else if let (Some(cache), Some(prefer_internal)) =
+                    (self.chunk_home_files.as_deref(), prefer_internal_home)
+                {
+                    let slots = cache.get(batch_slot as usize).ok_or_else(|| {
+                        DeltafinError::new("chunk read job refers to an unknown batch slot")
+                    })?;
+                    let preferred_index = if prefer_internal { 0 } else { 1 };
+                    let preferred = slots[preferred_index]
+                        .get_or_init(|| open_catalog_home(catalog, source_name, prefer_internal));
+                    match preferred {
+                        Err(error) => return Err(error.clone()),
+                        Ok(Some(file)) => file,
+                        Ok(None) => {
+                            let fallback = slots[1 - preferred_index].get_or_init(|| {
+                                open_catalog_home(catalog, source_name, !prefer_internal)
+                            });
+                            match fallback {
+                                Err(error) => return Err(error.clone()),
+                                Ok(Some(file)) => file,
+                                Ok(None) => {
+                                    return Err(DeltafinError::new(format!(
+                                        "deferred source {}/{} missing from every home",
+                                        catalog.directory_path.display(),
+                                        source_name.as_str(),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    legacy_file =
+                        open_deferred_catalog_source(catalog, source_name, prefer_internal_home)?;
+                    &legacy_file
+                };
+                let read_started = std::time::Instant::now();
+                advise_read_range(file, source_offset, destination.len());
                 let mut completed = 0_usize;
                 while completed < destination.len() {
-                    let count = match file.read_at(&mut destination[completed..], completed as u64)
-                    {
+                    let count = match file.read_at(
+                        &mut destination[completed..],
+                        source_offset + completed as u64,
+                    ) {
                         Ok(count) => count,
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(error) => {
                             return Err(catalog_io_error("pread", catalog, source_name, error));
                         }
                     };
+                    EXPERT_READ_BYTES.fetch_add(count as u64, Ordering::Relaxed);
                     if count == 0 {
                         return Err(DeltafinError::new(format!(
-                            "short pread {}/{} from {}/{} at 0",
+                            "short pread {}/{} from {}/{} at {}",
                             completed,
                             destination.len(),
                             catalog.directory_path.display(),
                             source_name.as_str(),
+                            source_offset,
                         )));
                     }
                     completed += count;
                 }
-                drop_completed_cache(&file, catalog.cache_policy, 0, job.length);
+                drop(eta_guard);
+                if prefer_internal_home.is_some() && (split_trace_enabled() || trace_enabled()) {
+                    let tier = split_fd_tier(file.as_raw_fd());
+                    let read_ns = read_started.elapsed().as_nanos() as u64;
+                    if split_trace_enabled() {
+                        split_trace_record(SplitTraceRecord {
+                            batch: self.batch_seq,
+                            slot: batch_slot,
+                            chunk_offset: source_offset,
+                            tier,
+                            prefetch: matches!(self.priority, ReadPriority::Prefetch),
+                            done_ns: stall_trace_now_ns().saturating_sub(self.started_ns),
+                            read_ns,
+                        });
+                    }
+                    // Device record for the per-read provenance trace: chunked
+                    // reads open through the per-batch descriptor cache, so the
+                    // legacy open-site record never sees them. One record per
+                    // chunk, tier mapped onto the legacy source codes, duration
+                    // = this chunk's transfer (a replay needs file + device).
+                    if trace_enabled() {
+                        if let Some((layer, expert)) = parse_expert_name(source_name.as_str()) {
+                            let source = match tier {
+                                0 => SRC_K3B,
+                                1 => SRC_K3A,
+                                2 => SRC_K3C,
+                                3 => SRC_INTERNAL,
+                                _ => SRC_READ,
+                            };
+                            trace_read_prio(
+                                TRACE_BARRIER.load(Ordering::Relaxed),
+                                layer,
+                                expert,
+                                source,
+                                read_ns,
+                                Some(matches!(self.priority, ReadPriority::Prefetch)),
+                                source_offset,
+                                job.length as u64,
+                            );
+                        }
+                    }
+                }
+                // The transfer itself — this is the duration that sets the
+                // barrier tail. The open-site record times openat() only, which
+                // is ~0.1 ms against a ~2 ms transfer, so a tail computed from
+                // opens describes descriptor resolution and not the read the
+                // layer is actually waiting on.
+                if trace_enabled() {
+                    if let Some((layer, expert)) = parse_expert_name(source_name.as_str()) {
+                        trace_read(
+                            TRACE_BARRIER.load(Ordering::Relaxed),
+                            layer,
+                            expert,
+                            SRC_READ,
+                            read_started.elapsed().as_nanos() as u64,
+                        );
+                    }
+                }
+                // The record has landed: this device no longer owes it. Placed
+                // after the transfer rather than after the open, because the
+                // open returns in ~0.1 ms while the 17.5 MB read takes ~2 ms —
+                // retiring at open would make every device look idle and the
+                // policy would collapse back to a static order.
+                mirror_retire();
+                drop_completed_cache(file, catalog.cache_policy, source_offset, job.length);
             }
         }
         Ok(())
@@ -2866,6 +4268,7 @@ impl Batch {
                 return Err(DeltafinError::new("preadv exceeded its destination length"));
             }
             remaining -= read;
+            EXPERT_READ_BYTES.fetch_add(read as u64, Ordering::Relaxed);
             file_offset = file_offset
                 .checked_add(read as i64)
                 .ok_or_else(|| DeltafinError::new("vectored source offset overflows off_t"))?;
@@ -3044,8 +4447,57 @@ impl ReadTicket {
         self.batch.completion.remaining.load(Ordering::Acquire) == 0
     }
 
+    /// Arrival-driven compute: wait until `minimum` sources of this union read
+    /// have every chunk landed (or the read finished / was cancelled) and
+    /// return the indices of the sources that are complete right now.
+    pub fn wait_ready_sources(&self, minimum: usize) -> Vec<usize> {
+        self.batch.wait_ready_sources(minimum);
+        self.batch.ready_sources()
+    }
+
+    /// Indices of the sources whose every chunk has landed, without waiting.
+    pub fn ready_sources(&self) -> Vec<usize> {
+        self.batch.ready_sources()
+    }
+
+    /// Surface the first read error recorded so far without consuming the ticket.
+    pub fn check_error(&self) -> Result<()> {
+        match self.batch.completion.first_error.lock().unwrap().as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Borrow the `other` slab while the read is still in flight (arrival-
+    /// driven compute). Only byte ranges of sources reported by
+    /// `ready_sources` are complete; the lease stays owned by this ticket.
+    pub fn peek_other(&self) -> &[u8] {
+        self.batch
+            .lease
+            .buffers()
+            .get(BufferKind::Other)
+            .as_slice(self.batch.lease.lengths.other)
+    }
+
     pub fn wait(self) -> Result<(LayerBuffers, ReadStats)> {
+        let trace_wait = self.batch.trace.as_deref().map(|_| {
+            (
+                stall_trace_now_ns(),
+                self.batch.completion.remaining.load(Ordering::Acquire) == 0,
+            )
+        });
         self.batch.wait()?;
+        if let (Some(trace), Some((wait_start_ns, was_ready))) =
+            (self.batch.trace.as_deref(), trace_wait)
+        {
+            stall_trace_record(
+                self.batch.priority,
+                wait_start_ns,
+                stall_trace_now_ns(),
+                was_ready,
+                trace,
+            );
+        }
         let buffers = LayerBuffers {
             lease: Arc::clone(&self.batch.lease),
         };
@@ -3156,6 +4608,18 @@ impl Reader {
         arena_slots: usize,
         retire_hook: Option<BufferRetireHook>,
     ) -> Result<Self> {
+        Self::with_arena_capacity_retire_hook_and_class(workers, arena_slots, retire_hook, false)
+    }
+
+    /// `prefetch_class: true` marks this Reader's workers as speculative I/O,
+    /// eligible for K3_PREFETCH_IOPOL kernel deprioritization. Demand readers
+    /// pass false and are untouched.
+    pub(crate) fn with_arena_capacity_retire_hook_and_class(
+        workers: usize,
+        arena_slots: usize,
+        retire_hook: Option<BufferRetireHook>,
+        prefetch_class: bool,
+    ) -> Result<Self> {
         if workers == 0 {
             return Err(DeltafinError::new(
                 "storage reader needs at least one worker",
@@ -3175,7 +4639,7 @@ impl Reader {
             let worker_state = Arc::clone(&state);
             let handle = match thread::Builder::new()
                 .name(format!("deltafin-io-{index}"))
-                .spawn(move || worker_main(worker_state))
+                .spawn(move || worker_main(worker_state, prefetch_class))
             {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -3245,6 +4709,67 @@ impl Reader {
         destination: BufferKind,
         priority: ReadPriority,
     ) -> Result<ReadTicket> {
+        self.submit_deferred_exact_inner(catalog, source_indices, destination, priority, true)?
+            .ok_or_else(|| {
+                DeltafinError::new("blocking catalog submission unexpectedly found no arena slot")
+            })
+    }
+
+    /// Non-blocking deferred-exact admission. `None` means every eligible
+    /// arena slot is currently leased. Speculative submitters (pilot plans,
+    /// true-route top-ups) MUST use this: with `wait=true` the single decode
+    /// thread can park on the arena condvar waiting for slots held by
+    /// speculative tickets only it can ever claim or drain — a permanent
+    /// self-deadlock (observed post-cold-boot at race-scattered tokens once
+    /// the top-up path exceeded the sized 32-current + 32-next invariant).
+    pub fn try_submit_deferred_exact(
+        &self,
+        catalog: &DeferredExactCatalog,
+        source_indices: &[u32],
+        destination: BufferKind,
+        priority: ReadPriority,
+    ) -> Result<Option<ReadTicket>> {
+        self.submit_deferred_exact_inner(catalog, source_indices, destination, priority, false)
+    }
+
+    /// Wait-flag passthrough for callers deciding blocking behavior at
+    /// runtime (authoritative unions block; speculative ones must not).
+    pub fn try_submit_deferred_exact_with_wait(
+        &self,
+        catalog: &DeferredExactCatalog,
+        source_indices: &[u32],
+        destination: BufferKind,
+        priority: ReadPriority,
+        wait_for_slot: bool,
+    ) -> Result<Option<ReadTicket>> {
+        self.submit_deferred_exact_inner(
+            catalog,
+            source_indices,
+            destination,
+            priority,
+            wait_for_slot,
+        )
+    }
+
+    /// Wait-flag passthrough over the planned-submission path; same
+    /// contract as `try_submit_deferred_exact_with_wait`.
+    pub fn try_submit_with_wait(
+        &self,
+        plan: &ReadPlan,
+        priority: ReadPriority,
+        wait_for_slot: bool,
+    ) -> Result<Option<ReadTicket>> {
+        self.submit_inner(plan, priority, wait_for_slot)
+    }
+
+    fn submit_deferred_exact_inner(
+        &self,
+        catalog: &DeferredExactCatalog,
+        source_indices: &[u32],
+        destination: BufferKind,
+        priority: ReadPriority,
+        wait_for_slot: bool,
+    ) -> Result<Option<ReadTicket>> {
         let (lengths, source_length) =
             deferred_batch_lengths(catalog, source_indices, destination)?;
         let logical_bytes = lengths.get(destination) as u64;
@@ -3255,10 +4780,9 @@ impl Reader {
                 return Err(DeltafinError::new("storage reader is closed"));
             }
         }
-        let lease = self
-            .arena
-            .acquire(lengths, true, priority)?
-            .ok_or_else(|| DeltafinError::new("blocking catalog submission found no arena slot"))?;
+        let Some(lease) = self.arena.acquire(lengths, wait_for_slot, priority)? else {
+            return Ok(None);
+        };
         let batch = Arc::new(Batch::new_deferred_exact_validated(
             catalog,
             source_indices,
@@ -3267,7 +4791,7 @@ impl Reader {
             lease,
             priority,
         ));
-        let participating = self.workers().min(source_indices.len());
+        let participating = self.workers().min(batch.jobs.len());
         let mut inner = self.state.inner.lock().unwrap();
         if inner.closed {
             return Err(DeltafinError::new("storage reader is closed"));
@@ -3277,13 +4801,89 @@ impl Reader {
         }
         self.state.available.notify_all();
         drop(inner);
-        Ok(ReadTicket {
+        Ok(Some(ReadTicket {
+            batch,
+            started,
+            bytes: logical_bytes,
+            // Logical source count, NOT physical chunk jobs: the expert-union
+            // wait contract (experts.rs expected_jobs = selection.len())
+            // validates against this. K3_SPLIT_READ multiplies only the
+            // worker-facing job count above.
+            jobs: source_indices.len(),
+            workers: participating,
+        }))
+    }
+
+    /// K3_SUMMER_READ_INTO_SLOT: the same deferred-exact job, but its
+    /// `Other` destination is caller-owned memory (a Summer pool slot) rather
+    /// than an arena slot — the bytes land where they will live, no memcpy.
+    /// Takes no arena slot, so it carries no arena backpressure: the pool's
+    /// own slot reservation is the bound. `keepalive` pins the owner (the
+    /// pool span's Arc) for the batch's life, so a pool eviction guard that
+    /// counts that Arc's strong references sees this in-flight/served read.
+    pub fn try_submit_deferred_exact_into(
+        &self,
+        catalog: &DeferredExactCatalog,
+        source_indices: &[u32],
+        destination: BufferKind,
+        priority: ReadPriority,
+        dest_pointer: NonNull<u8>,
+        dest_capacity: usize,
+        keepalive: Arc<dyn Any + Send + Sync>,
+    ) -> Result<Option<ReadTicket>> {
+        let (lengths, source_length) =
+            deferred_batch_lengths(catalog, source_indices, destination)?;
+        if destination != BufferKind::Other
+            || lengths.get(BufferKind::Quantized) != 0
+            || lengths.get(BufferKind::Scales) != 0
+            || lengths.get(BufferKind::Other) > dest_capacity
+        {
+            return Ok(None);
+        }
+        let logical_bytes = lengths.get(destination) as u64;
+        let started = Instant::now();
+        {
+            let inner = self.state.inner.lock().unwrap();
+            if inner.closed {
+                return Err(DeltafinError::new("storage reader is closed"));
+            }
+        }
+        let buffers = Arc::new(SharedBuffers::external_other(
+            dest_pointer,
+            dest_capacity,
+            keepalive,
+        )?);
+        let lease = Arc::new(BufferLeaseInner {
+            arena: Weak::new(),
+            slot_index: usize::MAX,
+            buffers: Some(buffers),
+            lengths,
+        });
+        let batch = Arc::new(Batch::new_deferred_exact_validated(
+            catalog,
+            source_indices,
+            destination,
+            source_length,
+            lease,
+            priority,
+        ));
+        let participating = self.workers().min(batch.jobs.len());
+        let mut inner = self.state.inner.lock().unwrap();
+        if inner.closed {
+            return Err(DeltafinError::new("storage reader is closed"));
+        }
+        for _ in 0..participating {
+            inner.queues.push(priority, Arc::clone(&batch));
+        }
+        self.state.available.notify_all();
+        drop(inner);
+        Ok(Some(ReadTicket {
             batch,
             started,
             bytes: logical_bytes,
             jobs: source_indices.len(),
             workers: participating,
-        })
+        }))
     }
 
     pub fn read_deferred_exact(
@@ -3370,8 +4970,15 @@ fn deferred_batch_lengths(
     Ok((lengths, source_length))
 }
 
-fn worker_main(state: Arc<PoolState>) {
-    crate::io_priority::configure_model_io_thread();
+fn worker_main(state: Arc<PoolState>, prefetch_class: bool) {
+    // Prefetch workers may be deprioritized at the kernel's per-device I/O
+    // queues (K3_PREFETCH_IOPOL) so demand reads never wait behind
+    // speculation; with the knob unset both paths are identical.
+    if prefetch_class {
+        crate::io_priority::configure_prefetch_io_thread();
+    } else {
+        crate::io_priority::configure_model_io_thread();
+    }
     loop {
         let batch = {
             let mut inner = state.inner.lock().unwrap();
@@ -3522,6 +5129,7 @@ fn authenticate_and_scatter_source(
                         ));
                     }
                 };
+                EXPERT_READ_BYTES.fetch_add(count as u64, Ordering::Relaxed);
                 if count == 0 {
                     return Err(DeltafinError::new(format!(
                         "short authenticated pread from {} at {}",
@@ -3553,6 +5161,7 @@ fn authenticate_and_scatter_source(
                         return Err(io_error("pread authenticated gather", &source.path, error));
                     }
                 };
+                EXPERT_READ_BYTES.fetch_add(count as u64, Ordering::Relaxed);
                 if count == 0 {
                     return Err(DeltafinError::new(format!(
                         "short authenticated gather pread {}/{} from {} at {}",
@@ -3583,6 +5192,7 @@ fn authenticate_and_scatter_source(
                     ));
                 }
             };
+            EXPERT_READ_BYTES.fetch_add(count as u64, Ordering::Relaxed);
             if count == 0 {
                 return Err(DeltafinError::new(format!(
                     "short authenticated pread from {} at {}",
@@ -3675,9 +5285,683 @@ const fn open_cloexec_nofollow() -> i32 {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("Deltafin native storage currently supports macOS and Linux");
 
+/// K3_MIRROR_SCHED=1 (default off = upstream static order): least-loaded
+/// dispatch across the pools that hold a copy of an expert.
+///
+/// Hot-tier entries are COPIES — the enclosure original is never removed — so
+/// every tier-resident expert is dual-homed, and either source returns the
+/// same bytes (length- and identity-checked by the caller). Static resolution
+/// always reads the hot tier first, which pins the internal SSD at ~70% of
+/// read traffic while both enclosures idle: measured 2026-08-24, internal
+/// 9.45 GB/s of 13.73 capability (69%), each enclosure 2.6 of 5.58 (47%),
+/// aggregate 14.67 of 24.9. Because a token's ~32 GB of expert traffic is
+/// throughput-bound, that imbalance sets the token time directly.
+///
+/// The dispatcher keeps a virtual clock per pool — the projected time each
+/// has been given work for — and sends the next read to whichever pool is
+/// furthest ahead. No completion callback is needed: charging at submission
+/// converges on the same balance a work-conserving scheduler would reach.
+/// Which physical device served an expert open.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MirrorDev {
+    Internal = 0,
+    DirC = 1,
+    DirB = 2,
+    Primary = 3,
+}
+
+const MIRROR_DEVS: [MirrorDev; 4] = [
+    MirrorDev::Internal,
+    MirrorDev::DirC,
+    MirrorDev::DirB,
+    MirrorDev::Primary,
+];
+
+/// One counter per cache line. `[AtomicU64; 4]` is 32 bytes — a single line
+/// shared by 64 reader threads, so every dispatch invalidates the line for all
+/// of them. Flagged as free money by external review 2026-08-31 and folded in
+/// here rather than left as a separate patch.
+#[repr(align(128))]
+struct PaddedU64(AtomicU64);
+
+/// Per-device service clocks, in microseconds of charged work.
+///
+/// MONOTONIC. This is the defect that makes MODE 1 a weighted round-robin
+/// rather than a scheduler: it is a lifetime integral, so its sensitivity to
+/// the current dispatch decays as 1/N. Adding 1502 us to a clock already at
+/// ~15,000,000 us cannot reorder anything, and by mid-run the ordering is
+/// frozen at the long-run bandwidth ratio. It has no representation of what is
+/// outstanding right now, so two of a barrier's 16 experts can queue behind
+/// each other on K3B while internal idles and the clocks call that balanced —
+/// which is exactly the case the layer pays for, since it costs max(16 reads).
+static MIRROR_CLOCKS: [PaddedU64; 4] = [
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+];
+
+/// MODE 2. Reads currently IN FLIGHT per device: incremented on issue,
+/// decremented on completion. Unlike the clocks this is a level, not an
+/// integral, so it answers "what is this device busy with NOW" — the question
+/// a barrier actually poses. Estimated completion for a candidate device is
+/// `(outstanding + 1) * cost_us(dev)`, and dispatch picks the argmin, i.e.
+/// the drive that can finish this expert first rather than the drive that is
+/// furthest behind its lifetime quota.
+static MIRROR_OUTSTANDING: [PaddedU64; 4] = [
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+    PaddedU64(AtomicU64::new(0)),
+];
+
+thread_local! {
+    /// Device this worker most recently dispatched to, so the completion site
+    /// can decrement the right counter. Safe because in the catalog path the
+    /// open and the read are sequential on the SAME worker thread. Cached-open
+    /// paths never call the dispatcher, so they never increment, and therefore
+    /// must not decrement — `None` records that.
+    static MIRROR_INFLIGHT_DEV: std::cell::Cell<Option<MirrorDev>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Estimated microseconds for `dev` to finish one more expert record.
+fn mirror_eta_us(dev: MirrorDev) -> u64 {
+    let index = dev as usize;
+    let queued = MIRROR_OUTSTANDING[index].0.load(Ordering::Relaxed);
+    // Bias applies here too: it is an EV correction on the cost estimate, and
+    // an estimate used for ordering must carry the same correction the charge
+    // does or the two disagree about what a device costs.
+    let unit = mirror_cost_us(dev);
+    unit.saturating_mul(queued.saturating_add(1))
+}
+
+/// Mark a dispatch to `dev` as in flight (MODE 2 only).
+fn mirror_issue(dev: MirrorDev) {
+    if mirror_sched_mode() != 2 {
+        return;
+    }
+    MIRROR_OUTSTANDING[dev as usize].0.fetch_add(1, Ordering::Relaxed);
+    MIRROR_INFLIGHT_DEV.with(|slot| slot.set(Some(dev)));
+}
+
+/// Retire the dispatch this worker last issued (MODE 2 only). Idempotent: the
+/// slot is cleared, so a second call cannot drive the counter negative — an
+/// under-count merely makes a device look freer, whereas an over-count would
+/// permanently exile it from selection.
+pub(crate) fn mirror_retire() {
+    if mirror_sched_mode() != 2 {
+        return;
+    }
+    MIRROR_INFLIGHT_DEV.with(|slot| {
+        if let Some(dev) = slot.take() {
+            MIRROR_OUTSTANDING[dev as usize]
+                .0
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)))
+                .ok();
+        }
+    });
+}
+
+/// Per-device in-flight depth, for telemetry: (internal, C, B, A).
+pub fn mirror_outstanding_report() -> (u64, u64, u64, u64) {
+    let n = |dev: MirrorDev| MIRROR_OUTSTANDING[dev as usize].0.load(Ordering::Relaxed);
+    (
+        n(MirrorDev::Internal),
+        n(MirrorDev::DirC),
+        n(MirrorDev::DirB),
+        n(MirrorDev::Primary),
+    )
+}
+
+/// Per-device cost of one 17.5 MB expert record, from the concurrent
+/// capability measured 2026-08-29: internal 11.68, K3C 7.08, K3B 5.62,
+/// K3A 5.80 GB/s.
+///
+/// The internal figure derives to 1502 us, which is exactly the corrected
+/// two-way constant — the same measurement seen from two directions.
+///
+/// WHY FOUR CLOCKS AND NOT TWO. The old scheduler weighed internal against
+/// all-enclosures-as-one-bucket, and within that bucket the probe order was
+/// fixed with dir_c unconditionally first. That is harmless while most
+/// experts have exactly one home, which is why it measured null (-0.33%,
+/// 2026-08-31 P3). It becomes actively harmful the moment experts are
+/// REPLICATED: every enclosure-side candidate resolves on the first probe, so
+/// K3C absorbs everything. Simulated on four recorded finance-style traces, replicating the
+/// >20x band under the two-way clock costs **-20.1%**, with K3C's read share
+/// going 23% -> 43% while K3B and K3A fall to 9%. The same replication under
+/// four-way load ordering gains **+17.1%**.
+///
+/// Replication and per-device scheduling are a PAIR: neither pays alone, and
+/// the two-way version of this code makes the pair impossible.
+/// K3_MIRROR_COST_ACHIEVED=1 selects constants derived from ACHIEVED steady
+/// bandwidth instead of rated. Default stays rated so every arm recorded before
+/// today remains comparable.
+///
+/// The rated figures are sequential-benchmark numbers; measured steady decode
+/// never reaches them:
+///     internal  rated 11.68  achieved 10.28  -> cost 1502 -> 1707  (+14%)
+///     K3C       rated  7.08  achieved  5.37  -> cost 2478 -> 3268  (+32%)
+///     K3B       rated  5.62  achieved  4.08  -> cost 3122 -> 4301  (+38%)
+///     K3A       rated  5.80  achieved  4.20  -> cost 3025 -> 4178  (+38%)
+///
+/// This matters more than the percentages suggest. Per-read trace attribution
+/// (9,986 barriers, all 243,494 reads joined to a device) shows K3C sets Tmax on
+/// 42.7% of barriers while serving 24.5% of reads — 1.74x over-represented as
+/// the straggler. The cost model undercharges exactly that device by 32%, so
+/// mode 2 sends it more work than it can absorb. Internal is the mirror image:
+/// 40.7% of reads, 28.3% of stragglers, 0.69x.
+const MIRROR_COST_RATED: [u64; 4] = [1502, 2478, 3122, 3025];
+const MIRROR_COST_ACHIEVED: [u64; 4] = [1707, 3268, 4301, 4178];
+
+fn mirror_cost_table() -> &'static [u64; 4] {
+    static SEL: OnceLock<bool> = OnceLock::new();
+    let achieved = *SEL.get_or_init(|| {
+        std::env::var("K3_MIRROR_COST_ACHIEVED").is_ok_and(|v| v == "1")
+    });
+    if achieved { &MIRROR_COST_ACHIEVED } else { &MIRROR_COST_RATED }
+}
+
+/// Which cost table resolved, for the startup line — the knob is absent from
+/// `[config] resolved:`.
+pub fn mirror_cost_table_report() -> &'static str {
+    if std::ptr::eq(mirror_cost_table(), &MIRROR_COST_ACHIEVED) { "achieved" } else { "rated" }
+}
+
+/// EV COMPENSATION for the scheduler (K3_MIRROR_BIAS).
+///
+/// The cost constants are a light meter: they estimate what each device costs
+/// from its *sequential* bandwidth. Like a meter they can be systematically
+/// off, and like a photographer we would rather dial a known correction than
+/// rebuild the meter.
+///
+/// Format: `internal:0.85,K3A:1.1` — a MULTIPLIER on that device's cost.
+/// Below 1 makes the device look cheaper, so it attracts more work; above 1
+/// pushes work away. Unlisted devices stay at 1.0. Clamped to [0.25, 4.0].
+///
+/// The evidence this exists to chase: with no scheduler the layout ran internal
+/// at **43%** of reads and was FASTER than the scheduler's capability-proportional
+/// **38%** (0.38505 vs 0.3556 tok/s, 2026-08-31). Internal was at only 64% of its
+/// capability with headroom, so over-weighting the fastest device beat balancing.
+/// A bias below 1.0 on internal should reproduce that split deliberately.
+///
+/// Deliberately a multiplier and not new constants: it keeps the derivation
+/// (RECORD/bandwidth) intact and auditable, and makes the correction an
+/// explicit, logged decision rather than a silently retuned magic number.
+fn mirror_bias() -> [f64; 4] {
+    static BIAS: std::sync::OnceLock<[f64; 4]> = std::sync::OnceLock::new();
+    *BIAS.get_or_init(|| {
+        let mut bias = [1.0_f64; 4];
+        let Ok(raw) = std::env::var("K3_MIRROR_BIAS") else {
+            return bias;
+        };
+        for entry in raw.split(',') {
+            let Some((name, value)) = entry.split_once(':') else {
+                continue;
+            };
+            let Ok(factor) = value.trim().parse::<f64>() else {
+                continue;
+            };
+            let index = match name.trim() {
+                "internal" => 0,
+                "K3C" | "dir_c" => 1,
+                "K3B" | "dir_b" => 2,
+                "K3A" | "primary" => 3,
+                _ => continue,
+            };
+            bias[index] = factor.clamp(0.25, 4.0);
+        }
+        bias
+    })
+}
+
+/// Cost after EV compensation. This is what the clocks are charged.
+fn mirror_cost_us(dev: MirrorDev) -> u64 {
+    let index = dev as usize;
+    ((mirror_cost_table()[index] as f64) * mirror_bias()[index]).round().max(1.0) as u64
+}
+
+/// Resolved bias, for the startup line — so a compensated run can never be
+/// mistaken for an uncompensated one when the logs are read back.
+pub fn mirror_bias_report() -> [f64; 4] {
+    mirror_bias()
+}
+
+/// K3_MIRROR_SCHED: 0/unset = upstream static probe order.
+///   1 = cumulative-clock order (the original; a weighted round-robin, see
+///       MIRROR_CLOCKS — kept so every arm recorded before 2026-08-31 stays
+///       reproducible against its own logs).
+///   2 = least-expected-completion: dispatch to the drive that can finish this
+///       expert FIRST, from live in-flight depth rather than lifetime totals.
+fn mirror_sched_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("K3_MIRROR_SCHED")
+            .ok()
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|mode| *mode <= 2)
+            .unwrap_or(0)
+    })
+}
+
+fn mirror_sched_enabled() -> bool {
+    mirror_sched_mode() != 0
+}
+
+/// Microseconds one 17,547,264 B expert occupies each pool, from the measured
+/// engine-pattern rates. Pool throughput is the right currency rather than
+/// per-stream latency, because one stream already saturates a drive (5.23 of
+/// 5.58 GB/s single-threaded), so a second concurrent read buys nothing per
+/// drive.
+///
+/// RE-DERIVED 2026-08-31. Both constants were stale and the error was large
+/// enough to invert the scheduler's preference:
+///
+///   internal    13.73 -> 11.68 GB/s  =>  1278 -> 1502 us
+///   enclosures  11.16 -> 18.50 GB/s  =>  1572 ->  948 us
+///
+/// The enclosure figure was derived when there were TWO enclosures totalling
+/// 11.16 GB/s. There are now THREE, measured concurrently at
+/// 7.08 + 5.62 + 5.80 = 18.50 GB/s (observed maxima across 130+ timed arms,
+/// 2026-08-29). Internal's 11.68 GB/s comes from the same set.
+///
+/// Old ratio internal/enclosure 0.813 biased every dual-homed decision toward
+/// internal; the corrected ratio is 1.584, i.e. the scheduler had the sign
+/// wrong, not merely the magnitude. Expected speed effect is nonetheless ~0%:
+/// the current four-way layout is an index split, so most experts have exactly
+/// one home and this path is rarely exercised. This is a correctness fix.
+const MIRROR_INTERNAL_COST_US: u64 = 1502;
+const MIRROR_ENCLOSURE_COST_US: u64 = 948;
+
+/// Resolved mirror-scheduler state for the startup line: (enabled, internal_us,
+/// enclosure_us). Emitted so a stale cost constant can never again sit
+/// unnoticed in the tree — the 2026-08-31 re-derivation found both constants
+/// wrong by enough to invert the scheduler's preference, and nothing in any log
+/// would have shown it.
+pub fn mirror_sched_report() -> (bool, u64, u64) {
+    (
+        mirror_sched_enabled(),
+        mirror_cost_table()[MirrorDev::Internal as usize],
+        MIRROR_ENCLOSURE_COST_US,
+    )
+}
+
+/// Which dispatch policy actually resolved. Reported separately because
+/// K3_MIRROR_SCHED now has three values and `enabled=true` no longer says which
+/// one is running — an arm that meant to test mode 2 and silently got mode 1
+/// would produce a plausible, wrong, and unfalsifiable result.
+pub fn mirror_sched_mode_report() -> u8 {
+    mirror_sched_mode()
+}
+
+/// Per-device opens the scheduler actually dispatched: (internal, C, B, A).
+/// The two-way version of this was dead code and the dispatch split was
+/// therefore unobservable; with four clocks it is the only way to assert the
+/// balance BY EFFECT rather than by resolution.
+pub fn mirror_device_split() -> (u64, u64, u64, u64) {
+    let n = |d: MirrorDev| {
+        MIRROR_CLOCKS[d as usize].0.load(Ordering::Relaxed) / mirror_cost_us(d).max(1)
+    };
+    (n(MirrorDev::Internal), n(MirrorDev::DirC), n(MirrorDev::DirB), n(MirrorDev::Primary))
+}
+
+/// Probe order for one expert open.
+///
+/// Disabled, or with an explicit split-read home hint, this returns the
+/// historical fixed order (dir_c, internal, dir_b, primary) so behaviour is
+/// byte-identical to before the four-way change. Enabled, devices are ordered
+/// by current clock so the least-loaded home is probed first; the order stays
+/// a permutation of all four, so resolution remains total and an expert can
+/// never become unreachable.
+/// K3_PROBE_ORDER=hot_first — probe `hot` (internal) before `dir_c` (K3C).
+///
+/// WHY. The static chain is dir_c -> hot -> dir_b -> primary, so K3C is probed
+/// FIRST despite being the slower of the two mirror tiers (rated 7.08 GB/s vs
+/// internal's 11.68; achieved steady 10.28 for internal). Whatever occupies the
+/// first-probed slot absorbs hot traffic alone while the other three idle.
+/// Measured dose-response, 40 tok, band placed in dir_c:
+///
+///     0% in dir_c -> +1.1%   25% -> -4.5%   50% -> -15.0%   100% -> -32.6%
+///
+/// and the per-read trace caught the mechanism directly: a 50/50 internal/K3C
+/// split delivered 63% of pool reads to K3C, a 25%-each-of-four split delivered
+/// 43% to K3C and 4.6% to K3A. dir_c captures its own share PLUS everything it
+/// already held. That is also the mechanism behind the -22.31% R_OFF arm.
+///
+/// LOW RISK. The `home_hint` branch below already returns exactly this ordering
+/// for hinted opens, so hot-first is a known-good permutation — this only
+/// changes which case gets it. The order remains a permutation of all four, so
+/// resolution stays total and no expert becomes unreachable.
+///
+/// BEHIND A FLAG, never a silent default: a silent reorder would make every
+/// arm recorded before today incomparable with every arm after it.
+///
+/// CAVEAT recorded before measuring: this moves K3C's 20,516 experts onto
+/// internal, taking its read share from ~41% toward ~55%. The recorded
+/// simulation for pushing internal past ~81% was -34.5%, so the effect is not
+/// obviously monotonic in internal's share.
+fn probe_hot_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("K3_PROBE_ORDER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("hot_first"))
+    })
+}
+
+/// Resolved probe order, for the startup line — K3_PROBE_ORDER does not appear
+/// in `[config] resolved:`, so this is the only assertable record of it.
+pub fn probe_order_report() -> &'static str {
+    if probe_hot_first() { "hot_first" } else { "dir_c_first" }
+}
+
+fn mirror_probe_order(home_hint: Option<bool>) -> [MirrorDev; 4] {
+    const DIR_C_FIRST: [MirrorDev; 4] = [
+        MirrorDev::DirC,
+        MirrorDev::Internal,
+        MirrorDev::DirB,
+        MirrorDev::Primary,
+    ];
+    const HOT_FIRST: [MirrorDev; 4] = [
+        MirrorDev::Internal,
+        MirrorDev::DirC,
+        MirrorDev::DirB,
+        MirrorDev::Primary,
+    ];
+    let legacy = if probe_hot_first() { HOT_FIRST } else { DIR_C_FIRST };
+    if !mirror_sched_enabled() {
+        return legacy;
+    }
+    if let Some(prefer_internal) = home_hint {
+        return if prefer_internal {
+            HOT_FIRST
+        } else {
+            legacy
+        };
+    }
+    let mut order = MIRROR_DEVS;
+    if mirror_sched_mode() == 2 {
+        // Least expected completion. Ties broken by raw speed so that when the
+        // machine is idle (all depths zero, the common case at a barrier
+        // boundary) the fastest device wins instead of whatever the array
+        // order happened to be — without this the policy degenerates to the
+        // static order exactly when it matters most.
+        order.sort_by_key(|dev| (mirror_eta_us(*dev), mirror_cost_us(*dev)));
+    } else {
+        order.sort_by_key(|dev| MIRROR_CLOCKS[*dev as usize].0.load(Ordering::Relaxed));
+    }
+    order
+}
+
+// ---------------------------------------------------------------------------
+// PER-READ PROVENANCE TRACE  (K3_READ_TRACE=<path>)
+//
+// Answers, per second and per barrier, WHICH expert was served from WHERE:
+// the RAM pools (summer / retain / pinned) or one of the four drives. Nothing
+// in the engine could answer that before this: `[summer]` and `[mirror-split]`
+// are END-OF-RUN TOTALS, and the disk-sampler .csv has 200 ms time resolution but
+// is an OS byte counter with no expert identity, so it cannot say which expert
+// or which barrier a read belonged to.
+//
+// LOCK-FREE ON PURPOSE. 64 reader threads hit this path; a Mutex<Vec> would
+// serialise them and the instrument would change the thing it measures. Each
+// record is packed into two u64 stored in preallocated atomic arrays, claimed
+// with one fetch_add. Cost is ~2 relaxed stores per expert read.
+//
+//   w0: t_us(40) | layer(7) | expert(10) | source(3)   ... 60 bits
+//   w1: dur_ns(32) | barrier(32)
+//
+// Records are DROPPED, not wrapped, once the buffer is full, and the drop
+// count is reported — a silently wrapping ring would look like a complete
+// trace with a plausible but wrong tail.
+const TRACE_CAP: usize = 1 << 21; // 2M records ~= 32 MB; a 200-tok run makes ~250k
+
+pub(crate) const SRC_SUMMER: u8 = 0;
+pub(crate) const SRC_RETAIN: u8 = 1;
+pub(crate) const SRC_PINNED: u8 = 2;
+pub(crate) const SRC_INTERNAL: u8 = 3;
+pub(crate) const SRC_K3C: u8 = 4;
+pub(crate) const SRC_K3B: u8 = 5;
+pub(crate) const SRC_K3A: u8 = 6;
+// The TRANSFER, recorded separately from the open. The open site is the only
+// place that knows the resolved device, and the read site is the only place
+// that knows how long the 17.5 MB actually took — and for catalog-resolved
+// experts neither can see the other's fact without threading state through a
+// cached-descriptor path where opens do not happen per read. Keeping them as
+// two records is honest: `read` carries the duration that sets the barrier
+// tail, the device records carry placement, and the reducer uses each for what
+// it actually measured instead of inventing a join that would silently
+// mis-attribute every cached open.
+pub(crate) const SRC_READ: u8 = 7;
+const SRC_NAMES: [&str; 8] =
+    ["summer", "retain", "pinned", "internal", "K3C", "K3B", "K3A", "read"];
+
+static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static TRACE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static TRACE_IDX: AtomicU64 = AtomicU64::new(0);
+static TRACE_DROPPED: AtomicU64 = AtomicU64::new(0);
+static TRACE_BARRIER: AtomicU64 = AtomicU64::new(0);
+static TRACE_W0: std::sync::OnceLock<Vec<AtomicU64>> = std::sync::OnceLock::new();
+static TRACE_W1: std::sync::OnceLock<Vec<AtomicU64>> = std::sync::OnceLock::new();
+// w2 (2026-09-06): target_barrier(32) | tile_layer(8) | offset_units(12) | length_units(12),
+// units of BUFFER_ALIGNMENT bytes. target_barrier = the pass a prefetch read
+// serves (the current pass for demand/union reads), so consumers no longer
+// guess it from the pass current at completion; offset/length give the exact
+// byte range so nothing is inferred from record counts.
+static TRACE_W2: std::sync::OnceLock<Vec<AtomicU64>> = std::sync::OnceLock::new();
+static TRACE_LAYER: AtomicU32 = AtomicU32::new(0);
+
+fn trace_enabled() -> bool {
+    *TRACE_ON.get_or_init(|| {
+        let on = std::env::var("K3_READ_TRACE").is_ok_and(|v| !v.trim().is_empty());
+        if on {
+            TRACE_T0.get_or_init(std::time::Instant::now);
+            TRACE_W0.get_or_init(|| (0..TRACE_CAP).map(|_| AtomicU64::new(0)).collect());
+            TRACE_W1.get_or_init(|| (0..TRACE_CAP).map(|_| AtomicU64::new(0)).collect());
+            TRACE_W2.get_or_init(|| (0..TRACE_CAP).map(|_| AtomicU64::new(0)).collect());
+        }
+        on
+    })
+}
+
+/// Open a new barrier (one layer's top-16 union). Returns its id.
+pub(crate) fn trace_barrier_begin(layer: u32) -> u64 {
+    if !trace_enabled() {
+        return 0;
+    }
+    TRACE_LAYER.store(layer, Ordering::Relaxed);
+    let id = TRACE_BARRIER.fetch_add(1, Ordering::Relaxed);
+    // Pass-begin marker (2026-09-06): source "read", expert 1023 (no such
+    // expert; ids stop at 895), duration 0. Consumers measure a pass's storage
+    // span from this stamp, so a prefetch that landed a whole chunk earlier
+    // cannot stretch the span backwards (the "layer 20 = 5.8 s" artefact).
+    // Reads issued during this pass record the counter AFTER the increment
+    // (id + 1), so the marker carries id + 1 too (05:35 fix: the first
+    // captures had it one behind, which the parser detects and shifts).
+    trace_read_prio(id + 1, layer, 0x3FF, SRC_READ, 0, None, 0, 0);
+    id
+}
+
+/// The pass a read serves. Demand and union reads serve the current pass. A
+/// prefetch for layer L issued while the pass of layer Lb is current serves the
+/// pass of L in this chunk when L > Lb, otherwise in the next chunk: barriers
+/// advance one MoE layer per pass, 92 passes per chunk sweep.
+fn trace_target_barrier(current: u64, layer: u32, prefetch: Option<bool>) -> u64 {
+    let tile_layer = TRACE_LAYER.load(Ordering::Relaxed);
+    if prefetch != Some(true) || tile_layer == 0 || layer == tile_layer {
+        return current;
+    }
+    let passes = 92_i64;
+    let delta = ((layer as i64 - tile_layer as i64) % passes + passes) % passes;
+    current + delta as u64
+}
+
+/// Record one expert arrival. `dur_ns` is 0 for RAM hits (no I/O performed).
+pub(crate) fn trace_read(barrier: u64, layer: u32, expert: u16, source: u8, dur_ns: u64) {
+    trace_read_prio(barrier, layer, expert, source, dur_ns, None, 0, 0);
+}
+
+/// Same record with the read's priority: `Some(true)` prefetch, `Some(false)`
+/// demand, `None` unknown (legacy sites). Bits 60/61 of w0 were spare (t_us
+/// uses 40 bits from bit 20), so the layout stays a two-u64 packed record.
+pub(crate) fn trace_read_prio(
+    barrier: u64,
+    layer: u32,
+    expert: u16,
+    source: u8,
+    dur_ns: u64,
+    prefetch: Option<bool>,
+    offset: u64,
+    length: u64,
+) {
+    if !trace_enabled() {
+        return;
+    }
+    let (Some(w0s), Some(w1s), Some(w2s)) = (TRACE_W0.get(), TRACE_W1.get(), TRACE_W2.get()) else {
+        return;
+    };
+    let slot = TRACE_IDX.fetch_add(1, Ordering::Relaxed) as usize;
+    if slot >= TRACE_CAP {
+        TRACE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let units = BUFFER_ALIGNMENT as u64;
+    let offset_units = (offset / units).min(0xFFF);
+    let length_units = (length.div_ceil(units)).min(0xFFF);
+    let w2 = (trace_target_barrier(barrier, layer, prefetch) & 0xFFFF_FFFF) << 32
+        | ((TRACE_LAYER.load(Ordering::Relaxed) as u64) & 0xFF) << 24
+        | (offset_units << 12)
+        | length_units;
+    w2s[slot].store(w2, Ordering::Relaxed);
+    let t_us = TRACE_T0
+        .get()
+        .map(|t0| t0.elapsed().as_micros() as u64)
+        .unwrap_or(0)
+        & 0xFF_FFFF_FFFF;
+    let prio_bits: u64 = match prefetch {
+        None => 0,
+        Some(false) => 1 << 60,
+        Some(true) => (1 << 60) | (1 << 61),
+    };
+    let w0 = prio_bits
+        | (t_us << 20)
+        | (((layer as u64) & 0x7F) << 13)
+        | (((expert as u64) & 0x3FF) << 3)
+        | ((source as u64) & 0x7);
+    let w1 = ((dur_ns.min(u32::MAX as u64)) << 32) | (barrier & 0xFFFF_FFFF);
+    w0s[slot].store(w0, Ordering::Relaxed);
+    w1s[slot].store(w1, Ordering::Relaxed);
+}
+
+/// Write the trace as CSV. Called at end of run.
+pub(crate) fn trace_dump() {
+    if !trace_enabled() {
+        return;
+    }
+    let Ok(path) = std::env::var("K3_READ_TRACE") else {
+        return;
+    };
+    let (Some(w0s), Some(w1s), Some(w2s)) = (TRACE_W0.get(), TRACE_W1.get(), TRACE_W2.get()) else {
+        return;
+    };
+    let n = (TRACE_IDX.load(Ordering::Relaxed) as usize).min(TRACE_CAP);
+    let dropped = TRACE_DROPPED.load(Ordering::Relaxed);
+    let mut out = String::with_capacity(n * 56);
+    out.push_str("t_us,barrier,layer,expert,source,dur_ns,prio,target_barrier,tile_layer,offset,bytes\n");
+    let units = BUFFER_ALIGNMENT as u64;
+    for i in 0..n {
+        let w0 = w0s[i].load(Ordering::Relaxed);
+        let w1 = w1s[i].load(Ordering::Relaxed);
+        let w2 = w2s[i].load(Ordering::Relaxed);
+        let src = (w0 & 0x7) as usize;
+        let prio = match (w0 >> 60) & 0x3 {
+            0 => "-",
+            1 => "D",
+            _ => "P",
+        };
+        let offset = ((w2 >> 12) & 0xFFF) * units;
+        let length_units = w2 & 0xFFF;
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            (w0 >> 20) & 0xFF_FFFF_FFFF,
+            w1 & 0xFFFF_FFFF,
+            (w0 >> 13) & 0x7F,
+            (w0 >> 3) & 0x3FF,
+            SRC_NAMES.get(src).copied().unwrap_or("?"),
+            w1 >> 32,
+            prio,
+            w2 >> 32,
+            (w2 >> 24) & 0xFF,
+            offset,
+            length_units * units
+        ));
+    }
+    match std::fs::write(&path, out) {
+        Ok(()) => eprintln!(
+            "[read-trace] wrote {n} records -> {path} (dropped={dropped}, barriers={})",
+            TRACE_BARRIER.load(Ordering::Relaxed)
+        ),
+        Err(error) => eprintln!("[read-trace] FAILED to write {path}: {error}"),
+    }
+}
+
+/// `L<layer>-E<expert>[.bin]` -> (layer, expert). Returns None for any name
+/// that is not an expert record, so non-expert opens never enter the trace.
+pub(crate) fn parse_expert_name(name: &str) -> Option<(u32, u16)> {
+    let rest = name.strip_prefix('L')?;
+    let (layer, rest) = rest.split_once("-E")?;
+    let expert = rest.strip_suffix(".bin").unwrap_or(rest);
+    Some((layer.parse().ok()?, expert.parse().ok()?))
+}
+
+/// Map the scheduler's device enum onto a trace source tag.
+pub(crate) fn trace_src_of(dev: MirrorDev) -> u8 {
+    match dev {
+        MirrorDev::Internal => SRC_INTERNAL,
+        MirrorDev::DirC => SRC_K3C,
+        MirrorDev::DirB => SRC_K3B,
+        MirrorDev::Primary => SRC_K3A,
+    }
+}
+
+fn mirror_charge_dev(served: MirrorDev) {
+    if !mirror_sched_enabled() {
+        return;
+    }
+    let index = served as usize;
+    MIRROR_CLOCKS[index].0.fetch_add(mirror_cost_us(served), Ordering::Relaxed);
+}
+
+/// Wall time spent inside expert file opens (openat probes across the resolve
+/// chain) and how many opens were issued. The read-path "hint" phase wraps
+/// take_prefetch_hint + try_schedule_expert_prefetch, and the latter opens up
+/// to 16 experts per layer with up to three directory probes each — this
+/// separates that cost from the prediction it is bundled with.
+static EXPERT_OPEN_NS: AtomicU64 = AtomicU64::new(0);
+static EXPERT_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Bytes the engine requested from expert files via pread/preadv (logical read
+/// volume; compare with the physical SSD counters to see page-cache avoidance).
+static EXPERT_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn expert_read_bytes_total() -> u64 {
+    EXPERT_READ_BYTES.load(Ordering::Relaxed)
+}
+
+pub fn expert_open_totals() -> (u64, u64) {
+    (
+        EXPERT_OPEN_NS.load(Ordering::Relaxed),
+        EXPERT_OPEN_COUNT.load(Ordering::Relaxed),
+    )
+}
+
+/// Diagnostic for the A/B: how the dispatcher actually split the traffic.
+pub fn mirror_schedule_split() -> (u64, u64) {
+    let (internal, c, b, a) = mirror_device_split();
+    (internal, c + b + a)
+}
+
 fn open_deferred_catalog_source(
     catalog: &DeferredExactCatalogInner,
     source: &DeferredSourceName,
+    home_hint: Option<bool>,
 ) -> Result<File> {
     unsafe extern "C" {
         // `c_char` is signed on x86_64 and unsigned on aarch64; spelling the
@@ -3689,16 +5973,79 @@ fn open_deferred_catalog_source(
             ...
         ) -> libc::c_int;
     }
-    // SAFETY: the catalog retains a live directory descriptor, `source` is a
+    // SAFETY: the catalog retains live directory descriptors, `source` is a
     // validated NUL-terminated direct child name, and no mode argument is
-    // required because these flags never create a file.
-    let descriptor = unsafe {
-        openat(
-            catalog.directory.as_raw_fd(),
-            source.as_c_str().as_ptr(),
-            open_cloexec_nofollow(),
-        )
-    };
+    // required because these flags never create a file. The hot tier is
+    // probed first; only ENOENT falls through to the primary directory, so a
+    // present-but-wrong hot entry fails closed below like a primary one.
+    // Load-ordered probe across all four homes. Each device is tried at most
+    // once and the order is a permutation of all four, so resolution stays
+    // TOTAL: an expert present anywhere is still found, whatever the clocks
+    // say. Only ENOENT falls through; any other error fails closed exactly as
+    // the fixed cascade did.
+    let mut descriptor = -1;
+    let mut served = MirrorDev::Primary;
+    let open_started = std::time::Instant::now();
+    for dev in mirror_probe_order(home_hint) {
+        let dir_fd = match dev {
+            MirrorDev::Internal => catalog.hot_directory.as_ref().map(|d| d.as_raw_fd()),
+            MirrorDev::DirC => catalog.tertiary_directory.as_ref().map(|d| d.as_raw_fd()),
+            MirrorDev::DirB => catalog.secondary_directory.as_ref().map(|d| d.as_raw_fd()),
+            MirrorDev::Primary => Some(catalog.directory.as_raw_fd()),
+        };
+        let Some(dir_fd) = dir_fd else {
+            continue;
+        };
+        descriptor = unsafe {
+            openat(dir_fd, source.as_c_str().as_ptr(), open_cloexec_nofollow())
+        };
+        if descriptor >= 0 {
+            served = dev;
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(catalog_io_error(
+                "open deferred non-symlink expert source",
+                catalog,
+                source,
+                error,
+            ));
+        }
+    }
+    // Hinted (K3_SPLIT_READ) opens never consulted the clocks and open once
+    // per CHUNK; charging them the whole-expert cost would inflate the clocks
+    // ~chunks-fold and bias any remaining clock-decided opens.
+    if home_hint.is_none() {
+        mirror_charge_dev(served);
+        // MODE 2: this device now owes one more record. Gated identically to
+        // the charge so the level and the integral always describe the same
+        // population of dispatches — hinted (K3_SPLIT_READ) opens fire once per
+        // CHUNK rather than per expert, and counting them here would inflate
+        // the depth chunk-fold and permanently exile whichever device happened
+        // to be serving a split read.
+        mirror_issue(served);
+    }
+    // Provenance: which drive actually served this expert, and when. Recorded
+    // here because this is the only point that knows BOTH the resolved device
+    // and the expert identity — `[mirror-split]` counts the same decision but
+    // only as a run total, with no timestamp and no expert.
+    if trace_enabled() {
+        if let Some((layer, expert)) = parse_expert_name(source.as_str()) {
+            trace_read(
+                TRACE_BARRIER.load(Ordering::Relaxed),
+                layer,
+                expert,
+                trace_src_of(served),
+                open_started.elapsed().as_nanos() as u64,
+            );
+        }
+    }
+    EXPERT_OPEN_NS.fetch_add(
+        open_started.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+    EXPERT_OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
     if descriptor < 0 {
         let error = io::Error::last_os_error();
         if matches!(error.raw_os_error(), Some(23 | 24)) {
@@ -3715,6 +6062,16 @@ fn open_deferred_catalog_source(
             error,
         ));
     }
+    finish_catalog_open(catalog, source, descriptor)
+}
+
+/// Validate + configure a freshly opened catalog descriptor (shared by the
+/// legacy probe chain and the K3_SPLIT_READ per-home probes).
+fn finish_catalog_open(
+    catalog: &DeferredExactCatalogInner,
+    source: &DeferredSourceName,
+    descriptor: i32,
+) -> Result<File> {
     // SAFETY: `openat` returned a new owned descriptor. This is its unique
     // owner and `File` closes it on every subsequent success/error path.
     let file = unsafe { File::from_raw_fd(descriptor) };
@@ -3739,6 +6096,194 @@ fn open_deferred_catalog_source(
     }
     configure_catalog_cache_policy(&file, catalog, source)?;
     Ok(file)
+}
+
+/// K3_SPLIT_READ: probe exactly ONE home class for a catalog source.
+/// `internal` probes the hot tier only; otherwise secondary then primary.
+/// Ok(None) = ENOENT everywhere in that class; other errors fail closed.
+/// Chunk jobs cache the result per (source, home) on the batch, so a file
+/// pays at most two probe sequences however many chunks it has.
+fn open_catalog_home(
+    catalog: &DeferredExactCatalogInner,
+    source: &DeferredSourceName,
+    internal: bool,
+) -> Result<Option<File>> {
+    unsafe extern "C" {
+        fn openat(
+            directory: libc::c_int,
+            path: *const libc::c_char,
+            flags: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    let open_started = std::time::Instant::now();
+    // SAFETY: live directory descriptors retained by the catalog; validated
+    // NUL-terminated direct child name; flags never create a file.
+    let probe = |directory: &File| -> Result<Option<i32>> {
+        let descriptor = unsafe {
+            openat(
+                directory.as_raw_fd(),
+                source.as_c_str().as_ptr(),
+                open_cloexec_nofollow(),
+            )
+        };
+        if descriptor >= 0 {
+            return Ok(Some(descriptor));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(catalog_io_error(
+                "open split-read catalog source",
+                catalog,
+                source,
+                error,
+            ))
+        }
+    };
+    // Which tier answered (0 hot, 1 dir_c, 2 dir_b, 3 primary), recorded per
+    // descriptor for the K3_SPLIT_TRACE report.
+    let mut served_tier: u8 = 0;
+    let descriptor = if internal {
+        match &catalog.hot_directory {
+            Some(hot) => probe(hot)?,
+            None => None,
+        }
+    } else if tier_balance_enabled() {
+        // Same three tiers, probed lightest-first. Whichever answers gets
+        // charged, so the next expert in this tile prefers a different device.
+        let mut found = None;
+        for index in tier_probe_order() {
+            let directory = match index {
+                0 => catalog.tertiary_directory.as_ref(),
+                1 => catalog.secondary_directory.as_ref(),
+                _ => Some(&catalog.directory),
+            };
+            let Some(directory) = directory else { continue };
+            if let Some(descriptor) = probe(directory)? {
+                TIER_LOAD[index].fetch_add(1, Ordering::Relaxed);
+                served_tier = match index {
+                    0 => 1,
+                    1 => 2,
+                    _ => 3,
+                };
+                found = Some(descriptor);
+                break;
+            }
+        }
+        found
+    } else {
+        let mut found = match &catalog.tertiary_directory {
+            Some(tertiary) => probe(tertiary)?,
+            None => None,
+        };
+        if found.is_some() {
+            served_tier = 1;
+        }
+        if found.is_none() {
+            found = match &catalog.secondary_directory {
+                Some(secondary) => probe(secondary)?,
+                None => None,
+            };
+            if found.is_some() {
+                served_tier = 2;
+            }
+        }
+        if found.is_none() {
+            found = probe(&catalog.directory)?;
+            if found.is_some() {
+                served_tier = 3;
+            }
+        }
+        found
+    };
+    if let Some(descriptor) = descriptor {
+        split_fd_tier_set(descriptor, served_tier);
+    }
+    EXPERT_OPEN_NS.fetch_add(
+        open_started.elapsed().as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+    EXPERT_OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
+    match descriptor {
+        Some(descriptor) => finish_catalog_open(catalog, source, descriptor).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Per-tile tier balancing (K3_TIER_BALANCE=1).
+///
+/// 65.6% of the corpus has TWO homes, but `resolve_expert_path` probes a fixed
+/// order (dir_c -> hot -> dir_b -> primary) and takes the first hit, so the same
+/// copy is chosen every time. A layer's routed experts are then a multinomial
+/// load over the devices and the barrier waits on the busiest: measured
+/// max/mean 1.55x, i.e. the busiest device carries 55% more than fair share on
+/// every barrier.
+///
+/// Reordering the probe by current in-tile load turns those duplicate homes
+/// into a choice. Simulated on real router traces: barrier 13.78ms -> 12.45ms
+/// (-9.6%). Note a STATIC reshuffle is much worse than the fixed chain (-30.6%)
+/// -- the existing order is a well-balanced static assignment, and only
+/// per-barrier dynamics beat it. Hence the epoch reset rather than a global
+/// counter, which would converge back to the static split.
+///
+/// Correctness is unaffected: the probe still falls through every tier, so a
+/// different order finds the same file. Only WHICH copy is read changes, and
+/// the copies are byte-identical corpus content.
+const TIER_COUNT: usize = 3;
+static TIER_LOAD: [AtomicU32; TIER_COUNT] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+fn tier_balance_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("K3_TIER_BALANCE").is_ok_and(|value| value == "1"))
+}
+
+/// Measured four-way concurrent bandwidth, GB/s, in probe order
+/// (tertiary=K3C, secondary=K3B, primary=K3A). Override as
+/// K3_TIER_BW="7.01,5.63,5.93" after re-benchmarking or a re-plug.
+fn tier_bandwidth() -> [f32; TIER_COUNT] {
+    static BW: std::sync::OnceLock<[f32; TIER_COUNT]> = std::sync::OnceLock::new();
+    *BW.get_or_init(|| {
+        let mut bw = [7.01_f32, 5.63, 5.93];
+        if let Ok(raw) = std::env::var("K3_TIER_BW") {
+            for (slot, field) in bw.iter_mut().zip(raw.split(',')) {
+                if let Ok(value) = field.trim().parse::<f32>() {
+                    if value > 0.0 {
+                        *slot = value;
+                    }
+                }
+            }
+        }
+        bw
+    })
+}
+
+/// Start a new balancing epoch. Called once per submitted union so the counts
+/// describe THIS tile's load rather than the whole run.
+pub(crate) fn tier_balance_new_epoch() {
+    if !tier_balance_enabled() {
+        return;
+    }
+    for slot in &TIER_LOAD {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Probe order for this read: tiers sorted by projected completion time
+/// (assigned reads / bandwidth), lightest first. Ties keep the canonical order.
+fn tier_probe_order() -> [usize; TIER_COUNT] {
+    let bw = tier_bandwidth();
+    let mut order = [0_usize, 1, 2];
+    order.sort_by(|&a, &b| {
+        let cost = |i: usize| TIER_LOAD[i].load(Ordering::Relaxed) as f32 / bw[i];
+        cost(a)
+            .partial_cmp(&cost(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    order
 }
 
 fn catalog_io_error(

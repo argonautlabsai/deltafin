@@ -1,3 +1,9 @@
+# ARGODRIVE Deltafin
+
+A fork of gavamedia/deltafin (MIT) running Kimi K3 from SSDs on Apple Silicon, with the ARGODRIVE storage work. The benchmark package, placement manifests and results are in [`k3-public-bench/`](k3-public-bench/); the measurement instruments are published separately as [ARGODRIVE](https://github.com/argonautlabsai/argodrive). Credits and what this fork changes: [`CREDITS.md`](CREDITS.md). The upstream README follows.
+
+---
+
 <div align="center">
 
 ```

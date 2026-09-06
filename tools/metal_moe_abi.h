@@ -67,4 +67,24 @@ int k3_metal_moe_positions_desc_v1(
 }
 #endif
 
+#ifdef __OBJC__
+#import <Metal/Metal.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+/* Loop-queue CB_tail entry (K3-SIDEQUEUE-PLAN.md Step 5): encodes the T=1
+ * raw-v1 expert stack onto a caller command buffer, binding the caller's
+ * x/out buffers directly.  Same-device required (-6 otherwise); the caller
+ * must host-wait its CB before releasing the expert byte lease. */
+int k3_metal_moe_encode_t1_raw_v1(id<MTLCommandBuffer> cb,
+                                  id<MTLDevice> device,
+                                  const uint8_t* const* expert_blobs,
+                                  int n_experts, const float* weights,
+                                  id<MTLBuffer> x_buf, NSUInteger x_off,
+                                  id<MTLBuffer> out_buf, NSUInteger out_off);
+#ifdef __cplusplus
+}
+#endif
+#endif
+
 #endif

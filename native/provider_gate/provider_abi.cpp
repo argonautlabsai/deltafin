@@ -3,6 +3,13 @@
 #include "provider_device.h"
 #include "provider_spine_bf16_cuda.h"
 
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_MLA_ATTN_METAL_V1)
+#include "provider_mla_attn_metal.h"
+#endif
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+#include "provider_loop.h"
+#endif
+
 #include <ATen/ATen.h>
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/add.h>
@@ -220,6 +227,163 @@ CheckResult check_packed_int8(const at::Device& device,
   }
 }
 
+/*
+ * MPS-only advisory canary for the fused MLA decode attention kernel: a
+ * deterministic offset/NaN-poison shape compared against an fp64 host
+ * reference within the kernel's published tolerances.  It reports alongside
+ * the core checks but never gates required_passed — production use of the
+ * kernel remains an explicit env opt-in qualified again in-process.
+ */
+CheckResult check_mla_attn_metal(const at::Device& device) {
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_MLA_ATTN_METAL_V1)
+  try {
+    if (!device.is_mps()) {
+      return {false, "requires the MPS provider"};
+    }
+    const auto capabilities =
+        deltafin::provider_internal::mla_attn_metal_capabilities_v1();
+    if (capabilities.abi_version !=
+            deltafin::provider_internal::kMlaAttnMetalAbiV1 ||
+        capabilities.flags !=
+            deltafin::provider_internal::
+                kMlaAttnMetalRequiredCapabilitiesV1) {
+      return {false, "MLA attention Metal capabilities changed"};
+    }
+    const auto report =
+        deltafin::provider_internal::mla_attn_metal_canary_v1();
+    const bool passed =
+        deltafin::provider_internal::mla_attn_metal_canary_passes(report);
+    std::ostringstream detail;
+    detail << "S=" << report.kv_length << " cap=" << report.capacity
+           << " P=" << report.partitions << " close="
+           << report.close_elements << '/' << report.compared_elements
+           << " nonfinite=" << report.nonfinite << " max_abs="
+           << report.max_absolute_error << " rel_l2="
+           << report.relative_l2_error;
+    return {passed, detail.str()};
+  } catch (const std::exception& error) {
+    return {false, error.what()};
+  }
+#else
+  (void)device;
+  return {false, "not compiled into this provider"};
+#endif
+}
+
+/*
+ * MPS-only advisory canary of the bespoke decode-loop scaffold (worklist
+ * step 2): the loop-owned serial MTLCommandQueue, MTLSharedEvent pool, the
+ * two 192-byte route/pilot mailboxes, and the device weights-table cache
+ * round-trip byte-exact data through two command buffers on their own
+ * queue, byte-exact against a host reference. It reports alongside the
+ * core checks but never gates required_passed -- the scaffold has no
+ * decode-path hook yet, and production use of the eventual bespoke loop
+ * remains a separate explicit env opt-in (K3_BESPOKE_LOOP=1) qualified
+ * again in-process.
+ */
+/*
+ * MPS-only advisory canary of the router side-queue chain (side-queue plan
+ * Step 1): the ported int8 GEMV + fused top-16 select run on the loop-owned
+ * queue against controlled-logit cases (pair-exact, bitwise weights, pinned
+ * tie outcomes) and one full-chain case at the production 896x7168 shape
+ * (GEMV held to the validated 1e-6 relL2 fp64 bound).  Advisory like the
+ * scaffold canary: no decode-path hook consumes it yet.
+ */
+CheckResult check_loop_router(const at::Device& device) {
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  try {
+    if (!device.is_mps()) {
+      return {false, "requires the MPS provider"};
+    }
+    const auto report =
+        deltafin::provider_internal::loop_router_canary_v1();
+    const bool passed =
+        deltafin::provider_internal::loop_router_canary_passes(report);
+    std::ostringstream detail;
+    detail << "cases=" << report.cases_pair_exact << '/' << report.cases_run
+           << " gemv_rows=" << report.gemv_rows_compared
+           << " gemv_rel_l2=" << report.gemv_relative_l2_error
+           << " max_weight_abs=" << report.max_weight_absolute_error
+           << " cbs=" << report.command_buffers;
+    return {passed, detail.str()};
+  } catch (const std::exception& error) {
+    return {false, error.what()};
+  }
+#else
+  (void)device;
+  return {false, "not compiled into this provider"};
+#endif
+}
+
+/*
+ * MPS-only advisory canary of the fused KDA decode core on the loop queue
+ * (loop plan Step 3a first gate): the ported kda_core kernel vs an fp64
+ * host reference over random / zero-state / saturated-decay cases, all
+ * three outputs (out, S_out, convout) at the validated 5e-6 relL2 bound.
+ */
+CheckResult check_loop_kda(const at::Device& device) {
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  try {
+    if (!device.is_mps()) {
+      return {false, "requires the MPS provider"};
+    }
+    const auto report = deltafin::provider_internal::loop_kda_canary_v1();
+    const bool passed =
+        deltafin::provider_internal::loop_kda_canary_passes(report);
+    std::ostringstream detail;
+    detail << "cases=" << report.cases_passed << '/' << report.cases_run
+           << " out_rel_l2=" << report.max_out_relative_l2
+           << " state_rel_l2=" << report.max_state_relative_l2
+           << " conv_rel_l2=" << report.max_conv_relative_l2;
+    return {passed, detail.str()};
+  } catch (const std::exception& error) {
+    return {false, error.what()};
+  }
+#else
+  (void)device;
+  return {false, "not compiled into this provider"};
+#endif
+}
+
+CheckResult check_bespoke_loop(const at::Device& device) {
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  try {
+    if (!device.is_mps()) {
+      return {false, "requires the MPS provider"};
+    }
+    const auto capabilities =
+        deltafin::provider_internal::loop_metal_capabilities_v1();
+    if (capabilities.abi_version !=
+            deltafin::provider_internal::kLoopMetalAbiV1 ||
+        capabilities.flags !=
+            deltafin::provider_internal::kLoopMetalRequiredCapabilitiesV1 ||
+        capabilities.event_pool_size !=
+            deltafin::provider_internal::kLoopMetalSharedEventPoolSizeV1) {
+      return {false, "bespoke-loop Metal capabilities changed"};
+    }
+    const auto report =
+        deltafin::provider_internal::loop_metal_canary_v1();
+    const bool passed =
+        deltafin::provider_internal::loop_metal_canary_passes(report);
+    std::ostringstream detail;
+    detail << "route=" << report.route_ids_matched << '/' << report.top_k
+           << " pilot=" << report.pilot_ids_matched << '/' << report.top_k
+           << " table_hits=" << report.weights_table_hits
+           << " table_invalidations=" << report.weights_table_invalidations
+           << " max_abs=" << report.max_absolute_error
+           << " rel_l2=" << report.relative_l2_error
+           << " mla_heads=" << report.mla_heads_checked
+           << " mla_rel_l2=" << report.mla_attention_relative_l2;
+    return {passed, detail.str()};
+  } catch (const std::exception& error) {
+    return {false, error.what()};
+  }
+#else
+  (void)device;
+  return {false, "not compiled into this provider"};
+#endif
+}
+
 void append_detail(std::ostringstream& details, const char* name,
                    const CheckResult& result) {
   if (details.tellp() > 0) {
@@ -309,6 +473,20 @@ extern "C" int32_t deltafin_provider_canary_v1(
     const CheckResult softmax = check_softmax(selected.device);
     const CheckResult packed = check_packed_int8(
         selected.device, report->packed_rows, report->packed_columns);
+    const bool attempt_mla_attn = selected.device.is_mps();
+    const CheckResult mla_attn = attempt_mla_attn
+        ? check_mla_attn_metal(selected.device)
+        : CheckResult{false, "requires the MPS provider"};
+    const bool attempt_bespoke_loop = selected.device.is_mps();
+    const CheckResult bespoke_loop = attempt_bespoke_loop
+        ? check_bespoke_loop(selected.device)
+        : CheckResult{false, "requires the MPS provider"};
+    const CheckResult loop_router = attempt_bespoke_loop
+        ? check_loop_router(selected.device)
+        : CheckResult{false, "requires the MPS provider"};
+    const CheckResult loop_kda = attempt_bespoke_loop
+        ? check_loop_kda(selected.device)
+        : CheckResult{false, "requires the MPS provider"};
 
     report->attempted_checks =
         DELTAFIN_PROVIDER_CHECK_RMS_FP32_V1 |
@@ -326,6 +504,32 @@ extern "C" int32_t deltafin_provider_canary_v1(
     }
     if (packed.passed) {
       report->passed_checks |= DELTAFIN_PROVIDER_CHECK_PACKED_INT8_FP32_V1;
+    }
+    if (attempt_mla_attn) {
+      report->attempted_checks |=
+          DELTAFIN_PROVIDER_CHECK_MLA_ATTN_METAL_FP32_V1;
+      if (mla_attn.passed) {
+        report->passed_checks |=
+            DELTAFIN_PROVIDER_CHECK_MLA_ATTN_METAL_FP32_V1;
+      }
+    }
+    if (attempt_bespoke_loop) {
+      report->attempted_checks |=
+          DELTAFIN_PROVIDER_CHECK_BESPOKE_LOOP_METAL_V1;
+      if (bespoke_loop.passed) {
+        report->passed_checks |=
+            DELTAFIN_PROVIDER_CHECK_BESPOKE_LOOP_METAL_V1;
+      }
+      report->attempted_checks |=
+          DELTAFIN_PROVIDER_CHECK_LOOP_ROUTER_METAL_V1;
+      if (loop_router.passed) {
+        report->passed_checks |=
+            DELTAFIN_PROVIDER_CHECK_LOOP_ROUTER_METAL_V1;
+      }
+      report->attempted_checks |= DELTAFIN_PROVIDER_CHECK_LOOP_KDA_METAL_V1;
+      if (loop_kda.passed) {
+        report->passed_checks |= DELTAFIN_PROVIDER_CHECK_LOOP_KDA_METAL_V1;
+      }
     }
 
     const std::uint32_t core_checks =
@@ -345,6 +549,14 @@ extern "C" int32_t deltafin_provider_canary_v1(
     append_detail(details, "matmul_fp32", matmul);
     append_detail(details, "softmax_fp32", softmax);
     append_detail(details, "packed_int8_fp32", packed);
+    if (attempt_mla_attn) {
+      append_detail(details, "mla_attn_metal_fp32", mla_attn);
+    }
+    if (attempt_bespoke_loop) {
+      append_detail(details, "bespoke_loop_metal", bespoke_loop);
+      append_detail(details, "loop_router_metal", loop_router);
+      append_detail(details, "loop_kda_metal", loop_kda);
+    }
     copy_text(report->detail, sizeof(report->detail), details.str());
     copy_text(error, error_capacity, "");
     return 0;

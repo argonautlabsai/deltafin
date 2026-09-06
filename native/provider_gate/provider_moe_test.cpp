@@ -615,12 +615,18 @@ void shared_gate_up_bundle_test() {
   const at::Tensor dense_actual =
       deltafin::provider_internal::complete_moe_t1(
           dense_prepared, routed, dense_bundled);
-  if (!at::equal(dense_actual, dense_expected)) {
-    throw std::runtime_error(
-        "dense adjacent shared gate/up changed fp32 output bits");
-  }
+  // The quantized bundle above stays bit-exact. The dense fallback cannot
+  // promise bit equality: Accelerate selects different sgemm blocking for the
+  // concatenated 128-row arena than for two 64-row calls (observed on macOS
+  // 25.4: 1-4 ulp), so the dense adjacency check holds a tight tolerance
+  // instead. Production keeps shared_gate_up_enabled=false, and only the
+  // quantized branch is a bundling candidate.
+  const double dense_error = require_close(
+      dense_actual, dense_expected, 1.0e-5,
+      "dense adjacent shared gate/up parity");
   std::cout << "provider_moe.shared_gate_up_us=" << baseline_us << "->"
-            << bundled_us << " dispatches=2->1 dense=PASS\n";
+            << bundled_us << " dispatches=2->1 dense_max_abs=" << dense_error
+            << "\n";
 }
 
 #if defined(__APPLE__)
@@ -685,7 +691,12 @@ bool mps_parity_test() {
   const at::Tensor actual = deltafin::provider_internal::complete_moe_t1(
                                 staged, routed, mps_spine, &trace)
                                 .to(at::kCPU);
-  constexpr std::array<MoeExecutionStage, 9> kExpectedOrder{
+  // K3_ROUTE_ASYNC=1 deliberately swaps RoutedDown/RouteMaterialization on
+  // MPS so the route boundary drains only its dependencies; the trace must
+  // verify whichever schedule the environment selected.
+  const bool async_route =
+      deltafin::provider_internal::moe_route_async_enabled();
+  std::array<MoeExecutionStage, 9> kExpectedOrder{
       MoeExecutionStage::Router,
       MoeExecutionStage::RoutedDown,
       MoeExecutionStage::RouteMaterialization,
@@ -696,6 +707,10 @@ bool mps_parity_test() {
       MoeExecutionStage::Shared,
       MoeExecutionStage::Merge,
   };
+  if (async_route) {
+    kExpectedOrder[1] = MoeExecutionStage::RouteMaterialization;
+    kExpectedOrder[2] = MoeExecutionStage::RoutedDown;
+  }
   if (trace.count != kExpectedOrder.size()) {
     throw std::runtime_error("MPS demand-I/O trace had wrong stage count");
   }

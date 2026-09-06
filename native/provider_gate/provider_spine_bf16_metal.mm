@@ -9,6 +9,7 @@
 #endif
 
 #include "provider_spine_bf16_metal.h"
+#include "provider_loop.h"
 
 #include <ATen/ATen.h>
 #include <ATen/mps/MPSStream.h>
@@ -377,6 +378,7 @@ SpineBf16MetalBuffer retain_spine_bf16_metal_tensor(
   id<MTLBuffer> buffer = tensor_buffer(tensor);
   require(buffer != nil && logical_bytes <= buffer.length,
           "retained BF16 spine tensor exceeds its MTLBuffer");
+  loop_residency_register_tensor(tensor);
   const NSUInteger byte_offset = tensor_byte_offset(
       tensor, logical_bytes, "retained BF16 spine tensor");
   require(byte_offset == 0,
@@ -453,6 +455,8 @@ at::Tensor spine_bf16_metal_gemv(
       tensor_byte_offset(output, output_bytes, "BF16 spine output");
   const GemvDimsV1 dims{rows, columns, 0, 0};
 
+  loop_residency_register_activation(input);
+  loop_residency_register_activation(output);
   at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();

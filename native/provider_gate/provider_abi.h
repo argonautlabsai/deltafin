@@ -38,6 +38,22 @@ enum DeltafinProviderCheckV1 {
   DELTAFIN_PROVIDER_CHECK_MATMUL_FP32_V1 = 1u << 1,
   DELTAFIN_PROVIDER_CHECK_SOFTMAX_FP32_V1 = 1u << 2,
   DELTAFIN_PROVIDER_CHECK_PACKED_INT8_FP32_V1 = 1u << 3,
+  /* MPS-only advisory check of the fused MLA decode attention kernel
+   * (fp64-referenced tolerance canary; never part of required_passed). */
+  DELTAFIN_PROVIDER_CHECK_MLA_ATTN_METAL_FP32_V1 = 1u << 4,
+  /* MPS-only advisory check of the bespoke decode-loop scaffold (worklist
+   * step 2: loop-owned queue/event-pool/mailbox/weights-table plumbing;
+   * never part of required_passed, and independent of the separate
+   * K3_BESPOKE_LOOP env opt-in qualified again in-process). */
+  DELTAFIN_PROVIDER_CHECK_BESPOKE_LOOP_METAL_V1 = 1u << 5,
+  /* MPS-only advisory check of the router side-queue chain (side-queue plan
+   * Step 1: ported int8 GEMV + fused top-16 select, pair-exact against a
+   * bitwise host reference; never part of required_passed). */
+  DELTAFIN_PROVIDER_CHECK_LOOP_ROUTER_METAL_V1 = 1u << 6,
+  /* MPS-only advisory check of the fused KDA decode core on the loop queue
+   * (loop plan Step 3a: ported kda_core vs fp64 reference; never part of
+   * required_passed). */
+  DELTAFIN_PROVIDER_CHECK_LOOP_KDA_METAL_V1 = 1u << 7,
 };
 
 enum DeltafinProviderCanaryFlagV1 {
@@ -77,6 +93,16 @@ enum DeltafinProviderTargetExpertFlagV1 {
    * preserves the original ABI contract and drops every wrapper before return.
    */
   DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1 = 1u << 0,
+  /*
+   * Arrival-driven expert compute. PARTIAL: this call carries a subset of the
+   * tile's experts; route edges whose expert is absent are skipped and the
+   * partial routed output is accumulated in the pending layer instead of
+   * completing rows. FINAL: after accumulating this call's experts, complete
+   * the rows from the accumulated sum (the last group of a tile carries
+   * PARTIAL|FINAL). Neither flag = the stock single-dispatch contract.
+   */
+  DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1 = 1u << 1,
+  DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1 = 1u << 2,
 };
 
 enum DeltafinProviderSpineEncodingV1 {
@@ -1564,6 +1590,17 @@ int32_t deltafin_provider_metal_expert_cache_flush_v1(
     char* error,
     size_t error_capacity);
 
+/**
+ * Drop the cached Metal wrappers for specific expert span pointers
+ * (K3_EXPERT_RETAIN graveyard retirement). blobs/blob_count describe the
+ * span base addresses being freed; unknown pointers are ignored by the
+ * bridge. Requires the MPS provider; resource must be zero.
+ */
+int32_t deltafin_provider_metal_expert_cache_drop_v1(
+    const DeltafinProviderResourceRequestV1* request,
+    const void* const* blobs, uint64_t blob_count, char* error,
+    size_t error_capacity);
+
 int32_t deltafin_provider_metal_expert_cache_stats_v1(
     const DeltafinProviderResourceRequestV1* request,
     DeltafinProviderMetalExpertCacheStatsReportV1* report,
@@ -1808,6 +1845,18 @@ int32_t deltafin_provider_target_sequence_prepare_v1(
 int32_t deltafin_provider_target_sequence_take_prefetch_hint_v1(
     const DeltafinProviderResourceRequestV1* request,
     DeltafinProviderTargetSequencePrefetchHintReportV1* report,
+    char* error,
+    size_t error_capacity);
+
+/**
+ * Prepare / prefetch-hint host-wait decomposition (attention-timer split,
+ * 2026-09-02): copies up to value_count cumulative u64 counters in the
+ * word order documented in provider_prep_timer.h (18 words; extra words
+ * are zeroed). Session-less and always available; nothing is reset.
+ */
+int32_t deltafin_provider_prep_timer_report_v1(
+    uint64_t* values,
+    size_t value_count,
     char* error,
     size_t error_capacity);
 

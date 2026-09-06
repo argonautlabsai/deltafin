@@ -250,6 +250,46 @@ impl QwenGenerator for NativeQwen {
     }
 }
 
+/// K3_QWEN_ROUNDTRIP_SOFT=1: treat the two DATA-DEPENDENT round-trip
+/// invariants in `translate_once` as an ordinary empty proposal instead of a
+/// hard error.
+///
+/// Both guards are correctness guards for the proposal they are checking:
+/// if the assistant's text does not re-tokenise back onto the exact K3
+/// history, the drafted suffix cannot be aligned and must not be used. But
+/// their failure is a property of the CURRENT prefix's tokenisation, not of
+/// the drafter — a single token of extra history usually re-aligns it.
+///
+/// Returning `Err` here reaches `FailSoftQwenDraft::propose_with_outcome`,
+/// which sets `enabled = false` PERMANENTLY. Measured on the 2026-08-30
+/// champion (200-token raw, `The three main financial statements are`): the
+/// drafter dies at history_len=127 — generated token 121 of 200 — with
+/// "assistant text did not preserve the exact K3 token prefix", and the
+/// remaining 79 tokens run undrafted at ~1.97 s/token against ~1.46 s/token
+/// while it was alive. Deterministic across all five champion replicates and
+/// the depth-4 arm, at the same token index.
+///
+/// The third invariant ("Qwen token/confidence rows disagree") is a generator
+/// contract violation, not data-dependent, and stays a hard error.
+fn roundtrip_soft_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("K3_QWEN_ROUNDTRIP_SOFT").is_ok_and(|value| value == "1")
+    })
+}
+
+/// One-shot-per-reason counter so a soft skip is visible without flooding a
+/// 200-token log: a drafter that skips every proposal must not look like a
+/// drafter that is working.
+fn note_roundtrip_skip(reason: &str, history_len: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SKIPS: AtomicU64 = AtomicU64::new(0);
+    let count = SKIPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 3 || count % 25 == 0 {
+        eprintln!("[qwen-roundtrip-skip] n={count} history_len={history_len}: {reason}");
+    }
+}
+
 pub struct QwenDraftController<G, T, A> {
     generator: G,
     target: Arc<T>,
@@ -278,6 +318,10 @@ where
     ) -> Result<(Box<[u32]>, Box<[u32]>, bool, bool, Option<f32>)> {
         let canonical = self.target.decode_target(target_history)?;
         if self.target.encode_target_allow_special(&canonical)? != target_history {
+            if roundtrip_soft_enabled() {
+                note_roundtrip_skip("K3 history round trip", target_history.len());
+                return Ok((Box::new([]), Box::new([]), false, false, None));
+            }
             return Err(DeltafinError::new(
                 "K3 history does not survive the canonical raw-completion round trip",
             ));
@@ -317,6 +361,10 @@ where
             raw_translated.clone()
         };
         if !raw_translated.starts_with(target_history) || !translated.starts_with(target_history) {
+            if roundtrip_soft_enabled() {
+                note_roundtrip_skip("assistant prefix preservation", target_history.len());
+                return Ok((Box::new([]), Box::new([]), false, false, None));
+            }
             return Err(DeltafinError::new(
                 "assistant text did not preserve the exact K3 token prefix",
             ));
@@ -424,6 +472,16 @@ where
             Ok(proposal) => Ok(proposal),
             Err(error) => {
                 self.enabled = false;
+                // This latch is permanent and silent: `last_error` is recorded
+                // but no caller has ever printed it, so a drafter that dies
+                // mid-run is indistinguishable in the logs from one that simply
+                // has nothing to propose. On the 2026-08-30 champion it fires
+                // at token 121 of 200 and costs 13.8% of the run.
+                eprintln!(
+                    "[qwen-failsoft] drafter DISABLED permanently at history_len={} maximum={}: {error}",
+                    target_history.len(),
+                    maximum,
+                );
                 self.last_error = Some(error.to_string());
                 Ok(QwenDraftProposal::empty())
             }

@@ -3,9 +3,13 @@
 #include <ATen/ops/cat.h>
 #include <ATen/ops/linear.h>
 #include <ATen/ops/matmul.h>
+#include <ATen/ops/topk.h>
 #include <c10/core/InferenceMode.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -15,6 +19,39 @@
 
 namespace deltafin::provider_internal {
 namespace {
+
+// K3_DSPARK_DEBUG=1: diagnostic-only dump of the draft model's own top-5
+// ids+logits per proposed row, to stderr. Off by default; checked once and
+// cached (env is immutable for the process lifetime). See DIRECTIVE STEP 2
+// (DSpark day) in K3-ENGINE-STATUS.md.
+bool dspark_debug_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("K3_DSPARK_DEBUG");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+// Prints "tag row=<r> pos=<p> top5=[id:logit, ...]" for a 1-D logits row.
+// CPU-materializes only the requested top-k slice, never the full tensor.
+void debug_print_topk(const char* tag, const std::int64_t row,
+                      const std::int64_t position, const at::Tensor& logits_row) {
+  const std::int64_t k = std::min<std::int64_t>(5, logits_row.size(0));
+  const auto topk = at::topk(logits_row.to(at::kFloat), k, -1, true, true);
+  const at::Tensor values = std::get<0>(topk).to(at::kCPU).contiguous();
+  const at::Tensor indices = std::get<1>(topk).to(at::kCPU).contiguous();
+  const float* value_ptr = values.const_data_ptr<float>();
+  const std::int64_t* index_ptr = indices.const_data_ptr<std::int64_t>();
+  std::cerr << "K3_DSPARK_DEBUG " << tag << " row=" << row << " pos=" << position
+            << " top5=[";
+  for (std::int64_t i = 0; i < k; ++i) {
+    if (i != 0) {
+      std::cerr << ",";
+    }
+    std::cerr << index_ptr[i] << ":" << value_ptr[i];
+  }
+  std::cerr << "]\n";
+}
 
 void require_bf16(const at::Tensor& tensor, const at::Device& device,
                   const at::IntArrayRef shape, const char* name) {
@@ -420,7 +457,12 @@ void DSparkModel::append_target_context(
         slice
             .narrow(-1, shape_.kv_lora_rank, shape_.qk_rope_head_dim)
             .contiguous(),
-        positions, shape_);
+        positions, shape_,
+        // Context appends carry the full committed prefix — a chat prefill
+        // is arbitrarily many rows; positions were already range-checked
+        // against the cache above. The trained 7-row ceiling applies only
+        // to draft query/backbone forwards, not to appended context.
+        shape_.max_position);
   }
   cache_.append(projected);
 }
@@ -542,13 +584,29 @@ DSparkProposalScores DSparkModel::propose_from_embeddings(
   std::vector<at::Tensor> previous_embeddings;
   proposed.reserve(static_cast<std::size_t>(score_rows));
   previous_embeddings.reserve(static_cast<std::size_t>(score_rows));
+  const bool debug = dspark_debug_enabled();
+  const std::int64_t anchor_position = cache_.length();
+  if (debug) {
+    std::cerr << "K3_DSPARK_DEBUG draft_anchor anchor_token_id=" << anchor_token_id
+              << " anchor_position=" << anchor_position
+              << " cache_generation=" << cache_.generation() << "\n";
+  }
   for (std::int64_t row = 0; row < score_rows; ++row) {
     const at::Tensor embedding =
         weights_.markov_embedding.index_select(0, previous);
     previous_embeddings.push_back(embedding);
     const at::Tensor bias =
         dense_linear(embedding, weights_.markov_output).squeeze(0);
-    previous = at::argmax(logits[row] + bias.to(at::kFloat)).reshape({1});
+    const at::Tensor combined = logits[row] + bias.to(at::kFloat);
+    if (debug) {
+      // "raw" = the parallel multi-token head alone; "combined" = raw plus
+      // the sequential Markov correction that actually decides the token
+      // (hypothesis-adjacent: if raw and combined top-1 disagree often, the
+      // Markov correction is dominating/destabilizing the head's own signal).
+      debug_print_topk("draft_raw", row, anchor_position + row, logits[row]);
+      debug_print_topk("draft_combined", row, anchor_position + row, combined);
+    }
+    previous = at::argmax(combined).reshape({1});
     proposed.push_back(previous);
   }
   const at::Tensor token_ids = at::cat(proposed, 0).contiguous();

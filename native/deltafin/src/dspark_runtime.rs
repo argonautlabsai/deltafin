@@ -278,6 +278,11 @@ pub struct RuntimeConfig {
     pub max_drafts: u8,
     pub max_context_tokens: Option<usize>,
     pub min_auto_speedup: f64,
+    /// Consecutive zero-acceptance verify blocks tolerated before the
+    /// acceptance-economics disable. 1 preserves the historical
+    /// disable-on-first-miss behavior; higher values mirror the timing
+    /// economics' own streak tolerance (`economic_loss_streak >= 2`).
+    pub miss_tolerance: u8,
 }
 
 impl Default for RuntimeConfig {
@@ -288,6 +293,7 @@ impl Default for RuntimeConfig {
             max_drafts: MAX_DRAFTS,
             max_context_tokens: Some(8_192),
             min_auto_speedup: 0.03,
+            miss_tolerance: 1,
         }
     }
 }
@@ -310,6 +316,11 @@ impl RuntimeConfig {
         if self.max_context_tokens == Some(0) {
             return Err(RuntimeError::configuration(
                 "DSpark max context must be positive",
+            ));
+        }
+        if self.miss_tolerance == 0 {
+            return Err(RuntimeError::configuration(
+                "DSpark miss tolerance must be positive",
             ));
         }
         if !self.min_auto_speedup.is_finite() || !(0.0..1.0).contains(&self.min_auto_speedup) {
@@ -552,6 +563,18 @@ struct ProposalTransaction<S: Clone> {
     base: StateSnapshot<S>,
 }
 
+/// K3_DSPARK_MIN_TRAILING_ACCEPT=<percent 1..=99>: trailing-acceptance
+/// drafting cutoff. Unset or unparsable disables the gate.
+fn trailing_accept_threshold_percent() -> Option<u8> {
+    static THRESHOLD: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("K3_DSPARK_MIN_TRAILING_ACCEPT")
+            .ok()
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|percent| (1..=99).contains(percent))
+    })
+}
+
 struct ActiveRequest<S: Clone> {
     lease: DraftLease,
     origin: Option<StateSnapshot<S>>,
@@ -569,6 +592,7 @@ struct ActiveRequest<S: Clone> {
     last_verifier_seconds: Option<f64>,
     economic_credit_seconds: f64,
     economic_loss_streak: u8,
+    acceptance_miss_streak: u8,
     last_resolved: Option<(u64, usize, usize)>,
 }
 
@@ -581,6 +605,14 @@ struct StagedBoundary<S: Clone> {
 pub struct DSparkRuntime<B: DraftBackend> {
     mode: Mode,
     config: RuntimeConfig,
+    /// Trailing acceptance economics (K3_DSPARK_MIN_TRAILING_ACCEPT):
+    /// exponential-decay counters over recent RESOLVED proposals. Runtime-
+    /// level on purpose — the miss-streak disable/re-qualify cycle
+    /// recreates the active request constantly in the deep-context collapse
+    /// regime, and per-active counters reset before ever reaching the
+    /// window (measured: gate never fired across a 500-token run).
+    trailing_drafted: u32,
+    trailing_accepted: u32,
     backend: Option<B>,
     next_id: u64,
     generation: u64,
@@ -592,9 +624,17 @@ pub struct DSparkRuntime<B: DraftBackend> {
 
 impl<B: DraftBackend> DSparkRuntime<B> {
     pub fn new(mode: Mode, backend: Option<B>, config: RuntimeConfig) -> Result<Self> {
+        // Null-hunt trace: a fresh runtime zeroes the trailing-acceptance
+        // window — if this line repeats mid-generation, counter reset by
+        // recreation is the gate's failure mode.
+        if trailing_accept_threshold_percent().is_some() {
+            eprintln!("[trailing-accept] runtime constructed (window reset)");
+        }
         Ok(Self {
             mode,
             config: config.validate()?,
+            trailing_drafted: 0,
+            trailing_accepted: 0,
             backend,
             next_id: 1,
             generation: 0,
@@ -751,14 +791,24 @@ impl<B: DraftBackend> DSparkRuntime<B> {
         let Some(active) = self.active.as_mut() else {
             return;
         };
+        let reason = reason.into();
         if active.proposals_enabled {
             self.metrics.runtime_disables += 1;
+            // K3_DSPARK_DEBUG=1: diagnostic-only — surface the first disable
+            // reason and the ledger position where DSpark died for the rest
+            // of the request (DSpark-day instrumentation, uncommitted).
+            if std::env::var_os("K3_DSPARK_DEBUG").is_some_and(|v| v == "1") {
+                eprintln!(
+                    "K3_DSPARK_DEBUG disable_active ledger_len={} reason={reason}",
+                    active.ledger.len()
+                );
+            }
         }
         active.proposals_enabled = false;
         if let Some(aligned) = state_aligned {
             active.state_aligned = aligned;
         }
-        active.reason = Some(reason.into());
+        active.reason = Some(reason);
         active.disable_category = category;
     }
 
@@ -919,6 +969,7 @@ impl<B: DraftBackend> DSparkRuntime<B> {
             last_verifier_seconds: None,
             economic_credit_seconds: 0.0,
             economic_loss_streak: 0,
+            acceptance_miss_streak: 0,
             last_resolved: None,
         });
         if enabled {
@@ -1459,6 +1510,57 @@ impl<B: DraftBackend> DSparkRuntime<B> {
         self.metrics.accepted_drafts += accepted_drafts as u64;
         self.metrics.emitted_tokens += emitted.len() as u64;
         self.metrics.verifier_seconds += verifier_seconds;
+        // K3_DSPARK_MIN_TRAILING_ACCEPT=<percent> (default off): disable
+        // drafting when trailing acceptance over an exponential-decay
+        // window of at least 32 drafted tokens falls below the threshold.
+        // Output-invariant by the exact-verification contract; purely a
+        // drafting-economics policy.
+        if let Some(threshold) = trailing_accept_threshold_percent() {
+            self.trailing_drafted = self
+                .trailing_drafted
+                .saturating_add(proposal.token_ids.len() as u32);
+            self.trailing_accepted = self
+                .trailing_accepted
+                .saturating_add(accepted_drafts as u32);
+            let disable_now = self.trailing_drafted >= 32
+                && u64::from(self.trailing_accepted) * 100
+                    < u64::from(self.trailing_drafted) * u64::from(threshold);
+            // Null-hunt trace (2026-08-23, active only when the gate env is
+            // set): the gate measured bit-identical-to-off twice across
+            // 500-token runs despite this block provably executing — print
+            // every resolution so the counter trajectory itself names the
+            // failure (reset-by-recreation vs boundary clustering vs
+            // accounting semantics).
+            eprintln!(
+                "[trailing-accept] proposal={} drafted+{} accepted+{} window={}/{} ({:.1}%) threshold={} fire={}",
+                proposal.proposal_id,
+                proposal.token_ids.len(),
+                accepted_drafts,
+                self.trailing_accepted,
+                self.trailing_drafted,
+                if self.trailing_drafted > 0 {
+                    100.0 * f64::from(self.trailing_accepted)
+                        / f64::from(self.trailing_drafted)
+                } else {
+                    0.0
+                },
+                threshold,
+                disable_now
+            );
+            if self.trailing_drafted >= 32 && !disable_now {
+                self.trailing_drafted /= 2;
+                self.trailing_accepted /= 2;
+            }
+            if disable_now {
+                let retain = self.active_for(lease)?.retain_state_after_disable;
+                self.disable_active(
+                    "DSpark trailing acceptance below threshold",
+                    Some(retain),
+                    Some(DisableCategory::AcceptanceEconomics),
+                );
+                return self.decision(lease);
+            }
+        }
         {
             let active = self.active_for_mut(lease)?;
             active.last_verifier_seconds = Some(verifier_seconds);
@@ -1479,21 +1581,37 @@ impl<B: DraftBackend> DSparkRuntime<B> {
             } else {
                 self.config.probe_drafts
             };
-            self.active_for_mut(lease)?.width = width;
+            let active = self.active_for_mut(lease)?;
+            active.width = width;
+            active.acceptance_miss_streak = 0;
         } else if accepted_drafts == 0 {
             self.metrics.misses += 1;
-            let retain = self.active_for(lease)?.retain_state_after_disable;
-            self.disable_active(
-                "DSpark target-verification miss",
-                Some(retain),
-                Some(DisableCategory::AcceptanceEconomics),
-            );
+            let streak = {
+                let active = self.active_for_mut(lease)?;
+                active.acceptance_miss_streak = active.acceptance_miss_streak.saturating_add(1);
+                active.acceptance_miss_streak
+            };
+            if streak >= self.config.miss_tolerance {
+                let retain = self.active_for(lease)?.retain_state_after_disable;
+                self.disable_active(
+                    "DSpark target-verification miss",
+                    Some(retain),
+                    Some(DisableCategory::AcceptanceEconomics),
+                );
+            } else {
+                // Ride out an isolated zero-acceptance block at the cautious
+                // probe width, mirroring the timing economics' streak
+                // tolerance instead of dying on the first miss.
+                self.active_for_mut(lease)?.width = self.config.probe_drafts;
+            }
         } else {
             self.metrics.partial_matches += 1;
             let doubled = accepted_drafts.saturating_mul(2);
             let width = usize::from(self.config.probe_drafts)
                 .max(usize::from(self.config.max_drafts).min(doubled));
-            self.active_for_mut(lease)?.width = width as u8;
+            let active = self.active_for_mut(lease)?;
+            active.width = width as u8;
+            active.acceptance_miss_streak = 0;
         }
         self.decision(lease)
     }

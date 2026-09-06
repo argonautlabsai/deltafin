@@ -149,13 +149,17 @@ void arena_sequence() {
   require_materialized(first_report, first, {0.5F, 1.0F, -1.0F, 2.0F},
                        41, 0, 1);
 
-  expect_failure(
-      [&] {
-        static_cast<void>(
-            deltafin::provider_internal::spine_fp32_execution_debug(
-                session.session, 0, 1, 41, 13));
-      },
-      "same-layer arena overwrite");
+  // Step 6 contract: a same-owner same-layer same-generation re-request is
+  // an idempotent hit publishing the SAME views (pre-commit orchestration
+  // materializes one layer early; the ordinary prepare then asks again).
+  // The window must not advance and the storage must not be re-encoded.
+  const auto repeat_report =
+      deltafin::provider_internal::spine_fp32_execution_debug(
+          session.session, 0, 1, 41, 13);
+  require_materialized(repeat_report, first, {0.5F, 1.0F, -1.0F, 2.0F},
+                       41, 0, 1);
+  require(repeat_report.storage_identity == first_report.storage_identity,
+          "same-layer idempotent hit did not reuse the arena storage");
 
   const BoundLayer second = make_layer(
       3, {UINT16_C(0x3c00), UINT16_C(0x3c00),

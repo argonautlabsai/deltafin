@@ -71,6 +71,14 @@ struct TargetLayerBinding {
   const KdaWeights *kda_weights = nullptr;
   const MlaWeights *mla_weights = nullptr;
   const MlaInputBundle *mla_input_bundle = nullptr;
+  /* Stable spine-form MLA weights for K3_MLA_LOOP=parity only: when the
+   * fp32 execution arena is active, mla_weights are per-layer arena VIEWS
+   * (DenseF32, recycled every layer) and mla_input_bundle is nulled — the
+   * loop parity must bind the resident row-int8 forms instead (the KDA
+   * takeover's "bind resident int8, not the arena" lesson). Null unless
+   * parity mode is on and the spine carries the qualified int8 bundle. */
+  const MlaWeights *mla_parity_weights = nullptr;
+  const MlaInputBundle *mla_parity_bundle = nullptr;
   const TargetDenseWeights *dense = nullptr;
   const MoeSpineT1 *moe = nullptr;
 };

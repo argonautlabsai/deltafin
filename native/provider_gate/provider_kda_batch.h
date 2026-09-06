@@ -6,6 +6,8 @@
 #include <ATen/ATen.h>
 
 #include <cstdint>
+#include <optional>
+#include <vector>
 
 namespace deltafin::provider_internal {
 
@@ -61,6 +63,23 @@ struct KdaBatchOutputProjection {
   std::uint32_t provider_dispatches = 0;
   std::uint32_t equivalent_rowwise_dispatches = 0;
 };
+
+/* K3_KDA_WIDE_FUSED=1: the batched short conv + per-position recurrence +
+ * output norm/gate/projection as one fused Metal kernel on the ATen stream
+ * (Apple, exact K3, 2..16 positions). Returns nullopt when ineligible so the
+ * caller runs the stock batched path. Boundary states mirror the stock path:
+ * per-position conv-window views of the source plus the recurrent state. */
+struct KdaWideFusedResult {
+  at::Tensor output;
+  KdaState final_state;
+  std::vector<KdaState> boundaries;
+  std::uint32_t provider_dispatches = 0;
+};
+std::optional<KdaWideFusedResult> kda_wide_fused_positions(
+    const at::Tensor& normalized_hidden, const KdaWeights& weights,
+    const KdaState& state, const KdaBatchInputProjections& batch,
+    const KdaBatchDependentProjections& dependent, bool retain_boundaries,
+    bool exact_k3);
 
 /*
  * Live-order post-recurrence stage: one T-wide full-rank output-gate

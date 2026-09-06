@@ -447,6 +447,7 @@ pub enum Command {
     WarmExpertCache(WarmExpertCacheArgs),
     ConvertSpineInt8(ConvertSpineInt8Args),
     ConvertExpertsScale4(ConvertExpertsScale4Args),
+    Scale4ManifestFromSidecars(ConvertExpertsScale4Args),
     Doctor(DoctorArgs),
     Upgrade,
     Help,
@@ -536,6 +537,13 @@ where
         values.remove(0);
         return parse_convert_experts_scale4(&values).map(Command::ConvertExpertsScale4);
     }
+    if values
+        .first()
+        .is_some_and(|value| value == "scale4-manifest-from-sidecars")
+    {
+        values.remove(0);
+        return parse_convert_experts_scale4(&values).map(Command::Scale4ManifestFromSidecars);
+    }
 
     if values.len() == 1 && matches!(values[0].as_str(), "-h" | "--help") {
         return Ok(Command::Help);
@@ -614,6 +622,7 @@ fn is_subcommand(value: &str) -> bool {
             | "warm-expert-cache"
             | "convert-spine-int8"
             | "convert-experts-scale4"
+            | "scale4-manifest-from-sidecars"
             | "pack-spine"
     )
 }

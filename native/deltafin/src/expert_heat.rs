@@ -445,6 +445,13 @@ const fn open_nofollow_cloexec() -> i32 {
 pub(crate) struct PageAlignedSpan {
     ptr: NonNull<u8>,
     layout: Layout,
+    /// False for a VIEW into a larger allocation someone else owns. Views exist
+    /// so a single registered arena can be handed to the execution path as many
+    /// per-expert spans: Metal keys its no-copy wrap cache by raw pointer AND
+    /// issues one `useResource` per distinct buffer per dispatch, so N
+    /// individually-allocated spans cost N wraps and N residency calls, while N
+    /// views into one registered arena cost one of each.
+    owned: bool,
 }
 
 impl PageAlignedSpan {
@@ -458,7 +465,64 @@ impl PageAlignedSpan {
         // SAFETY: the fresh allocation is `bytes.len()` writable bytes and
         // cannot overlap the borrowed source.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len()) };
-        Some(Arc::new(Self { ptr, layout }))
+        Some(Arc::new(Self { ptr, layout, owned: true }))
+    }
+
+    /// Allocate a span WITHOUT initialising it, for reuse as a recycled cache
+    /// buffer. Callers must `fill_from` before dereferencing.
+    ///
+    /// Exists because allocating per admission is a real cost at expert scale:
+    /// a fresh 17.5 MB mapping must be faulted in page by page during the
+    /// memcpy that follows, and freed on eviction. A RAM cache doing ~45k
+    /// admissions in a 40-token run pays that ~45k times. Recycling buffers
+    /// writes into already-mapped memory instead.
+    pub(crate) fn alloc_uninit(len: usize) -> Option<Arc<Self>> {
+        let layout = Layout::from_size_align(len, BUFFER_ALIGNMENT).ok()?;
+        if layout.size() == 0 {
+            return None;
+        }
+        // SAFETY: the layout has a non-zero size.
+        let ptr = NonNull::new(unsafe { std::alloc::alloc(layout) })?;
+        // Initialise once so Deref is never reading uninitialised memory even
+        // if a caller skips fill_from.
+        // SAFETY: `layout.size()` writable bytes were just allocated.
+        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, layout.size()) };
+        Some(Arc::new(Self { ptr, layout, owned: true }))
+    }
+
+    /// Overwrite this span's bytes. Returns false on a length mismatch.
+    ///
+    /// # Safety
+    /// The caller must hold the ONLY reference to this allocation — in
+    /// practice `Arc::strong_count == 1`, checked before recycling — so no
+    /// reader can observe the buffer mid-write.
+    pub(crate) unsafe fn fill_from(&self, src: &[u8]) -> bool {
+        if src.len() != self.layout.size() {
+            return false;
+        }
+        // SAFETY: sizes are equal, the allocation is live, and the caller
+        // guarantees exclusive access. Source cannot overlap: it is either
+        // arena-owned read bytes or a distinct allocation.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr(), src.len()) };
+        true
+    }
+}
+
+impl PageAlignedSpan {
+    /// Borrow `len` bytes at `base` as a span this value does NOT own.
+    ///
+    /// # Safety
+    /// `base..base+len` must stay valid and immutable for as long as the
+    /// returned span lives. In practice the caller owns a process-lifetime
+    /// arena and guarantees the slot is not recycled while referenced.
+    pub(crate) unsafe fn view_into(base: *mut u8, len: usize) -> Option<Arc<Self>> {
+        let layout = Layout::from_size_align(len, BUFFER_ALIGNMENT).ok()?;
+        let ptr = NonNull::new(base)?;
+        Some(Arc::new(Self { ptr, layout, owned: false }))
+    }
+
+    pub(crate) fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
     }
 }
 
@@ -474,6 +538,9 @@ impl std::ops::Deref for PageAlignedSpan {
 
 impl Drop for PageAlignedSpan {
     fn drop(&mut self) {
+        if !self.owned {
+            return; // a view borrows; the arena owns
+        }
         // SAFETY: `ptr` was allocated with exactly this layout and is owned.
         unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
     }
@@ -802,16 +869,40 @@ mod tests {
                         heat.observe_layer_routes(2, [&one_route(0)].into_iter());
                         heat.note_pass_committed();
                         // Contention restores deltas, so retry until merged.
+                        //
+                        // Bounded by wall-clock, not iterations: the peer's
+                        // critical section holds the flock across two
+                        // F_FULLFSYNCs (temp-file sync_all + fsync_directory),
+                        // whose latency is device-serialized and effectively
+                        // unbounded under parallel-suite disk load, while one
+                        // retry costs a fixed slice of CPU (the 82k-slot
+                        // harvest sweep). The old `for _ in 0..1_000` +
+                        // yield_now bound was a CPU-denominated budget
+                        // guarding an I/O-denominated wait: measured 53/1000
+                        // iterations consumed solo on an idle machine but
+                        // >1000 under concurrent FULLFSYNC traffic, which is
+                        // exactly the full-suite flake. Sixty seconds without
+                        // a merge means a leaked or deadlocked heat lock, not
+                        // scheduling noise. The 1 ms sleep is backoff only;
+                        // correctness still comes from re-checking pass_delta
+                        // after every flush attempt, so the contention/restore
+                        // path stays exercised and mass conservation is
+                        // verified unchanged below.
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(60);
                         let mut merged = false;
-                        for _ in 0..1_000 {
+                        loop {
                             heat.flush_best_effort();
                             if heat.pass_delta.load(Ordering::Relaxed) == 0 {
                                 merged = true;
                                 break;
                             }
-                            std::thread::yield_now();
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        assert!(merged, "flush never acquired the heat lock");
+                        assert!(merged, "flush did not acquire the heat lock within 60s");
                     }
                 });
             }

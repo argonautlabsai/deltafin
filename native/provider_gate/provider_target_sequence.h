@@ -75,6 +75,7 @@ struct TargetSequenceStats {
   std::uint64_t expert_row_requests = 0;
   std::uint64_t expert_rows_completed = 0;
   std::uint64_t expert_tiles_completed = 0;
+  std::uint64_t moe_partial_dispatches = 0;
   std::uint64_t tail_rows = 0;
   std::uint64_t tail_provider_dispatches = 0;
   std::uint64_t maximum_live_streamed_layers = 0;
@@ -105,6 +106,8 @@ struct TargetSequenceStats {
   std::uint64_t moe_route_materializations = 0;
   std::uint64_t moe_route_host_transfers = 0;
   std::uint64_t moe_routed_input_host_transfers = 0;
+  /// K3_ROUTED_INPUT_ALIAS=1: transfers served by a unified-memory alias.
+  std::uint64_t moe_routed_input_host_aliases = 0;
   std::uint64_t moe_complete_provider_dispatches = 0;
   std::uint64_t moe_complete_rows = 0;
   std::uint64_t moe_routed_up_dispatches = 0;
@@ -151,6 +154,19 @@ class TargetSequenceTape {
 
   [[nodiscard]] TargetSequenceExpertMailbox expert_mailbox() const;
   [[nodiscard]] TargetSequencePrefetchHint take_prefetch_hint() noexcept;
+  /* Step 6 arena barrier: waits out any pre-committed KDA loop CB before
+   * the caller rewrites fp32 execution-arena storage. No-op without a
+   * pending pre-commit. Never throws. */
+  void precommit_arena_barrier() noexcept;
+  /* Step 6 pre-commit orchestration (runtime-driven so the weights are
+   * fresh per-owner views, never cached across tapes): after a loop tail
+   * completes a layer, precommit_wanted() names the successor KDA layer
+   * eligible for early encoding (UINT32_MAX = none), and the runtime calls
+   * try_precommit_next() with a freshly built binding for that layer —
+   * the same views prepare_layer will later resolve (cache hit), so the
+   * pre-computed math is bit-equal to the synchronous path. */
+  [[nodiscard]] std::uint32_t precommit_wanted() const noexcept;
+  void try_precommit_next(const TargetLayerBinding& binding) noexcept;
   void finish_expert_row(std::uint16_t row_index,
                          std::uint64_t spine_generation,
                          const CanonicalExpertBatchT1& experts,

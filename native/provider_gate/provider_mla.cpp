@@ -1,5 +1,9 @@
 #include "provider_mla.h"
 
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_MLA_ATTN_METAL_V1)
+#include "provider_mla_attn_metal.h"
+#endif
+
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/cat.h>
 #include <ATen/ops/einsum.h>
@@ -935,43 +939,64 @@ MlaPreparedDecode prepare_mla_positions(
     const double scaling = std::pow(
         static_cast<double>(query_head_dim), -0.5);
     trace(MlaExecutionStage::Attention);
-    at::Tensor scores;
-    if (cache.representation_ == MlaCacheRepresentation::ExpandedExact) {
-      scores = at::einsum("bhqd,bhkd->bhqk",
-                          {query_states, key_states});
-    } else {
-      const at::Tensor query_nope =
-          query_states.narrow(-1, 0, shape.qk_nope_head_dim);
-      const at::Tensor query_rope = query_states.narrow(
-          -1, shape.qk_nope_head_dim, shape.qk_rope_head_dim);
-      const at::Tensor query_latent = at::einsum(
-          "bhqn,hnr->bhqr", {query_nope, absorbed_key_value->key_up});
-      scores =
-          at::einsum("bhqr,bkr->bhqk",
-                     {query_latent, key_states.squeeze(1)}) +
-          at::einsum("bhqp,bkp->bhqk",
-                     {query_rope, value_states.squeeze(1)});
-    }
-    scores = scores * scaling;
-    if (positions > 1) {
-      scores = scores + causal_block_mask(scores, cache.length_, positions);
-    }
-    const at::Tensor probabilities = at::softmax(scores, -1, at::kFloat)
-                                         .to(query_states.scalar_type());
     at::Tensor attention;
-    if (cache.representation_ == MlaCacheRepresentation::ExpandedExact) {
-      attention = at::einsum(
-          "bhqk,bhkd->bhqd", {probabilities, value_states});
-    } else {
-      const at::Tensor latent_output = at::einsum(
-          "bhqk,bkr->bhqr", {probabilities, key_states.squeeze(1)});
-      attention = at::einsum(
-          "bhqr,hvr->bhqv",
-          {latent_output, absorbed_key_value->value_up});
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_MLA_ATTN_METAL_V1)
+    // Explicit env opt-in (K3_MLA_METAL_ATTENTION=1): the fused Metal
+    // attention core reads the same fp32 expanded slabs and computes the same
+    // scores/softmax/value math, but reassociates fp32 reductions (simd_sum
+    // trees, online softmax), so it is deliberately NOT bit-exact to the
+    // LibTorch einsum sequence below.  It never engages outside the exact-K3
+    // expanded T=1 MPS decode, and a failed one-shot canary qualification
+    // falls back to the stock path.  At T=1 the kernel writes the pre-gate
+    // [1,1,12288] row directly (the transpose below is a pure view then).
+    if (positions == 1 &&
+        cache.representation_ == MlaCacheRepresentation::ExpandedExact &&
+        shape.is_exact_k3() && hidden.device().is_mps() &&
+        query_states.is_contiguous() && mla_attn_metal_decode_ready()) {
+      attention = at::empty({1, 1, value_width},
+                            hidden.options().dtype(at::kFloat));
+      mla_attn_metal_decode_f32(attention, query_states, key_states,
+                                value_states);
     }
-    attention = attention.transpose(1, 2).contiguous();
-    attention =
-        attention.reshape({1, positions, value_width}).contiguous();
+#endif
+    if (!attention.defined()) {
+      at::Tensor scores;
+      if (cache.representation_ == MlaCacheRepresentation::ExpandedExact) {
+        scores = at::einsum("bhqd,bhkd->bhqk",
+                            {query_states, key_states});
+      } else {
+        const at::Tensor query_nope =
+            query_states.narrow(-1, 0, shape.qk_nope_head_dim);
+        const at::Tensor query_rope = query_states.narrow(
+            -1, shape.qk_nope_head_dim, shape.qk_rope_head_dim);
+        const at::Tensor query_latent = at::einsum(
+            "bhqn,hnr->bhqr", {query_nope, absorbed_key_value->key_up});
+        scores =
+            at::einsum("bhqr,bkr->bhqk",
+                       {query_latent, key_states.squeeze(1)}) +
+            at::einsum("bhqp,bkp->bhqk",
+                       {query_rope, value_states.squeeze(1)});
+      }
+      scores = scores * scaling;
+      if (positions > 1) {
+        scores = scores + causal_block_mask(scores, cache.length_, positions);
+      }
+      const at::Tensor probabilities = at::softmax(scores, -1, at::kFloat)
+                                           .to(query_states.scalar_type());
+      if (cache.representation_ == MlaCacheRepresentation::ExpandedExact) {
+        attention = at::einsum(
+            "bhqk,bhkd->bhqd", {probabilities, value_states});
+      } else {
+        const at::Tensor latent_output = at::einsum(
+            "bhqk,bkr->bhqr", {probabilities, key_states.squeeze(1)});
+        attention = at::einsum(
+            "bhqr,hvr->bhqv",
+            {latent_output, absorbed_key_value->value_up});
+      }
+      attention = attention.transpose(1, 2).contiguous();
+      attention =
+          attention.reshape({1, positions, value_width}).contiguous();
+    }
     if (!raw_output_gate.defined()) {
       trace(MlaExecutionStage::OutputGate);
       raw_output_gate = linear(hidden, weights.output_gate);
@@ -1077,6 +1102,82 @@ MlaPreparedDecode prepare_k3_mla_positions(
   }
   return prepare_mla_positions(hidden, weights, cache, absorbed_key_value,
                                true, input_bundle);
+}
+
+MlaDecodeShell prepare_k3_mla_decode_shell(
+    const at::Tensor& hidden, MlaCache& cache) {
+  const MlaShape& shape = cache.shape_;
+  shape.validate();
+  if (!shape.is_exact_k3() ||
+      cache.representation_ != MlaCacheRepresentation::ExpandedExact) {
+    throw std::invalid_argument(
+        "MLA decode shell requires the exact-K3 expanded cache");
+  }
+  if (!hidden.defined() || hidden.scalar_type() != at::kFloat ||
+      hidden.dim() != 3 || hidden.size(0) != 1 || hidden.size(1) != 1 ||
+      hidden.size(2) != shape.hidden_size || hidden.device().is_meta()) {
+    throw std::invalid_argument(
+        "MLA decode shell requires fp32 [1,1,hidden] input");
+  }
+  if (!cache.can_append(1)) {
+    throw std::invalid_argument(
+        "MLA position exceeds the cache context/storage admission bound");
+  }
+  if (cache.pending_nonce_ != 0) {
+    throw std::runtime_error(
+        "MLA cache already has an unfinished prepared decode");
+  }
+  if (cache.next_nonce_ == 0 ||
+      cache.next_nonce_ == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::runtime_error("MLA cache transaction nonce is exhausted");
+  }
+  const std::uint64_t nonce = cache.next_nonce_++;
+  cache.pending_nonce_ = nonce;
+  try {
+    const std::int64_t needed = cache.length_ + 1;
+    const bool grow = cache.capacity_ < needed;
+    const std::int64_t capacity =
+        grow ? grown_capacity(cache, needed) : cache.capacity_;
+    at::Tensor key_storage = cache.key_storage_;
+    at::Tensor value_storage = cache.value_storage_;
+    if (grow) {
+      const auto options = hidden.options().dtype(at::kFloat);
+      const auto [key_shape, value_shape] =
+          cache_storage_shapes(shape, cache.representation_, capacity);
+      key_storage = at::empty(key_shape, options);
+      value_storage = at::empty(value_shape, options);
+      if (cache.length_ != 0) {
+        key_storage.narrow(2, 0, cache.length_)
+            .copy_(cache.committed_keys());
+        value_storage.narrow(2, 0, cache.length_)
+            .copy_(cache.committed_values());
+      }
+    } else if (!key_storage.defined() || !value_storage.defined()) {
+      throw std::logic_error("MLA cache capacity exists without storage");
+    }
+
+    MlaDecodeShell shell;
+    shell.key_states = key_storage.narrow(2, 0, needed);
+    shell.value_states = value_storage.narrow(2, 0, needed);
+    if (grow) {
+      shell.prepared.grown_key_storage = std::move(key_storage);
+      shell.prepared.grown_value_storage = std::move(value_storage);
+    }
+    shell.prepared.nonce = nonce;
+    shell.prepared.expected_version = cache.version_;
+    shell.prepared.expected_length = cache.length_;
+    shell.prepared.next_length = needed;
+    shell.prepared.next_capacity = capacity;
+    shell.prepared.position_count = 1;
+    shell.prepared.owner = &cache;
+    shell.prepared.uses_grown_storage = grow;
+    return shell;
+  } catch (...) {
+    if (cache.pending_nonce_ == nonce) {
+      cache.pending_nonce_ = 0;
+    }
+    throw;
+  }
 }
 
 void commit_mla_decode(MlaCache& cache, MlaPreparedDecode& prepared) {

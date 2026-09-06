@@ -1,4 +1,7 @@
 #include "provider_kda_batch.h"
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+#include "provider_loop.h"
+#endif
 
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/linear.h>
@@ -10,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -140,6 +144,10 @@ at::Tensor batch_linear(const at::Tensor& input,
   if (projection.original_bf16.defined()) {
     return original_bf16_linear(input, projection.original_bf16);
   }
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  loop_residency_register_tensor(projection.weight);
+  loop_residency_register_tensor(projection.scale);
+#endif
   if (!projection.scale.defined()) {
     return at::linear(input, projection.weight, std::nullopt);
   }
@@ -285,6 +293,91 @@ KdaBatchOutputProjection kda_finish_output_batch(
   result.provider_dispatches = 2;
   result.equivalent_rowwise_dispatches = result.positions * 2;
   return result;
+}
+
+
+std::optional<KdaWideFusedResult> kda_wide_fused_positions(
+    const at::Tensor& normalized_hidden, const KdaWeights& weights,
+    const KdaState& state, const KdaBatchInputProjections& batch,
+    const KdaBatchDependentProjections& dependent,
+    const bool retain_boundaries, const bool exact_k3) {
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  if (!loop_kda_wide_fused_enabled() || !exact_k3 ||
+      !normalized_hidden.defined() || !normalized_hidden.device().is_mps() ||
+      normalized_hidden.dim() != 2 || normalized_hidden.size(0) < 2 ||
+      normalized_hidden.size(0) > 16 || !state.recurrent.defined() ||
+      !state.recurrent.is_contiguous() ||
+      state.recurrent.numel() != kK3Projection * 128) {
+    return std::nullopt;
+  }
+  const std::int64_t positions = normalized_hidden.size(0);
+  if (batch.positions != positions || dependent.positions != positions ||
+      !batch.query.defined() || !batch.key.defined() ||
+      !batch.value.defined() || !dependent.feature_b.defined() ||
+      !dependent.beta.defined()) {
+    return std::nullopt;
+  }
+  constexpr std::int64_t kWidth = 4;
+  // Same source construction as short_convolution_positions, so the
+  // boundary conv windows are identical views.
+  auto source_of = [&](const at::Tensor& projected, const at::Tensor& previous) {
+    return at::cat({previous.slice(2, 1, kWidth),
+                    projected.transpose(0, 1).unsqueeze(0)}, 2)
+        .contiguous();
+  };
+  const at::Tensor src_q = source_of(batch.query, state.query_convolution);
+  const at::Tensor src_k = source_of(batch.key, state.key_convolution);
+  const at::Tensor src_v = source_of(batch.value, state.value_convolution);
+  const at::Tensor gate =
+      batch_linear(normalized_hidden, weights.recurrent_gate_projection)
+          .contiguous();
+  const at::Tensor fb = dependent.feature_b.contiguous();
+  const at::Tensor beta = dependent.beta.contiguous();
+  const auto options = state.recurrent.options();
+  const at::Tensor s_out = at::empty_like(state.recurrent);
+  at::Tensor s_bound;
+  if (retain_boundaries) {
+    s_bound = at::empty({positions, kK3Heads, 128, 128}, options);
+  }
+  const at::Tensor out = at::empty({positions, kK3Projection}, options);
+  for (const at::Tensor* tensor : std::initializer_list<const at::Tensor*>{
+           &normalized_hidden, &batch.query, &batch.key, &batch.value, &src_q,
+           &src_k, &src_v, &gate, &fb, &beta, &state.recurrent, &s_out,
+           &s_bound, &out}) {
+    loop_residency_register_activation(*tensor);
+  }
+  loop_kda_wide_fused_on_aten_stream(
+      src_q, src_k, src_v, weights.query_convolution.contiguous(),
+      weights.key_convolution.contiguous(),
+      weights.value_convolution.contiguous(), weights.a_log.contiguous(),
+      weights.dt_bias.contiguous(), fb, beta, gate,
+      weights.output_norm.contiguous(), state.recurrent, s_out, s_bound, out,
+      static_cast<std::uint32_t>(positions), retain_boundaries);
+  KdaWideFusedResult result;
+  result.output =
+      batch_linear(out, weights.output_projection).contiguous();
+  const std::int64_t final_start = positions - 1;
+  result.final_state = KdaState{
+      src_q.narrow(2, final_start, kWidth).contiguous(),
+      src_k.narrow(2, final_start, kWidth).contiguous(),
+      src_v.narrow(2, final_start, kWidth).contiguous(), s_out};
+  if (retain_boundaries) {
+    result.boundaries.reserve(static_cast<std::size_t>(positions));
+    for (std::int64_t position = 0; position < positions; ++position) {
+      result.boundaries.push_back(KdaState{
+          src_q.narrow(2, position, kWidth), src_k.narrow(2, position, kWidth),
+          src_v.narrow(2, position, kWidth), s_bound.narrow(0, position, 1)});
+    }
+  }
+  result.provider_dispatches = 3;  // gate projection, kernel, output projection
+  return result;
+#else
+  static_cast<void>(normalized_hidden); static_cast<void>(weights);
+  static_cast<void>(state); static_cast<void>(batch);
+  static_cast<void>(dependent); static_cast<void>(retain_boundaries);
+  static_cast<void>(exact_k3);
+  return std::nullopt;
+#endif
 }
 
 }  // namespace deltafin::provider_internal

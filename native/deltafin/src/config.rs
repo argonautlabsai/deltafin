@@ -9,7 +9,14 @@ use crate::quality::{QualityPolicy, ResidentWeightAuthority};
 use crate::router_trace::RouterTraceMode;
 
 pub const MAX_SPINE_READ_THREADS: usize = 16;
-pub const MAX_EXPERT_READ_THREADS: usize = 16;
+/// Raised 16 -> 64 on 2026-08-29. This constant bounds BOTH
+/// K3_EXPERT_READ_THREADS and K3_EXPERT_PREFETCH_THREADS. At 16 -- the old
+/// ceiling -- measured four-way draw was still climbing with thread count
+/// (7.64 GB/s at pf1 -> 15.62 at pf16, peak 23.88 of 28.73 capability), so
+/// the cap itself was the binding constraint on the draw experiment rather
+/// than any property of the storage path. Used only for validation and
+/// clamping; no fixed-size structure is keyed to it.
+pub const MAX_EXPERT_READ_THREADS: usize = 128;
 
 pub fn parse_spine_read_threads(raw: &str) -> Result<usize> {
     let workers = raw
@@ -26,10 +33,22 @@ pub fn parse_spine_read_threads(raw: &str) -> Result<usize> {
 pub fn parse_expert_read_threads(raw: &str) -> Result<usize> {
     let workers = raw
         .parse::<usize>()
-        .map_err(|_| DeltafinError::new("K3_EXPERT_READ_THREADS must be an integer in 1..=16"))?;
+        .map_err(|_| DeltafinError::new("K3_EXPERT_READ_THREADS must be an integer in 1..=128"))?;
     if !(1..=MAX_EXPERT_READ_THREADS).contains(&workers) {
         return Err(DeltafinError::new(
-            "K3_EXPERT_READ_THREADS must be an integer in 1..=16",
+            "K3_EXPERT_READ_THREADS must be an integer in 1..=128",
+        ));
+    }
+    Ok(workers)
+}
+
+pub fn parse_expert_prefetch_threads(raw: &str) -> Result<usize> {
+    let workers = raw.parse::<usize>().map_err(|_| {
+        DeltafinError::new("K3_EXPERT_PREFETCH_THREADS must be an integer in 1..=128")
+    })?;
+    if !(1..=MAX_EXPERT_READ_THREADS).contains(&workers) {
+        return Err(DeltafinError::new(
+            "K3_EXPERT_PREFETCH_THREADS must be an integer in 1..=128",
         ));
     }
     Ok(workers)
@@ -347,6 +366,11 @@ pub struct RuntimeConfig {
     /// to the same host/device safety envelope.
     pub provider_resident_layers: Option<usize>,
     pub expert_read_threads: Option<usize>,
+    /// Worker count for the speculative expert prefetch pool. `None` mirrors
+    /// the demand pool's count (upstream behavior); an explicit value lets
+    /// speculation complete inside the layer window without raising demand
+    /// concurrency.
+    pub expert_prefetch_threads: Option<usize>,
     pub expert_backend: ExpertBackendRequest,
     pub expert_scale4: ExpertScale4Request,
     /// Byte budget for the permanent learned-expert RAM tier. Zero keeps the
@@ -366,6 +390,14 @@ pub struct RuntimeConfig {
     pub dspark: DSparkRequest,
     pub dspark_max_context: Option<usize>,
     pub dspark_min_auto_speedup: f64,
+    /// Consecutive zero-acceptance verify blocks tolerated before DSpark
+    /// disables drafting for the request. 1 = historical
+    /// disable-on-first-miss.
+    pub dspark_miss_tolerance: u8,
+    /// Ceiling on drafted tokens per speculative block (1..=7). Lower widths
+    /// trade peak speedup for less wasted verify I/O on rejected rows —
+    /// early-position drafts accept at much higher rates than tail drafts.
+    pub dspark_max_drafts: u8,
     pub qwen: QwenRequest,
     /// Chat thinking depth (`low`, `high`, or `max`), normalized. `None`
     /// defers to the chat template's own default of `max`; the server's
@@ -413,6 +445,10 @@ impl RuntimeConfig {
         let expert_read_threads = environment("K3_EXPERT_READ_THREADS")
             .as_deref()
             .map(parse_expert_read_threads)
+            .transpose()?;
+        let expert_prefetch_threads = environment("K3_EXPERT_PREFETCH_THREADS")
+            .as_deref()
+            .map(parse_expert_prefetch_threads)
             .transpose()?;
         let expert_pin_bytes = environment("K3_EXPERT_PIN_GB")
             .as_deref()
@@ -494,6 +530,24 @@ impl RuntimeConfig {
                 "K3_DSPARK_AUTO_MIN_SPEEDUP must be a finite number in [0,1)",
             ));
         }
+        let dspark_miss_tolerance = environment("K3_DSPARK_MISS_TOLERANCE")
+            .as_deref()
+            .unwrap_or("1")
+            .parse::<u8>()
+            .ok()
+            .filter(|value| (1..=64).contains(value))
+            .ok_or_else(|| {
+                DeltafinError::new("K3_DSPARK_MISS_TOLERANCE must be an integer in 1..=128")
+            })?;
+        let dspark_max_drafts = environment("K3_DSPARK_MAX_DRAFTS")
+            .as_deref()
+            .unwrap_or("7")
+            .parse::<u8>()
+            .ok()
+            .filter(|value| (1..=7).contains(value))
+            .ok_or_else(|| {
+                DeltafinError::new("K3_DSPARK_MAX_DRAFTS must be an integer in 1..=7")
+            })?;
 
         Ok(Self {
             surface: RuntimeSurface::DirectRun,
@@ -515,6 +569,7 @@ impl RuntimeConfig {
             spine_resident_bytes,
             provider_resident_layers,
             expert_read_threads,
+            expert_prefetch_threads,
             expert_backend: ExpertBackendRequest::parse(backend_value.as_deref())?,
             expert_scale4,
             expert_pin_bytes,
@@ -526,6 +581,8 @@ impl RuntimeConfig {
             dspark,
             dspark_max_context,
             dspark_min_auto_speedup,
+            dspark_miss_tolerance,
+            dspark_max_drafts,
             qwen,
             reasoning_effort,
         })
@@ -571,10 +628,11 @@ impl std::fmt::Display for RuntimeConfig {
             "surface={:?} device={:?} spine={:?} spine_read_threads={} spine_fd_cache={} \
              spine_stream_nocache={} expert_stream_nocache={} spine_resident_bytes={} \
              provider_resident_layers={} \
-             expert_read_threads={} expert_backend={:?} expert_scale4={:?} \
-             expert_pin_bytes={} expert_heat={} pilot_gate={:?} \
+             expert_read_threads={} expert_prefetch_threads={} expert_backend={:?} expert_scale4={:?} \
+             expert_pin_bytes={} expert_heat={} expert_overlays=[{}] pilot_gate={:?} \
              pilot_gate_threshold={} pilot_gate_warmup={} quality={:?} \
-             dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} qwen={:?} \
+             dspark={:?} dspark_max_context={} dspark_min_auto_speedup={} \
+             dspark_miss_tolerance={} dspark_max_drafts={} qwen={:?} \
              reasoning_effort={} router_trace_mode={:?} router_trace_path={} chat={} \
              stats={} layer_profile={} max_new={}",
             self.surface,
@@ -587,10 +645,12 @@ impl std::fmt::Display for RuntimeConfig {
             describe_u64(self.spine_resident_bytes),
             describe_usize(self.provider_resident_layers),
             describe_usize(self.expert_read_threads),
+            describe_usize(self.expert_prefetch_threads),
             self.expert_backend,
             self.expert_scale4,
             self.expert_pin_bytes,
             self.expert_heat,
+            describe_expert_overlays(),
             self.pilot_gate,
             self.pilot_gate_threshold,
             self.pilot_gate_warmup,
@@ -598,6 +658,8 @@ impl std::fmt::Display for RuntimeConfig {
             self.dspark,
             describe_usize(self.dspark_max_context),
             self.dspark_min_auto_speedup,
+            self.dspark_miss_tolerance,
+            self.dspark_max_drafts,
             self.qwen,
             self.reasoning_effort.as_deref().unwrap_or("default"),
             self.router_trace_mode,
@@ -608,6 +670,40 @@ impl std::fmt::Display for RuntimeConfig {
             describe_u64(self.max_new),
         )
     }
+}
+
+/// Report every ACTIVE expert overlay with its file count, for the [config]
+/// line. Added 2026-08-28 after a real misreading: the config line printed
+/// expert_read_threads and expert_pin_bytes but NOTHING about the resolve
+/// overlays, so a reviewer reading a benchmark log concluded K3C was not in
+/// use when it was — and drew an architectural conclusion from it. Two
+/// benchmark logs must be able to PROVE they ran on the same expert
+/// topology; the file counts act as a cheap placement fingerprint.
+fn describe_expert_overlays() -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (label, var) in [
+        ("hot", "K3_EXPERT_HOT_DIR"),
+        ("dir_b", "K3_EXPERT_DIR_B"),
+        ("dir_c", "K3_EXPERT_DIR_C"),
+    ] {
+        match std::env::var(var) {
+            Ok(raw) if !raw.trim().is_empty() => {
+                let path = std::path::Path::new(raw.trim());
+                let n = std::fs::read_dir(path)
+                    .map(|it| {
+                        it.flatten()
+                            .filter(|e| {
+                                e.file_name().to_string_lossy().ends_with(".bin")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                parts.push(format!("{label}={}:{n}files", raw.trim()));
+            }
+            _ => parts.push(format!("{label}=off")),
+        }
+    }
+    parts.join(" ")
 }
 
 fn describe_usize(value: Option<usize>) -> String {
@@ -943,14 +1039,26 @@ mod tests {
         .unwrap();
         assert_eq!(config.expert_read_threads, Some(8));
 
-        for invalid in ["0", "17", "many"] {
+        // Derived from the constant, not hardcoded: this test asserted "17"
+        // was out of range and silently began failing when
+        // MAX_EXPERT_READ_THREADS went 16 -> 128 (the 64-thread champion win).
+        let above = (MAX_EXPERT_READ_THREADS + 1).to_string();
+        for invalid in ["0", above.as_str(), "many"] {
             assert!(
                 RuntimeConfig::resolve(arguments(), |name| {
                     (name == "K3_EXPERT_READ_THREADS").then(|| invalid.into())
                 })
-                .is_err()
+                .is_err(),
+                "expected {invalid} to be rejected"
             );
         }
+
+        // And the raised ceiling is genuinely reachable — the champion runs 64.
+        let config = RuntimeConfig::resolve(arguments(), |name| {
+            (name == "K3_EXPERT_READ_THREADS").then(|| "64".into())
+        })
+        .unwrap();
+        assert_eq!(config.expert_read_threads, Some(64));
     }
 
     #[test]

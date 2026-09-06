@@ -91,9 +91,13 @@ struct DSparkDecoderOutput {
 [[nodiscard]] at::Tensor dspark_yarn_inverse_frequencies(
     const DSparkShape& shape, const at::Device& device);
 
+// `maximum_rows` bounds value.size(0): the draft query/backbone paths keep
+// the trained 7-row ceiling (the default); the context-append path passes
+// its own bound, since a chat prefill legitimately appends arbitrarily many
+// target rows in one call (positions are range-checked separately).
 [[nodiscard]] at::Tensor dspark_apply_yarn_rotary_bf16(
     const at::Tensor& value, const at::Tensor& positions,
-    const DSparkShape& shape);
+    const DSparkShape& shape, std::int64_t maximum_rows = 7);
 
 [[nodiscard]] DSparkMlaOutput run_dspark_mla(
     const at::Tensor& hidden, const at::Tensor& positions,

@@ -48,6 +48,47 @@ pub(crate) fn configure_model_io_thread() {
     }
 }
 
+const PREFETCH_IOPOL_ENV: &str = "K3_PREFETCH_IOPOL";
+
+/// K3_PREFETCH_IOPOL=utility|throttle — deprioritize PREFETCH reader threads
+/// at the kernel's per-device I/O queues, so demand reads are served ahead of
+/// speculation on every drive. Motivation (2026-09-02): suppression frees
+/// prefetch capacity that elastically backfills with deeper speculation
+/// (PS200: 288 GB suppressed, net −102 GB; S1: 98 GB served, K3C −19 GB),
+/// and the champion's own barrier signature — Tmax/Tmedian = 2.02, top half
+/// of every barrier slow together — is plausibly demand-vs-prefetch queue
+/// contention. `utility` is the measured default candidate; `throttle` is
+/// Darwin's background class and may starve prefetch outright — bracket it,
+/// never assume it. Unset or any other value: no-op (champion unchanged).
+fn prefetch_policy(value: Option<&OsStr>) -> Option<PrefetchPolicy> {
+    match value {
+        Some(value) if value == OsStr::new("utility") => Some(PrefetchPolicy::Utility),
+        Some(value) if value == OsStr::new("throttle") => Some(PrefetchPolicy::Throttle),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PrefetchPolicy {
+    Utility,
+    Throttle,
+}
+
+/// Worker start hook for PREFETCH readers. With K3_PREFETCH_IOPOL set, the
+/// thread gets a deprioritized disk policy + matching QoS; otherwise it takes
+/// the ordinary foreground path, byte-identical to before this knob existed.
+pub(crate) fn configure_prefetch_io_thread() {
+    match prefetch_policy(std::env::var_os(PREFETCH_IOPOL_ENV).as_deref()) {
+        Some(PrefetchPolicy::Utility) if cfg!(target_os = "macos") => {
+            platform::set_prefetch_thread_utility();
+        }
+        Some(PrefetchPolicy::Throttle) if cfg!(target_os = "macos") => {
+            platform::set_prefetch_thread_throttled();
+        }
+        _ => configure_model_io_thread(),
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use libc::qos_class_t;
@@ -80,6 +121,25 @@ mod platform {
         };
     }
 
+    // Thread-scope disk policies for prefetch deprioritization. Values from
+    // <sys/resource.h>: SCOPE_THREAD=1, IOPOL_THROTTLE=3, IOPOL_UTILITY=4.
+    const IOPOL_SCOPE_THREAD: libc::c_int = 1;
+    const IOPOL_THROTTLE: libc::c_int = 3;
+    const IOPOL_UTILITY: libc::c_int = 4;
+
+    pub(super) fn set_prefetch_thread_utility() {
+        // SAFETY: scalar args only; THREAD scope affects the calling thread.
+        let _ = unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_UTILITY) };
+        let _ = unsafe { libc::pthread_set_qos_class_self_np(qos_class_t::QOS_CLASS_UTILITY, 0) };
+    }
+
+    pub(super) fn set_prefetch_thread_throttled() {
+        // SAFETY: as above. THROTTLE is Darwin's background class and can be
+        // aggressive on external buses — bracket before trusting.
+        let _ = unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) };
+        let _ = unsafe { libc::pthread_set_qos_class_self_np(qos_class_t::QOS_CLASS_BACKGROUND, 0) };
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -99,6 +159,10 @@ mod platform {
     pub(super) fn set_process_io_important() {}
 
     pub(super) fn set_reader_thread_user_initiated() {}
+
+    pub(super) fn set_prefetch_thread_utility() {}
+
+    pub(super) fn set_prefetch_thread_throttled() {}
 }
 
 #[cfg(test)]

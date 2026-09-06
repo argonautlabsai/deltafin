@@ -12,6 +12,7 @@ use crate::program::LayerSpinePlan;
 use crate::provider::{BoundSpineLayerReport, NativeProviderSession, SpineLayerRetention};
 use crate::spine_source_use::{ReclaimAdmission, SpineSourceUseController};
 use crate::storage::{LayerBuffers, ReadPriority, ReadStats, ReadTicket, Reader};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 const K3_LAYER_COUNT: u32 = 93;
@@ -60,9 +61,18 @@ struct ResidentBinding {
 /// until an explicit device-fence reclaim or abort.
 pub struct SpinePipeline {
     reader: Reader,
-    pending: Option<PendingRead>,
+    /// Reads in flight, in layer order. K3_SPINE_LOOKAHEAD keeps up to
+    /// `lookahead` of them open so streamed layers homed on different drives
+    /// are read in parallel instead of one drive taking a turn at a time.
+    pending: VecDeque<PendingRead>,
+    lookahead: usize,
     generation: u64,
     resident_prefix_target: u32,
+    /// K3_SPINE_TRANSIENT_SPREAD: per-layer residency. The prefix form sets
+    /// layers `0..target`; the spread form marks the same COUNT of layers but
+    /// leaves the transient ones evenly spaced through the pass, so streamed
+    /// spine bytes are a background load instead of a suffix burst.
+    resident_mask: Vec<bool>,
     resident: Vec<ResidentBinding>,
     resident_storage_bytes: u64,
     provider_identity: Option<u64>,
@@ -83,6 +93,43 @@ impl SpinePipeline {
         arena_slots: usize,
         resident_prefix_layers: u32,
     ) -> Result<Self> {
+        let mask = (0..K3_LAYER_COUNT)
+            .map(|layer| layer < resident_prefix_layers)
+            .collect::<Vec<bool>>();
+        Self::with_resident_mask(read_workers, arena_slots, mask)
+    }
+
+    /// Residency by explicit per-layer mask (length K3_LAYER_COUNT). The
+    /// resident COUNT still drives every budget and report path.
+    pub fn with_resident_mask(
+        read_workers: usize,
+        arena_slots: usize,
+        resident_mask: Vec<bool>,
+    ) -> Result<Self> {
+        Self::with_resident_mask_lookahead(read_workers, arena_slots, resident_mask, 1)
+    }
+
+    /// `lookahead` reads in flight; needs `arena_slots >= lookahead + 1` (one
+    /// slab being uploaded plus one per read in flight).
+    pub fn with_resident_mask_lookahead(
+        read_workers: usize,
+        arena_slots: usize,
+        resident_mask: Vec<bool>,
+        lookahead: usize,
+    ) -> Result<Self> {
+        let lookahead = lookahead.max(1);
+        if arena_slots < lookahead + 1 {
+            return Err(DeltafinError::new(format!(
+                "spine pipeline lookahead {lookahead} needs at least {} arena slots, got {arena_slots}",
+                lookahead + 1
+            )));
+        }
+        if resident_mask.len() != K3_LAYER_COUNT as usize {
+            return Err(DeltafinError::new(format!(
+                "resident spine mask must cover {K3_LAYER_COUNT} layers",
+            )));
+        }
+        let resident_prefix_layers = resident_mask.iter().filter(|kept| **kept).count() as u32;
         if arena_slots < 2 {
             return Err(DeltafinError::new(
                 "spine pipeline needs at least two arena slots for safe read/upload overlap",
@@ -95,9 +142,11 @@ impl SpinePipeline {
         }
         Ok(Self {
             reader: Reader::with_arena_capacity(read_workers, arena_slots)?,
-            pending: None,
+            pending: VecDeque::new(),
+            lookahead,
             generation: 0,
             resident_prefix_target: resident_prefix_layers,
+            resident_mask,
             resident: Vec::with_capacity(resident_prefix_layers as usize),
             resident_storage_bytes: 0,
             provider_identity: None,
@@ -136,23 +185,48 @@ impl SpinePipeline {
     }
 
     fn retained(&self, layer: u32) -> Option<ResidentBinding> {
-        self.resident
-            .get(layer as usize)
-            .copied()
-            .filter(|binding| binding.layer == layer)
+        // Retained layers are pushed in bind order; with a spread mask the
+        // vector index is not the layer index, so search by layer.
+        self.resident.iter().copied().find(|binding| binding.layer == layer)
     }
 
-    fn next_pending(&self, next: Option<&LayerSpinePlan>) -> Result<Option<PendingRead>> {
-        next.filter(|plan| self.retained(plan.layer()).is_none())
-            .map(|plan| {
-                self.reader
-                    .submit(plan.read_plan(), ReadPriority::Demand)
-                    .map(|ticket| PendingRead {
-                        layer: plan.layer(),
-                        ticket,
-                    })
-            })
-            .transpose()
+    /// The layers this pipeline will retain (true) vs stream (false).
+    pub fn resident_mask(&self) -> &[bool] {
+        &self.resident_mask
+    }
+
+    /// The next layer among `upcoming` (in order) that will need a read —
+    /// i.e. is not retained yet. With a spread residency this looks past the
+    /// resident layers to the next streamed one, so its read overlaps their
+    /// compute instead of sitting exposed on the critical path.
+    /// Top the in-flight queue up to `lookahead` with the next unretained
+    /// layers from `upcoming` (in order, skipping retained and already-pending
+    /// layers). Returns whether any new read was submitted.
+    fn fill_pending(&mut self, upcoming: &[LayerSpinePlan]) -> Result<bool> {
+        let mut submitted = false;
+        for plan in upcoming {
+            if self.pending.len() >= self.lookahead {
+                break;
+            }
+            if self.retained(plan.layer()).is_some() {
+                continue;
+            }
+            if self.pending.iter().any(|pending| pending.layer == plan.layer()) {
+                continue;
+            }
+            if let Some(last) = self.pending.back()
+                && plan.layer() <= last.layer
+            {
+                continue;
+            }
+            let ticket = self.reader.submit(plan.read_plan(), ReadPriority::Demand)?;
+            self.pending.push_back(PendingRead {
+                layer: plan.layer(),
+                ticket,
+            });
+            submitted = true;
+        }
+        Ok(submitted)
     }
 
     /// Start the first layer read. A pipeline may have only one unpublished
@@ -160,7 +234,7 @@ impl SpinePipeline {
     /// memory pressure on the reference 64 GiB host.
     pub fn prime(&mut self, plan: &LayerSpinePlan) -> Result<()> {
         self.require_healthy()?;
-        if self.pending.is_some() {
+        if !self.pending.is_empty() {
             return Err(DeltafinError::new(
                 "spine pipeline already has a pending layer read",
             ));
@@ -168,9 +242,10 @@ impl SpinePipeline {
         if self.retained(plan.layer()).is_some() {
             return Ok(());
         }
-        self.pending = Some(PendingRead {
+        let ticket = self.reader.submit(plan.read_plan(), ReadPriority::Demand)?;
+        self.pending.push_back(PendingRead {
             layer: plan.layer(),
-            ticket: self.reader.submit(plan.read_plan(), ReadPriority::Demand)?,
+            ticket,
         });
         Ok(())
     }
@@ -187,9 +262,9 @@ impl SpinePipeline {
         &mut self,
         provider: &NativeProviderSession,
         current: &LayerSpinePlan,
-        next: Option<&LayerSpinePlan>,
+        upcoming: &[LayerSpinePlan],
     ) -> Result<SpineBindStats> {
-        self.bind_current_with_timing(provider, current, next, false)
+        self.bind_current_with_timing(provider, current, upcoming, false)
     }
 
     /// Identical to [`Self::bind_current`] except that it records host-side
@@ -199,20 +274,20 @@ impl SpinePipeline {
         &mut self,
         provider: &NativeProviderSession,
         current: &LayerSpinePlan,
-        next: Option<&LayerSpinePlan>,
+        upcoming: &[LayerSpinePlan],
     ) -> Result<SpineBindStats> {
-        self.bind_current_with_timing(provider, current, next, true)
+        self.bind_current_with_timing(provider, current, upcoming, true)
     }
 
     fn bind_current_with_timing(
         &mut self,
         provider: &NativeProviderSession,
         current: &LayerSpinePlan,
-        next: Option<&LayerSpinePlan>,
+        upcoming: &[LayerSpinePlan],
         profile: bool,
     ) -> Result<SpineBindStats> {
         self.require_healthy()?;
-        if let Some(next) = next
+        if let Some(next) = upcoming.first()
             && next.layer() <= current.layer()
         {
             return Err(DeltafinError::new(format!(
@@ -235,18 +310,18 @@ impl SpinePipeline {
                     "spine pipeline lost the provider identity for a retained layer",
                 ));
             }
-            if let Some(pending) = &self.pending {
+            if self.pending.iter().any(|pending| pending.layer == current.layer()) {
                 return Err(DeltafinError::new(format!(
-                    "spine pipeline has an unexpected pending layer {} while reusing resident layer {}",
-                    pending.layer,
+                    "spine pipeline has a pending read for resident layer {}",
                     current.layer(),
                 )));
             }
+            // Pending reads for LATER (streamed) layers ride through the
+            // resident layers untouched; keep the queue topped up so several
+            // drives stream at once.
             let prefetch_started = profile.then(Instant::now);
-            let next_pending = self.next_pending(next)?;
+            let next_prefetch_started = self.fill_pending(upcoming)?;
             let next_prefetch_submit = profiled_elapsed(prefetch_started);
-            let next_prefetch_started = next_pending.is_some();
-            self.pending = next_pending;
             return Ok(SpineBindStats {
                 layer: current.layer(),
                 generation: resident.binding.generation,
@@ -268,19 +343,19 @@ impl SpinePipeline {
             });
         }
 
-        let retention = if current.layer() < self.resident_prefix_target {
-            if current.layer() != self.resident_prefix_layers() {
+        let retention = if self.resident_mask[current.layer() as usize] {
+            if self.resident_prefix_layers() >= self.resident_prefix_target {
                 return Err(DeltafinError::new(format!(
-                    "resident spine binding must append layer {}; got layer {}",
-                    self.resident_prefix_layers(),
+                    "resident spine binding for layer {} exceeds the {}-layer residency budget",
                     current.layer(),
+                    self.resident_prefix_target,
                 )));
             }
             SpineLayerRetention::Retained
         } else {
             SpineLayerRetention::Transient
         };
-        if let Some(pending) = &self.pending
+        if let Some(pending) = self.pending.front()
             && pending.layer != current.layer()
         {
             return Err(DeltafinError::new(format!(
@@ -289,7 +364,7 @@ impl SpinePipeline {
                 current.layer(),
             )));
         }
-        let pending = match self.pending.take() {
+        let pending = match self.pending.pop_front() {
             Some(pending) => pending,
             None => PendingRead {
                 layer: current.layer(),
@@ -307,7 +382,7 @@ impl SpinePipeline {
         // hold current upload + next read without deadlocking behind the
         // unrelated-prefetch reserve. Already-retained successors need no I/O.
         let prefetch_started = profile.then(Instant::now);
-        let next_pending = self.next_pending(next)?;
+        let next_prefetch_started = self.fill_pending(upcoming)?;
         let next_prefetch_submit = profiled_elapsed(prefetch_started);
         let generation = self
             .generation
@@ -323,7 +398,7 @@ impl SpinePipeline {
         ) {
             Ok(binding) => binding,
             Err(error) => {
-                drop(next_pending);
+                self.pending.clear();
                 return Err(error);
             }
         };
@@ -341,7 +416,7 @@ impl SpinePipeline {
             // lease when cancellation is not provable, so this pipeline must
             // never admit another arena slot.
             self.poison();
-            drop(next_pending);
+            self.pending.clear();
             return Err(error);
         }
         self.provider_identity = Some(provider.identity());
@@ -355,8 +430,6 @@ impl SpinePipeline {
                 binding,
             });
         }
-        let next_prefetch_started = next_pending.is_some();
-        self.pending = next_pending;
         Ok(SpineBindStats {
             layer: current.layer(),
             generation,
@@ -378,7 +451,12 @@ impl SpinePipeline {
     }
 
     pub fn pending_layer(&self) -> Option<u32> {
-        self.pending.as_ref().map(|pending| pending.layer)
+        self.pending.front().map(|pending| pending.layer)
+    }
+
+    /// Reads currently in flight.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     /// True when the selected CPU, Metal, or CUDA provider explicitly borrowed
@@ -465,7 +543,7 @@ impl SpinePipeline {
     /// live and tells the engine to retain the native provider session too.
     pub(crate) fn teardown(&mut self, provider: &NativeProviderSession) -> Result<()> {
         self.poison();
-        self.pending.take();
+        self.pending.clear();
         if self.source_uses.has_active_borrow() {
             let generation = self.source_uses.active_generation().ok_or_else(|| {
                 DeltafinError::new("borrowed spine source lost its active generation at teardown")
@@ -491,7 +569,9 @@ impl SpinePipeline {
     /// state; an already-running read drains inside the bounded reader and then
     /// releases its arena lease. Retained provider bindings remain immutable.
     pub fn discard_pending(&mut self) -> Option<u32> {
-        self.pending.take().map(|pending| pending.layer)
+        let first = self.pending.front().map(|pending| pending.layer);
+        self.pending.clear();
+        first
     }
 }
 
@@ -582,7 +662,7 @@ mod tests {
 
         pipeline.prime(&first).unwrap();
         let first_report = pipeline
-            .bind_current(&provider, &first, Some(&second))
+            .bind_current(&provider, &first, std::slice::from_ref(&second))
             .unwrap();
         assert_eq!(first_report.generation, 1);
         assert!(!first_report.profiled);
@@ -597,7 +677,7 @@ mod tests {
         assert_eq!(readback.stored_scalar, SpineStoredScalar::F32);
         assert_eq!(&*readback.values, &[1.0, 2.0]);
 
-        let second_report = pipeline.bind_current(&provider, &second, None).unwrap();
+        let second_report = pipeline.bind_current(&provider, &second, &[]).unwrap();
         assert_eq!(second_report.generation, 2);
         assert!(!second_report.next_prefetch_started);
         assert_eq!(pipeline.pending_layer(), None);
@@ -616,7 +696,7 @@ mod tests {
 
         pipeline.prime(&first).unwrap();
         let report = pipeline
-            .bind_current_profiled(&provider, &first, Some(&second))
+            .bind_current_profiled(&provider, &first, std::slice::from_ref(&second))
             .unwrap();
         assert!(report.profiled);
         assert_eq!(report.layer, 0);
@@ -662,7 +742,7 @@ mod tests {
         assert_eq!(pipeline.discard_pending(), Some(0));
         let prime_error = pipeline.prime(&first).unwrap_err();
         assert!(prime_error.to_string().contains("poisoned"));
-        let bind_error = pipeline.bind_current(&provider, &first, None).unwrap_err();
+        let bind_error = pipeline.bind_current(&provider, &first, &[]).unwrap_err();
         assert!(bind_error.to_string().contains("poisoned"));
     }
 
@@ -693,14 +773,14 @@ mod tests {
 
         pipeline.prime(&first).unwrap();
         let first_bound = pipeline
-            .bind_current(&provider, &first, Some(&second))
+            .bind_current(&provider, &first, std::slice::from_ref(&second))
             .unwrap();
         assert!(!first_bound.reused_resident);
         assert_eq!(first_bound.binding.retention, SpineLayerRetention::Retained);
         assert_eq!(first_bound.resident_prefix_layers, 1);
         assert_eq!(first_bound.resident_storage_bytes, 8);
         let second_bound = pipeline
-            .bind_current(&provider, &second, Some(&third))
+            .bind_current(&provider, &second, std::slice::from_ref(&third))
             .unwrap();
         assert_eq!(
             second_bound.binding.retention,
@@ -708,7 +788,7 @@ mod tests {
         );
         assert_eq!(second_bound.resident_prefix_layers, 2);
         assert_eq!(second_bound.resident_storage_bytes, 16);
-        let third_bound = pipeline.bind_current(&provider, &third, None).unwrap();
+        let third_bound = pipeline.bind_current(&provider, &third, &[]).unwrap();
         assert_eq!(
             third_bound.binding.retention,
             SpineLayerRetention::Transient
@@ -723,7 +803,7 @@ mod tests {
         // the second resident layer is being executed.
         pipeline.prime(&first).unwrap();
         let first_reused = pipeline
-            .bind_current(&provider, &first, Some(&second))
+            .bind_current(&provider, &first, std::slice::from_ref(&second))
             .unwrap();
         assert!(first_reused.reused_resident);
         assert_eq!(first_reused.generation, 1);
@@ -732,13 +812,13 @@ mod tests {
         assert_eq!(first_reused.read.elapsed, Duration::ZERO);
         assert!(!first_reused.next_prefetch_started);
         let second_reused = pipeline
-            .bind_current(&provider, &second, Some(&third))
+            .bind_current(&provider, &second, std::slice::from_ref(&third))
             .unwrap();
         assert!(second_reused.reused_resident);
         assert_eq!(second_reused.generation, 2);
         assert!(second_reused.next_prefetch_started);
         assert_eq!(pipeline.pending_layer(), Some(2));
-        let third_rebound = pipeline.bind_current(&provider, &third, None).unwrap();
+        let third_rebound = pipeline.bind_current(&provider, &third, &[]).unwrap();
         assert!(!third_rebound.reused_resident);
         assert_eq!(third_rebound.generation, 4);
 
@@ -774,10 +854,10 @@ mod tests {
         let mut pipeline = SpinePipeline::with_resident_prefix(1, 2, 1).unwrap();
         pipeline.prime(&first).unwrap();
         pipeline
-            .bind_current(&first_provider, &first, None)
+            .bind_current(&first_provider, &first, &[])
             .unwrap();
         let error = pipeline
-            .bind_current(&second_provider, &first, None)
+            .bind_current(&second_provider, &first, &[])
             .unwrap_err();
         assert!(error.to_string().contains("different provider session"));
     }

@@ -215,6 +215,10 @@ struct MoeExecutionTrace {
   }
 };
 
+/* K3_MOE_ATEN_STREAM=1: expert kernels on the ATen stream (device x/out,
+ * one sync per tile instead of one per wave plus two host copies). */
+bool moe_aten_stream_enabled() noexcept;
+
 struct MoeRunOptions {
   MoeExpertBackend expert_backend = MoeExpertBackend::Auto;
   std::uint32_t cpu_threads = 1;
@@ -238,6 +242,12 @@ struct MoeRunOptions {
   /* Default false preserves the public synchronous-borrow ABI. True is legal
    * only when the caller has installed flush-before-arena-retirement hooks. */
   bool metal_retain_expert_wrappers = false;
+  /* Arrival-driven compute: skip route edges whose expert is not in the batch
+   * (the caller accumulates partial outputs across calls). */
+  bool partial_edges = false;
+  /* Sequence-level arrival flags carried through to finish_expert_tile. */
+  bool arrival_partial = false;
+  bool arrival_final = false;
   MoeExecutionTrace* execution_trace = nullptr;
 };
 
@@ -257,7 +267,24 @@ struct MoeRunOptions {
  * and counters; they do not alter expert arithmetic or dispatch selection.
  */
 void flush_metal_expert_cache();
+// Per-blob wrapper eviction (K3_EXPERT_RETAIN graveyard): drops the cached
+// no-copy MTLBuffer for each span pointer instead of flushing the whole
+// cache. Safe while CBs are in flight: command buffers hold their own
+// retained references; the drop releases only the cache's reference.
+void drop_metal_expert_blobs(const std::uint8_t* const* blobs,
+                             std::uint64_t count);
 [[nodiscard]] MetalExpertCacheStats metal_expert_cache_stats();
+
+/*
+ * Env opt-in (K3_ROUTE_ASYNC=1, default off, read once): reorder the T=1 MPS
+ * prepare schedule so the route-materialization host boundary drains only the
+ * ops the route depends on. The router chain's committed prefix executes on
+ * the GPU while the host encodes the router tail, and the routed_down GEMV is
+ * queued after the route boundary so its execution overlaps Rust's expert
+ * I/O. Tensor values are unchanged: every op keeps its exact inputs; only the
+ * encode/commit order moves.
+ */
+[[nodiscard]] bool moe_route_async_enabled() noexcept;
 
 /*
  * The split mirrors the Rust reader boundary: prepare routes and routed input,
@@ -296,6 +323,14 @@ void flush_metal_expert_cache();
     std::span<const PreparedMoeT1* const> prepared_rows,
     const CanonicalExpertPositionTileT1& experts,
     const MoeRunOptions& options);
+
+/* Route-edge-ordered expert blob pointers for the loop CB_tail path
+ * (either canonical storage form); validates the route like the stock
+ * dispatch does. */
+[[nodiscard]] std::array<const std::uint8_t*, kMoeRouteTopK>
+loop_route_ordered_expert_blobs(const MoeRouteT1& route,
+                                const CanonicalExpertPositionTileT1& experts,
+                                const MoeGeometry& geometry);
 
 /* Exact backend selection probe used only by TargetSequenceTape to decide
  * whether its T>1 transaction should establish whole-layer host staging. */

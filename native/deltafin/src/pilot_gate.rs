@@ -43,13 +43,29 @@ pub(crate) struct ExpertPrefetchPlan {
     expert_ids: [u16; PILOT_MAX_PREFETCH],
 }
 
+/// Speculative plans narrower than the authoritative top-16 are legitimate
+/// exactly when the true-route top-up guarantees the balance of the layer's
+/// experts still gets prefetched at mailbox-open time: K3_TRUE_ROUTE_TOPUP=1
+/// lowers the accepted floor to one expert, otherwise the historical top-16
+/// floor keeps the legacy schedule byte-identical.
+pub(crate) fn prefetch_plan_floor() -> usize {
+    static FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        if std::env::var("K3_TRUE_ROUTE_TOPUP").is_ok_and(|value| value == "1") {
+            1
+        } else {
+            ROUTE_TOP_K
+        }
+    })
+}
+
 impl ExpertPrefetchPlan {
     /// Accepts only canonical plans: a routed target layer and an ascending,
     /// duplicate-free ID set within the prefetch bounds. Malformed input is a
     /// skipped prediction, never an error.
     pub(crate) fn new(target_layer: u32, expert_ids: &[u16]) -> Option<Self> {
         if !(1..K3_LAYER_COUNT as u32).contains(&target_layer)
-            || !(ROUTE_TOP_K..=PILOT_MAX_PREFETCH).contains(&expert_ids.len())
+            || !(prefetch_plan_floor()..=PILOT_MAX_PREFETCH).contains(&expert_ids.len())
             || expert_ids
                 .iter()
                 .any(|&expert| expert as usize >= K3_ROUTED_EXPERTS)
@@ -122,6 +138,16 @@ impl PreferredPredictor {
 struct LayerGateState {
     pilot: PredictorScore,
     prev_token: PredictorScore,
+    /// Hit rate of the UNION of this pass's pilot prediction with the
+    /// previous token's authoritative routes. Measure-only: it never selects
+    /// a predictor and never changes a read. It exists to price a re-ranked
+    /// pilot — one that uses the previous token's route as a PRIOR inside the
+    /// existing 16-slot budget, rather than widening the budget (widening was
+    /// measured -8.9% at topk 24 and -16.5% at 32 on 2026-08-25, because the
+    /// extra speculative reads displace demand reads). `union - pilot` is the
+    /// share of the pilot's ~38% misses that such a prior could recover, and
+    /// therefore the ceiling on the whole idea.
+    union: PredictorScore,
     /// The most recent position's authoritative routing, ascending: the
     /// "previous token's routing" predictor for this layer's next pass.
     prev_routes: Option<[u16; ROUTE_TOP_K]>,
@@ -176,6 +202,9 @@ pub struct PilotGateLayerReport {
     pub pilot_samples: u32,
     pub prev_token_ema: f32,
     pub prev_token_samples: u32,
+    /// Measure-only: hit rate of pilot ∪ previous-token. See LayerGateState.
+    pub union_ema: f32,
+    pub union_samples: u32,
     pub preferred: PreferredPredictor,
     pub reads_suppressed: bool,
 }
@@ -241,9 +270,22 @@ impl PilotGate {
             .as_ref()
             .map(|pilot| expert_bitset(&pilot.expert_ids[..pilot.expert_count as usize]));
         let prev_set = state.prev_routes.as_ref().map(|routes| expert_bitset(routes));
+        // Union is only meaningful when BOTH predictors have something to say
+        // this pass; scoring it against a half-populated union would flatter it.
+        let union_set = match (&pilot_set, &prev_set) {
+            (Some(pilot), Some(prev)) => {
+                let mut merged = *pilot;
+                for (word, prev_word) in merged.iter_mut().zip(prev.iter()) {
+                    *word |= *prev_word;
+                }
+                Some(merged)
+            }
+            _ => None,
+        };
         let mut row_count = 0_u32;
         let mut pilot_hits = 0_u32;
         let mut prev_hits = 0_u32;
+        let mut union_hits = 0_u32;
         let mut newest_row = None;
         for row in rows {
             row_count = row_count.saturating_add(1);
@@ -252,6 +294,9 @@ impl PilotGate {
             }
             if let Some(set) = &prev_set {
                 prev_hits += count_hits(set, row);
+            }
+            if let Some(set) = &union_set {
+                union_hits += count_hits(set, row);
             }
             newest_row = Some(*row);
         }
@@ -264,6 +309,9 @@ impl PilotGate {
         }
         if prev_set.is_some() {
             state.prev_token.absorb(prev_hits as f32 / slots);
+        }
+        if union_set.is_some() {
+            state.union.absorb(union_hits as f32 / slots);
         }
         let mut routes = newest_row;
         routes.sort_unstable();
@@ -377,6 +425,8 @@ impl PilotGate {
                     pilot_samples: state.pilot.samples,
                     prev_token_ema: state.prev_token.ema,
                     prev_token_samples: state.prev_token.samples,
+                    union_ema: state.union.ema,
+                    union_samples: state.union.samples,
                     preferred: state.preferred(self.warmup),
                     reads_suppressed: state.reads_suppressed,
                 })

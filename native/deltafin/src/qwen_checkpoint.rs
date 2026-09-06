@@ -150,21 +150,52 @@ pub struct QwenCheckpoint {
     root: PathBuf,
     path: PathBuf,
     file: File,
+    /// false when the directory came from K3_QWEN_PROBE_DIR / K3_QWEN_WIDE_DIR:
+    /// the Base artifact's byte pins (size, header length, SHA-256) do not
+    /// apply; structure, identity and architecture checks still do.
+    pinned: bool,
     identity: FileIdentity,
     tensors: Box<[QwenTensor]>,
 }
 
 impl QwenCheckpoint {
     pub fn open(model_root: &Path, variant: QwenVariant) -> Result<Self> {
-        let root = model_root.join(variant.directory());
-        validate_config(&root.join("config.json"), variant)?;
+        // K3_QWEN_PROBE_DIR / K3_QWEN_WIDE_DIR (2026-09-06): another checkpoint
+        // directory under the model root for the same architecture (e.g. the
+        // post-trained Qwen3-0.6B beside the pinned Base). The architecture
+        // (config.json) and the tensor header are still validated; only the
+        // exact byte-size and header-length pins of the Base files are waived.
+        let override_dir = std::env::var(match variant {
+            QwenVariant::Probe06B => "K3_QWEN_PROBE_DIR",
+            QwenVariant::Wide17B => "K3_QWEN_WIDE_DIR",
+        })
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+        let pinned = override_dir.is_none();
+        let root = match &override_dir {
+            Some(dir) if dir.starts_with('/') => PathBuf::from(dir),
+            Some(dir) => model_root.join(dir),
+            None => model_root.join(variant.directory()),
+        };
+        if let Some(dir) = &override_dir {
+            eprintln!("[native] qwen: {:?} checkpoint directory overridden -> {dir}", variant);
+        }
+        validate_config(&root.join("config.json"), variant, pinned)?;
         let path = root.join("model.safetensors");
-        let (mut file, identity) = open_regular(&path, variant.checkpoint_bytes())?;
+        let expected_bytes = if pinned {
+            variant.checkpoint_bytes()
+        } else {
+            std::fs::metadata(&path)
+                .map_err(|error| io_error("stat Qwen safetensors", &path, error))?
+                .len()
+        };
+        let (mut file, identity) = open_regular(&path, expected_bytes)?;
         let mut prefix = [0_u8; 8];
         file.read_exact(&mut prefix)
             .map_err(|error| io_error("read Qwen safetensors prefix", &path, error))?;
         let header_bytes = u64::from_le_bytes(prefix);
-        if header_bytes != variant.header_bytes() || header_bytes > MAX_HEADER_BYTES {
+        if (pinned && header_bytes != variant.header_bytes()) || header_bytes > MAX_HEADER_BYTES {
             return Err(DeltafinError::new(format!(
                 "Qwen safetensors header length {header_bytes} differs from its pin"
             )));
@@ -181,6 +212,7 @@ impl QwenCheckpoint {
             file,
             identity,
             tensors: tensors.into_boxed_slice(),
+            pinned,
         })
     }
 
@@ -212,6 +244,14 @@ impl QwenCheckpoint {
         let actual = digest_open_file(&self.file, &self.path)
             .map_err(|error| DeltafinError::new(error.to_string()))?;
         self.validate_live_identity()?;
+        if !self.pinned {
+            eprintln!(
+                "[native] qwen: {:?} checkpoint is an override directory; SHA-256 {} accepted unpinned",
+                self.variant,
+                actual.iter().map(|b| format!("{b:02x}")).collect::<String>().get(..16).unwrap_or("")
+            );
+            return Ok(());
+        }
         if actual != digest_from_hex(self.variant.checkpoint_digest())? {
             return Err(DeltafinError::new(
                 "Qwen checkpoint SHA-256 does not match the pinned inert artifact",
@@ -221,13 +261,23 @@ impl QwenCheckpoint {
     }
 }
 
-fn validate_config(path: &Path, variant: QwenVariant) -> Result<()> {
-    let (mut file, identity) = open_regular(path, CONFIG_BYTES)?;
-    let mut raw = Vec::with_capacity(CONFIG_BYTES as usize);
+fn validate_config(path: &Path, variant: QwenVariant, pinned: bool) -> Result<()> {
+    // `pinned == false` (K3_QWEN_*_DIR override): the exact byte-size and
+    // SHA-256 pins of the Base config are waived; every structural check
+    // below (architecture fields, tied embeddings, no remote code) still runs.
+    let expected_bytes = if pinned {
+        CONFIG_BYTES
+    } else {
+        std::fs::metadata(path)
+            .map_err(|error| io_error("stat Qwen config", path, error))?
+            .len()
+    };
+    let (mut file, identity) = open_regular(path, expected_bytes)?;
+    let mut raw = Vec::with_capacity(expected_bytes as usize);
     file.read_to_end(&mut raw)
         .map_err(|error| io_error("read Qwen config", path, error))?;
     identity.validate(&file, path)?;
-    if digest_bytes(&raw) != digest_from_hex(variant.config_digest())? {
+    if pinned && digest_bytes(&raw) != digest_from_hex(variant.config_digest())? {
         return Err(DeltafinError::new("Qwen config does not match its pin"));
     }
     let document = strict_json(&raw, "Qwen config")?;

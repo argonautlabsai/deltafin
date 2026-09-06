@@ -1,0 +1,146 @@
+#ifndef DELTAFIN_PROVIDER_MLA_ATTN_CORE_METALH
+#define DELTAFIN_PROVIDER_MLA_ATTN_CORE_METALH
+
+/*
+ * Shared source for the fused MLA decode attention core (T=1).
+ *
+ * Included by BOTH provider_mla_attn_metal.metal (the standalone ATen-path
+ * library) and provider_loop_kernels.metal (the bespoke decode loop), so the
+ * two can never silently diverge. Each metallib is its own symbol space, so
+ * the identical kernel names coexist.
+ *
+ * IEEE CONTRACT: both including sources must compile with -fno-fast-math —
+ * the fp32 accumulation, precise::exp() calls and -INFINITY sentinels depend
+ * on it. deltafin-native-build/src/lib.rs names both stems explicitly.
+ */
+
+struct DeltafinMlaAttnDimsV1 {
+  uint kv_length;   // S: committed prefix + the staged token
+  uint capacity;    // slab position pitch (key stride(1) / 192)
+  uint partitions;  // P flash-decoding partitions per head
+  uint chunk;       // ceil(S / P)
+  float scale;      // 192^-0.5
+  uint reserved0;
+  uint reserved1;
+  uint reserved2;
+};
+
+// partial record per (head, partition): [0:128) unnormalized accumulator,
+// [128] running max m, [129] running sum l, [130:132) padding.
+constant uint kDeltafinMlaAttnPartialStride = 132;
+
+// 256 threads = 8 simdgroups per threadgroup; grid is 96*P threadgroups.
+kernel void deltafin_mla_attn_part_f32_v1(
+    device const float* q [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* partials [[buffer(3)]],
+    constant DeltafinMlaAttnDimsV1& dims [[buffer(4)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint nsg [[simdgroups_per_threadgroup]]) {
+  const uint head = tg / dims.partitions;
+  const uint part = tg % dims.partitions;
+  const uint t0 = part * dims.chunk;
+  const uint t1 = min(dims.kv_length, t0 + dims.chunk);
+
+  device const float* qh = q + head * 192;
+  const float4 qn = float4(qh[lane * 4 + 0], qh[lane * 4 + 1],
+                           qh[lane * 4 + 2], qh[lane * 4 + 3]);
+  const float2 qr = float2(qh[128 + lane * 2], qh[128 + lane * 2 + 1]);
+
+  device const float* kh = keys + (ulong)head * dims.capacity * 192;
+  device const float* vh = values + (ulong)head * dims.capacity * 128;
+
+  float m = -INFINITY, l = 0.0f;
+  float4 acc = float4(0.0f);
+  for (uint t = t0 + sg; t < t1; t += nsg) {
+    device const float* kr = kh + (ulong)t * 192;
+    const float4 kn = float4(kr[lane * 4 + 0], kr[lane * 4 + 1],
+                             kr[lane * 4 + 2], kr[lane * 4 + 3]);
+    const float2 k2 = float2(kr[128 + lane * 2], kr[128 + lane * 2 + 1]);
+    const float pd = dot(kn, qn) + dot(k2, qr);
+    const float s = simd_sum(pd) * dims.scale;
+    const float m_new = max(m, s);
+    const float c = precise::exp(m - m_new);  // exp(-inf - finite) = 0 first hit
+    const float p = precise::exp(s - m_new);
+    device const float* vr = vh + (ulong)t * 128;
+    acc = acc * c + p * float4(vr[lane * 4 + 0], vr[lane * 4 + 1],
+                               vr[lane * 4 + 2], vr[lane * 4 + 3]);
+    l = l * c + p;
+    m = m_new;
+  }
+
+  // merge the (up to 8) simdgroups of this threadgroup
+  threadgroup float tg_m[8];
+  threadgroup float tg_l[8];
+  threadgroup float tg_acc[8][128];
+  if (lane == 0) {
+    tg_m[sg] = m;
+    tg_l[sg] = l;
+  }
+  tg_acc[sg][lane * 4 + 0] = acc.x;
+  tg_acc[sg][lane * 4 + 1] = acc.y;
+  tg_acc[sg][lane * 4 + 2] = acc.z;
+  tg_acc[sg][lane * 4 + 3] = acc.w;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    float M = -INFINITY;
+    for (uint g = 0; g < nsg; ++g) M = max(M, tg_m[g]);
+    float4 a = float4(0.0f);
+    float L = 0.0f;
+    if (M > -INFINITY) {  // guard: fully-empty partition stays (-inf, 0, 0)
+      for (uint g = 0; g < nsg; ++g) {
+        const float c = (tg_m[g] > -INFINITY) ? precise::exp(tg_m[g] - M) : 0.0f;
+        L += c * tg_l[g];
+        a += c * float4(tg_acc[g][lane * 4 + 0], tg_acc[g][lane * 4 + 1],
+                        tg_acc[g][lane * 4 + 2], tg_acc[g][lane * 4 + 3]);
+      }
+    }
+    device float* dst = partials +
+        ((ulong)head * dims.partitions + part) * kDeltafinMlaAttnPartialStride;
+    dst[lane * 4 + 0] = a.x;
+    dst[lane * 4 + 1] = a.y;
+    dst[lane * 4 + 2] = a.z;
+    dst[lane * 4 + 3] = a.w;
+    if (lane == 0) {
+      dst[128] = M;
+      dst[129] = L;
+    }
+  }
+}
+
+// one threadgroup (32 threads) per head: merge P partials, normalize, store
+// out[head*128 + d] — the head-major pre-gate [1,1,12288] row.
+kernel void deltafin_mla_attn_combine_f32_v1(
+    device const float* partials [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant DeltafinMlaAttnDimsV1& dims [[buffer(2)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  device const float* ph = partials +
+      (ulong)tg * dims.partitions * kDeltafinMlaAttnPartialStride;
+  float M = -INFINITY;
+  for (uint p = 0; p < dims.partitions; ++p) {
+    M = max(M, ph[p * kDeltafinMlaAttnPartialStride + 128]);
+  }
+  float4 a = float4(0.0f);
+  float L = 0.0f;
+  for (uint p = 0; p < dims.partitions; ++p) {
+    const float mp = ph[p * kDeltafinMlaAttnPartialStride + 128];
+    const float c = (mp > -INFINITY) ? precise::exp(mp - M) : 0.0f;
+    L += c * ph[p * kDeltafinMlaAttnPartialStride + 129];
+    device const float* pa = ph + p * kDeltafinMlaAttnPartialStride;
+    a += c * float4(pa[lane * 4 + 0], pa[lane * 4 + 1], pa[lane * 4 + 2],
+                    pa[lane * 4 + 3]);
+  }
+  const float invL = 1.0f / L;
+  device float* dst = out + (ulong)tg * 128;
+  dst[lane * 4 + 0] = a.x * invL;
+  dst[lane * 4 + 1] = a.y * invL;
+  dst[lane * 4 + 2] = a.z * invL;
+  dst[lane * 4 + 3] = a.w * invL;
+}
+
+#endif

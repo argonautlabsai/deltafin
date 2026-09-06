@@ -161,6 +161,38 @@ pub struct ResidencySelection {
 /// layer `i` (including expanded scales/storage, not merely its file size).
 /// Zero is treated as unknown and stops the prefix rather than granting a free
 /// layer.  All arithmetic saturates toward fewer resident layers.
+/// Growth-admission variant (local patch a7512b5, scoped 2026-08-26): the
+/// requested `fixed` bytes are credited back into host availability, which
+/// algebraically reduces admission to a watermark check (available >=
+/// reserve, and request <= total - reserve). Sound ONLY for the live
+/// context-growth site: its requests are hundreds of MiB against a
+/// dedicated K3_HOST_RESERVE_GB floor, and the pre-credit formula refused
+/// all post-startup growth on 128 GiB hosts running full K3. Every other
+/// caller keeps the documented FixedCosts contract (post-snapshot planned
+/// allocations, charged against availability) via select_resident_prefix —
+/// the blanket credit let load-time clamps admit allocations that left
+/// free memory below the reserve floor (found by the
+/// provider_prefix_control test, 2026-08-26).
+pub fn select_resident_prefix_crediting_request(
+    host: HostMemory,
+    provider: ProviderMemory,
+    provider_layer_bytes: &[u64],
+    fixed: FixedCosts,
+    request: ResidencyOverride,
+    policy: ResidencyPolicy,
+) -> ResidencySelection {
+    let committed = fixed.host_bytes.saturating_add(fixed.provider_bytes);
+    select_resident_prefix_with_envelope_credit(
+        host,
+        provider,
+        provider_layer_bytes,
+        fixed,
+        request,
+        policy,
+        committed,
+    )
+}
+
 pub fn select_resident_prefix(
     host: HostMemory,
     provider: ProviderMemory,
@@ -168,6 +200,27 @@ pub fn select_resident_prefix(
     fixed: FixedCosts,
     request: ResidencyOverride,
     policy: ResidencyPolicy,
+) -> ResidencySelection {
+    select_resident_prefix_with_envelope_credit(
+        host,
+        provider,
+        provider_layer_bytes,
+        fixed,
+        request,
+        policy,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_resident_prefix_with_envelope_credit(
+    host: HostMemory,
+    provider: ProviderMemory,
+    provider_layer_bytes: &[u64],
+    fixed: FixedCosts,
+    request: ResidencyOverride,
+    policy: ResidencyPolicy,
+    credited: u64,
 ) -> ResidencySelection {
     if policy.host_reserve_permille > 1_000
         || policy.device_reserve_permille > 1_000
@@ -180,7 +233,7 @@ pub fn select_resident_prefix(
             request_requests_residency(request),
         );
     }
-    let host_envelope = safe_host_envelope(host, policy);
+    let host_envelope = safe_host_envelope_with_committed(host, policy, credited);
     let provider_envelope = safe_provider_envelope(provider, policy);
 
     let Some(host_limit) = host_envelope else {
@@ -389,6 +442,14 @@ fn request_requests_residency(request: ResidencyOverride) -> bool {
 }
 
 fn safe_host_envelope(host: HostMemory, policy: ResidencyPolicy) -> Option<u64> {
+    safe_host_envelope_with_committed(host, policy, 0)
+}
+
+fn safe_host_envelope_with_committed(
+    host: HostMemory,
+    policy: ResidencyPolicy,
+    committed: u64,
+) -> Option<u64> {
     let total = host.effective_total_bytes()?;
     let available = host.effective_available_bytes()?;
     let reserve = reserve(
@@ -397,9 +458,11 @@ fn safe_host_envelope(host: HostMemory, policy: ResidencyPolicy) -> Option<u64> 
         policy.host_reserve_permille,
     )?;
     Some(
-        total
-            .saturating_sub(reserve)
-            .min(available.saturating_sub(reserve)),
+        total.saturating_sub(reserve).min(
+            available
+                .saturating_add(committed)
+                .saturating_sub(reserve),
+        ),
     )
 }
 

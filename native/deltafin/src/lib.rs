@@ -86,6 +86,8 @@ pub mod qwen_provider;
 #[cfg(feature = "runtime")]
 pub mod residency;
 #[cfg(feature = "runtime")]
+mod route_oracle;
+#[cfg(feature = "runtime")]
 mod router_trace;
 #[cfg(feature = "runtime")]
 pub mod routing;

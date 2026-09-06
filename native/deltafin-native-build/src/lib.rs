@@ -81,6 +81,12 @@ pub const PRODUCTION_PROVIDER_SOURCES: &[&str] = &[
     "native/provider_gate/provider_kda_batch.cpp",
     "native/provider_gate/provider_mla.h",
     "native/provider_gate/provider_mla.cpp",
+    "native/provider_gate/provider_mla_attn_metal.h",
+    "native/provider_gate/provider_mla_attn_metal.mm",
+    "native/provider_gate/provider_mla_attn_metal.metal",
+    "native/provider_gate/provider_loop.h",
+    "native/provider_gate/provider_loop.mm",
+    "native/provider_gate/provider_loop_kernels.metal",
     "native/provider_gate/provider_pilot.h",
     "native/provider_gate/provider_pilot.cpp",
     "native/provider_gate/provider_cuda_moe.h",
@@ -103,6 +109,7 @@ pub const PRODUCTION_PROVIDER_SOURCES: &[&str] = &[
     "native/provider_gate/provider_spine_int8_metal.metal",
     "native/provider_gate/provider_spine_debug.h",
     "native/provider_gate/provider_precision.h",
+    "native/provider_gate/provider_prep_timer.h",
     "native/provider_gate/provider_target.h",
     "native/provider_gate/provider_target.cpp",
     "native/provider_gate/provider_target_sequence.h",
@@ -266,6 +273,32 @@ const PROVIDER_GATE_CASES: &[NativeTestCase] = &[
         platform: NativeTestPlatform::Macos,
         arguments: &["--device", "mps", "--kda-tape"],
         environment: &[],
+    },
+];
+
+/// Exercises the bespoke decode-loop scaffold's env gate as three fresh
+/// process invocations of the same binary, so the sticky one-shot canary
+/// static resolves independently in each: unset and explicit "0" must both
+/// take the closed (default no-op) branch, "1" must take the qualification
+/// branch.
+const BESPOKE_LOOP_CASES: &[NativeTestCase] = &[
+    NativeTestCase {
+        name: "default-off",
+        platform: NativeTestPlatform::Macos,
+        arguments: &[],
+        environment: &[],
+    },
+    NativeTestCase {
+        name: "explicit-off",
+        platform: NativeTestPlatform::Macos,
+        arguments: &[],
+        environment: &[("K3_BESPOKE_LOOP", "0")],
+    },
+    NativeTestCase {
+        name: "enabled",
+        platform: NativeTestPlatform::Macos,
+        arguments: &[],
+        environment: &[("K3_BESPOKE_LOOP", "1")],
     },
 ];
 
@@ -483,6 +516,26 @@ pub const NATIVE_TEST_SPECS: &[NativeTestSpec] = &[
         provider: ProviderFlavor::Production,
         cases: DEFAULT_CASES,
         pass_marker: "provider_spine_int8_metal.mps=PASS",
+        timeout_seconds: 300,
+    },
+    NativeTestSpec {
+        name: "mla-attn-metal",
+        platform: NativeTestPlatform::Macos,
+        main_source: "native/provider_gate/provider_mla_attn_metal_test.mm",
+        extra_sources: &[],
+        provider: ProviderFlavor::Production,
+        cases: DEFAULT_CASES,
+        pass_marker: "provider_mla_attn_metal.mps=PASS",
+        timeout_seconds: 600,
+    },
+    NativeTestSpec {
+        name: "loop-encoder",
+        platform: NativeTestPlatform::Macos,
+        main_source: "native/provider_gate/provider_loop_test.mm",
+        extra_sources: &[],
+        provider: ProviderFlavor::Production,
+        cases: BESPOKE_LOOP_CASES,
+        pass_marker: "provider_loop.mps=PASS",
         timeout_seconds: 300,
     },
     NativeTestSpec {
@@ -997,6 +1050,8 @@ fn build_provider_artifacts(
             "DELTAFIN_HAVE_MPS_ROUTE_MAILBOX_V1=1",
             "DELTAFIN_HAVE_SPINE_BF16_METAL_V1=1",
             "DELTAFIN_HAVE_SPINE_INT8_METAL_V1=1",
+            "DELTAFIN_HAVE_MLA_ATTN_METAL_V1=1",
+            "DELTAFIN_HAVE_BESPOKE_LOOP_V1=1",
             "DELTAFIN_HAVE_PRECOMPILED_METAL_LIBRARIES_V1=1",
         ]);
     } else {
@@ -1056,6 +1111,14 @@ fn build_provider_artifacts(
             (
                 provider_source.join("provider_spine_int8_metal.mm"),
                 native_build.join("provider_spine_int8_metal.o"),
+            ),
+            (
+                provider_source.join("provider_mla_attn_metal.mm"),
+                native_build.join("provider_mla_attn_metal.o"),
+            ),
+            (
+                provider_source.join("provider_loop.mm"),
+                native_build.join("provider_loop.o"),
             ),
             (
                 repository.join("tools/metal_moe.mm"),
@@ -2307,6 +2370,22 @@ fn build_embedded_metal_libraries(
             "DELTAFIN_EMBEDDED_SPINE_INT8_METAL_METALLIB_H",
             "kDeltafinEmbeddedSpineInt8MetalMetallib",
         ),
+        (
+            "MLA fused attention",
+            provider_source.join("provider_mla_attn_metal.metal"),
+            "provider_mla_attn_metal",
+            "deltafin_embedded_mla_attn_metal_metallib.h",
+            "DELTAFIN_EMBEDDED_MLA_ATTN_METAL_METALLIB_H",
+            "kDeltafinEmbeddedMlaAttnMetalMetallib",
+        ),
+        (
+            "bespoke decode-loop scaffold",
+            provider_source.join("provider_loop_kernels.metal"),
+            "provider_loop_kernels",
+            "deltafin_embedded_loop_kernels_metallib.h",
+            "DELTAFIN_EMBEDDED_LOOP_KERNELS_METALLIB_H",
+            "kDeltafinEmbeddedLoopKernelsMetallib",
+        ),
     ] {
         let air = native_build.join(format!("{stem}.air"));
         let library = native_build.join(format!("{stem}.metallib"));
@@ -2326,7 +2405,18 @@ fn build_embedded_metal_libraries(
         // assumptions and reassociation), which is not a valid implementation
         // of that contract. Keep this source-specific: the established expert
         // and mailbox libraries retain their independently qualified flags.
-        if stem == "provider_spine_bf16_metal" || stem == "provider_spine_int8_metal" {
+        // The MLA fused-attention kernel likewise promises IEEE fp32
+        // accumulation/softmax with -INFINITY sentinels and carries no
+        // transcendental-guard macros, so it must not compile under
+        // fast-math either. The bespoke decode-loop scaffold's canary
+        // kernels are deliberately trivial today, but they exist to qualify
+        // the exact-contract plumbing the real fused kernels land on in
+        // later worklist steps, so they hold the same policy from day one.
+        if stem == "provider_spine_bf16_metal"
+            || stem == "provider_spine_int8_metal"
+            || stem == "provider_mla_attn_metal"
+            || stem == "provider_loop_kernels"
+        {
             compile.arg("-fno-fast-math");
         }
         compile
@@ -2379,6 +2469,29 @@ fn discover_metal_toolchain(guard: &PythonGuard) -> MetalToolchain {
             guard,
         ) {
             return toolchain;
+        }
+    }
+
+    // Local build fix: hosts whose xcode-select still points at Command Line
+    // Tools cannot run /usr/bin/xcodebuild below without root. The downloaded
+    // MetalToolchain component is mounted as a root-owned read-only cryptex;
+    // probe that mount directly with the same validation the xcodebuild JSON
+    // branch applies to its reported toolchainSearchPath.
+    if let Ok(entries) = fs::read_dir("/private/var/run/com.apple.security.cryptexd/mnt") {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("com.apple.MobileAsset.MetalToolchain-")
+            {
+                if let Some(toolchain) = metal_toolchain_under(
+                    &entry.path().join("Metal.xctoolchain"),
+                    "mounted Apple MetalToolchain component",
+                    guard,
+                ) {
+                    return toolchain;
+                }
+            }
         }
     }
 
@@ -3647,7 +3760,9 @@ fn sanitize_native_environment(command: &mut Command) {
         "NVCC_APPEND_FLAGS",
         "CUDAHOSTCXX",
         "CLANG_MODULE_CACHE_PATH",
-        "DEVELOPER_DIR",
+        // Local build fix: DEVELOPER_DIR is deliberately preserved so hosts
+        // whose xcode-select points at Command Line Tools (switching requires
+        // root) can direct the /usr/bin shims at full Xcode's toolchain.
         "SDKROOT",
         "TOOLCHAINS",
     ] {

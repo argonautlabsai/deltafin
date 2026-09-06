@@ -98,6 +98,7 @@ struct MlaExecutionTrace {
 };
 
 struct MlaPreparedDecode;
+struct MlaDecodeShell;
 class MlaCacheTransaction;
 
 enum class MlaCacheRepresentation : std::uint32_t {
@@ -200,6 +201,9 @@ class MlaCache {
       MlaExecutionTrace*);
   friend void commit_mla_decode(MlaCache&, MlaPreparedDecode&);
   friend void cancel_mla_decode(MlaCache&, MlaPreparedDecode&);
+  friend struct MlaDecodeShell;
+  friend MlaDecodeShell prepare_k3_mla_decode_shell(const at::Tensor&,
+                                                    MlaCache&);
   friend class MlaCacheTransaction;
 
   MlaShape shape_;
@@ -286,6 +290,27 @@ struct MlaPreparedDecode {
     bool allow_exact_query_alias = true,
     const MlaInputBundle* input_bundle = nullptr);
 
+/*
+ * K3_MLA_LOOP=on (Step 3 takeover): cache bookkeeping WITHOUT compute.
+ * Takes the pending nonce, decides growth (allocating + prefix-copying a
+ * grown slab exactly like the full prepare), and assembles the ticket —
+ * but stages no row and leaves prepared.output undefined. The loop chain
+ * then writes the new K/V row into row `expected_length` of key_states/
+ * value_states (views over the CHOSEN storage including the staging slot,
+ * [1,96,next_length,width]) and the caller sets prepared.output before
+ * commit_mla_decode. On failure the caller must cancel_mla_decode so the
+ * stock prepare can retake the nonce; an uncommitted staged row is
+ * scratch by contract, so a fallback after a partial GPU write is safe.
+ * ExpandedExact + exact-K3 + T=1 only.
+ */
+struct MlaDecodeShell {
+  MlaPreparedDecode prepared;
+  at::Tensor key_states;
+  at::Tensor value_states;
+};
+[[nodiscard]] MlaDecodeShell prepare_k3_mla_decode_shell(
+    const at::Tensor& hidden, MlaCache& cache);
+
 // Multi-position causal entry used by prefill and speculative verification.
 // Hidden is fp32 [1,T,hidden], 1 <= T <= remaining context.  ExpandedExact
 // ignores absorbed_key_value; CompactLatentF32 requires a validated bind-time
@@ -320,6 +345,13 @@ struct MlaPreparedDecode {
 // CompactLatentF32 is an algebraic research implementation: moving kv_b
 // across the score/value contractions changes fp32 reduction order, so merely
 // retaining fp32 cache rows does not make its output bit-exact to K3.
+//
+// One reviewed exception to LibTorch-tape bit-identity exists: with the
+// explicit env opt-in K3_MLA_METAL_ATTENTION=1 (default off) the exact-K3
+// expanded T=1 MPS attention core runs the fused Metal kernel
+// (provider_mla_attn_metal.h), which computes the same expanded math on the
+// same fp32 slabs but reassociates fp32 reductions.  The layout, the cache
+// transaction contract, and every other stage remain unchanged.
 [[nodiscard]] MlaPreparedDecode prepare_k3_mla_positions(
     const at::Tensor& hidden, const MlaWeights& weights, MlaCache& cache,
     const MlaAbsorbedKeyValue* absorbed_key_value,

@@ -174,13 +174,15 @@ void accelerator_arena_sequence(const std::uint32_t device) {
           session, 0, 1, 41, 13);
   require_all_bf16_encodings(first, 41, 1);
 
-  expect_failure(
-      [&] {
-        static_cast<void>(
-            deltafin::provider_internal::spine_fp32_execution_debug(
-                session, 0, 1, 41, 13));
-      },
-      "same-layer BF16 arena overwrite");
+  // Step 6 contract: a same-owner same-layer same-generation re-request is
+  // an idempotent hit publishing the SAME views (pre-commit orchestration
+  // materializes one layer early; the ordinary prepare then asks again).
+  const auto repeat =
+      deltafin::provider_internal::spine_fp32_execution_debug(
+          session, 0, 1, 41, 13);
+  require_all_bf16_encodings(repeat, 41, 1);
+  require(repeat.storage_identity == first.storage_identity,
+          "same-layer idempotent hit did not reuse the BF16 arena storage");
 
   BoundMatrix next = make_matrix(13, 4, 8);
   constexpr std::array<std::uint16_t, 8> finite_bits{

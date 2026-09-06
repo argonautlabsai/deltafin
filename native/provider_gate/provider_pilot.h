@@ -15,6 +15,22 @@ namespace deltafin::provider_internal {
 
 constexpr std::size_t kPilotTopK = kMoeRouteTopK;
 constexpr std::size_t kPilotMaxPrefetch = 2 * kPilotTopK;
+/* Sentinel target layer meaning "no previous-token prior available". */
+constexpr std::uint32_t kPilotPriorNoLayer = 0xFFFFFFFFU;
+/* Prior store bound; routed layers are 1..92. */
+constexpr std::size_t kPilotPriorMaxLayers = 128;
+
+/*
+ * Runtime prediction width: how many candidates the pilot's topk emits per
+ * position. Default kPilotTopK (upstream behavior, byte-identical schedule).
+ * K3_PILOT_TOPK widens it up to kPilotMaxPrefetch so speculative reads carry
+ * a safety margin over the authoritative top-16 route — every consumer (hint
+ * ABI array, Rust ExpertPrefetchPlan 16..=32 bound, 32-slot prefetch arena
+ * generations) already admits the wider set. Read once per process; invalid
+ * or out-of-range values fail closed to the default. Scheduling-only: the
+ * authoritative router still decides every executed expert.
+ */
+[[nodiscard]] std::size_t pilot_topk_width() noexcept;
 
 /*
  * Immutable, session-owned inputs for one next-layer scheduling prediction.
@@ -145,7 +161,38 @@ try_predict_pilot_router_rows(const at::Tensor& lookahead_source,
 [[nodiscard]] CanonicalPilotPrefetchT1 canonicalize_pilot_prefetch_rows(
     std::span<const std::int64_t> expert_ids,
     std::span<const float> choice_scores, std::size_t position_count,
-    std::uint32_t expert_count, std::size_t cap);
+    std::uint32_t expert_count, std::size_t cap,
+    std::uint32_t target_layer = kPilotPriorNoLayer);
+
+/*
+ * K3_PILOT_PRIOR — previous-token routing prior (2026-08-25).
+ *
+ * Measured: the pilot hits 63.0% of the authoritative top-16; the
+ * previous token's routing at the same layer hits 29.4%; their UNION hits
+ * 70.4% (k3-soak-logs pilot-union probe, 92 layers). So +7.4 points of the
+ * pilot's misses are recoverable from a free prior that costs no model
+ * evaluation.
+ *
+ * Crucially this must NOT be spent by widening the read set: K3_PILOT_TOPK
+ * 16->24->32 measured -8.9% and -16.5% on 2026-08-25 because extra
+ * speculative reads displace demand reads on the critical path. Instead run
+ * a WIDE prediction (K3_PILOT_TOPK=32) with a NARROW read cap
+ * (K3_PILOT_CAP=16) and let this prior decide WHICH 16 of the 32 candidates
+ * are read. Identical bytes, better picks.
+ *
+ * `pilot_prior_bonus()` is the additive score bonus (env K3_PILOT_PRIOR,
+ * default 0.0 = disabled = byte-identical schedule). Scores are sigmoid
+ * outputs plus the router's correction bias, so a bonus of ~0.05-0.20
+ * reorders the marginal candidates without displacing confident ones.
+ */
+[[nodiscard]] float pilot_prior_bonus() noexcept;
+
+/* Record a layer's AUTHORITATIVE routing so the next token's prediction for
+ * the same layer can use it as a prior. Decode only (one position); no-op
+ * when the prior is disabled or the layer is out of range. */
+void pilot_prior_record_route(std::uint32_t layer,
+                              const std::uint16_t* experts,
+                              std::size_t count) noexcept;
 
 }  // namespace deltafin::provider_internal
 

@@ -1,12 +1,17 @@
 #include "provider_moe.h"
 
 #include "provider_cuda_moe.h"
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+#include "provider_loop.h"
+#include "provider_prep_timer.h"
+#endif
 #include "../../tools/metal_moe_abi.h"
 
 #if defined(__APPLE__) && defined(DELTAFIN_HAVE_MPS_ROUTE_MAILBOX_V1)
 #include "provider_route_mailbox.h"
 #endif
 
+#include <atomic>
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/add.h>
 #include <ATen/ops/cat.h>
@@ -27,6 +32,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -504,6 +510,7 @@ at::Tensor materialize_row_int8(const MoeRowInt8Matrix& matrix) {
                  matrix.row_scales.unsqueeze(1));
 }
 
+
 at::Tensor row_int8_linear(const at::Tensor& input,
                            const MoeRowInt8Matrix& matrix,
                            const bool packed_int8_qualified) {
@@ -511,6 +518,8 @@ at::Tensor row_int8_linear(const at::Tensor& input,
     // Qualification happens once at session/device admission. A provider that
     // later rejects this exact call must fail the layer transaction; silently
     // changing arithmetic after routing would make diagnosis impossible.
+    deltafin::provider_internal::loop_residency_register_tensor(matrix.quantized);
+    deltafin::provider_internal::loop_residency_register_tensor(matrix.row_scales);
     return at::_weight_int8pack_mm(input, matrix.quantized,
                                    matrix.row_scales);
   }
@@ -612,8 +621,15 @@ MoeRouteT1 materialize_route_t1(const at::Tensor& expert_ids,
 
   // Authoritative fallback on CPU, CUDA, non-Apple builds, nonqualifying
   // tensors, and every mailbox setup/runtime failure.
+  // Attention-timer split: a device->host route readback is a host sync
+  // on the MPS stream; reported to the open prepare scope (drain unknown).
+  const std::uint64_t route_sync_started =
+      deltafin::provider_internal::prep_steady_ns();
   const at::Tensor ids_cpu = expert_ids.to(at::kCPU).contiguous();
   const at::Tensor weights_cpu = weights.to(at::kCPU).contiguous();
+  deltafin::provider_internal::prep_note_wait(
+      deltafin::provider_internal::prep_steady_ns() - route_sync_started, 0,
+      false);
   const auto* ids = ids_cpu.const_data_ptr<std::int64_t>();
   const auto* values = weights_cpu.const_data_ptr<float>();
   for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
@@ -673,10 +689,59 @@ std::vector<MoeRouteT1> materialize_route_positions(
    * device-to-host boundary for the entire position set instead of two
    * transfers for every row. Weight bits are copied without conversion.
    */
-  const at::Tensor packed =
-      at::cat({expert_ids.to(at::kFloat), weights}, 1)
-          .to(at::kCPU, at::kFloat)
-          .contiguous();
+  // Attention-timer split: the wide tile's one route readback is the
+  // batched ATen path's host sync; reported to the open prepare scope.
+  const std::uint64_t route_sync_started =
+      deltafin::provider_internal::prep_steady_ns();
+  const std::uint64_t prep_ops_began_ns =
+      deltafin::provider_internal::loop_aten_sync_now_ns();
+  const at::Tensor packed_device =
+      at::cat({expert_ids.to(at::kFloat), weights}, 1);
+  deltafin::provider_internal::loop_aten_sync_note_prep(
+      deltafin::provider_internal::loop_aten_sync_now_ns() - prep_ops_began_ns);
+  // K3_ROUTE_ALIAS=1: read the packed route through the unified-memory
+  // alias (commit-and-wait drain, no blit, no CPU tensor allocation).
+  // K3_ROUTE_SYNC_TWICE=1: diagnostic — time a second, redundant host copy
+  // of the same device tensor right after the first (nothing pending on the
+  // GPU by then), reported as `second=` in [aten-sync].
+  static const bool route_alias = [] {
+    const char* value = std::getenv("K3_ROUTE_ALIAS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  static const bool route_sync_twice = [] {
+    const char* value = std::getenv("K3_ROUTE_SYNC_TWICE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  void* const sync_token = deltafin::provider_internal::loop_aten_sync_begin();
+  const std::uint64_t sync_began_ns =
+      deltafin::provider_internal::loop_aten_sync_now_ns();
+  at::Tensor packed;
+  if (route_alias) {
+    try {
+      packed = deltafin::provider_internal::loop_host_alias_of_mps(
+          packed_device.contiguous());
+    } catch (...) {
+      packed = at::Tensor();
+    }
+  }
+  if (!packed.defined()) {
+    packed = packed_device.to(at::kCPU, at::kFloat).contiguous();
+  }
+  deltafin::provider_internal::loop_aten_sync_end(
+      sync_token, sync_began_ns,
+      deltafin::provider_internal::loop_aten_sync_now_ns());
+  if (route_sync_twice) {
+    const std::uint64_t again_began_ns =
+        deltafin::provider_internal::loop_aten_sync_now_ns();
+    const at::Tensor again =
+        packed_device.to(at::kCPU, at::kFloat).contiguous();
+    static_cast<void>(again.const_data_ptr<float>());
+    deltafin::provider_internal::loop_aten_sync_note_second(
+        deltafin::provider_internal::loop_aten_sync_now_ns() - again_began_ns);
+  }
+  deltafin::provider_internal::prep_note_wait(
+      deltafin::provider_internal::prep_steady_ns() - route_sync_started, 0,
+      false);
   const auto* values = packed.const_data_ptr<float>();
   const std::size_t packed_width = kMoeRouteTopK * 2;
   for (std::int64_t row = 0; row < positions; ++row) {
@@ -792,6 +857,19 @@ void validate_planned_cuda_misses(
   }
 }
 
+// Arrival-driven compute: while set, a route edge whose expert is absent from
+// the batch yields a null pointer instead of throwing; consumers drop those
+// edges (weight and blob) and the sequence accumulates across partial calls.
+thread_local bool t_partial_edges = false;
+
+struct PartialEdgesScope {
+  bool previous;
+  explicit PartialEdgesScope(const bool enable) : previous(t_partial_edges) {
+    t_partial_edges = enable;
+  }
+  ~PartialEdgesScope() { t_partial_edges = previous; }
+};
+
 std::array<const std::uint8_t*, kMoeRouteTopK> ordered_expert_pointers(
     const MoeRouteT1& route,
     const std::span<const std::uint16_t> expert_ids,
@@ -809,6 +887,10 @@ std::array<const std::uint8_t*, kMoeRouteTopK> ordered_expert_pointers(
     const auto found =
         std::lower_bound(expert_ids.begin(), expert_ids.end(), expert);
     if (found == expert_ids.end() || *found != expert) {
+      if (t_partial_edges) {
+        pointers[edge] = nullptr;
+        continue;
+      }
       throw std::invalid_argument(
           "expert-major batch is missing one of the ordered route experts");
     }
@@ -831,6 +913,10 @@ std::array<const std::uint8_t*, kMoeRouteTopK> ordered_expert_pointers(
     const auto found =
         std::lower_bound(expert_ids.begin(), expert_ids.end(), expert);
     if (found == expert_ids.end() || *found != expert) {
+      if (t_partial_edges) {
+        pointers[edge] = nullptr;
+        continue;
+      }
       throw std::invalid_argument(
           "scattered expert tile is missing one ordered route expert");
     }
@@ -862,6 +948,29 @@ std::array<float, kMoeRouteTopK> route_weights(const MoeRouteT1& route) {
     weights[edge] = std::bit_cast<float>(route.weight_bits[edge]);
   }
   return weights;
+}
+
+// Drop route edges whose blob is null (arrival-driven partial groups) so the
+// Metal bridge sees a dense edge list. With no nulls this is the identity.
+struct CompactEdges {
+  std::array<const std::uint8_t*, kMoeRouteTopK> blobs{};
+  std::array<float, kMoeRouteTopK> weights{};
+  std::size_t count = 0;
+};
+
+CompactEdges compact_present_edges(
+    const std::array<const std::uint8_t*, kMoeRouteTopK>& blobs,
+    const std::array<float, kMoeRouteTopK>& weights) {
+  CompactEdges out;
+  for (std::size_t edge = 0; edge < blobs.size(); ++edge) {
+    if (blobs[edge] == nullptr) {
+      continue;
+    }
+    out.blobs[out.count] = blobs[edge];
+    out.weights[out.count] = weights[edge];
+    ++out.count;
+  }
+  return out;
 }
 
 at::Tensor execute_cpu(const PreparedMoeT1& prepared,
@@ -956,6 +1065,12 @@ at::Tensor execute_cpu(const PreparedMoeT1& prepared,
                     output_rows.data(), rows2.data(), columns2.data(),
                     matrix2_count, threads);
 
+  for (const std::uint8_t* blob : blobs) {
+    if (blob == nullptr) {
+      throw std::runtime_error(
+          "arrival-driven partial expert groups are not supported on the CPU backend");
+    }
+  }
   const auto weights = route_weights(prepared.route);
   at::Tensor combined = at::zeros(
       {1, static_cast<std::int64_t>(geometry.routed_hidden)},
@@ -1026,8 +1141,9 @@ at::Tensor execute_metal(const PreparedMoeT1& prepared,
                MoeExecutionStage::MetalExpertRowDispatch);
   int status = 0;
   if (layout == MoeExpertLayout::RawV1) {
-    status = api.layer(blobs.data(), static_cast<int>(blobs.size()),
-                       weights.data(), input.const_data_ptr<float>(),
+    const auto compact = compact_present_edges(blobs, weights);
+    status = api.layer(compact.blobs.data(), static_cast<int>(compact.count),
+                       compact.weights.data(), input.const_data_ptr<float>(),
                        routed_output.data_ptr<float>());
   } else if (layout == MoeExpertLayout::Scale4V2) {
     if (api.descriptor_abi == nullptr || api.layout_capabilities == nullptr ||
@@ -1281,7 +1397,10 @@ at::Tensor execute_metal_pointer_positions(
     }
     at::Tensor inputs = at::cat(input_rows, 0);
     if (!all_host_materialized) {
+      const std::uint64_t sync_started = deltafin::provider_internal::prep_steady_ns();
       inputs = inputs.to(at::kCPU, at::kFloat);
+      deltafin::provider_internal::prep_note_wait(
+          deltafin::provider_internal::prep_steady_ns() - sync_started, 0, false);
     }
     inputs = inputs.contiguous();
     at::Tensor outputs = at::empty(
@@ -1299,8 +1418,9 @@ at::Tensor execute_metal_pointer_positions(
         const auto weights = route_weights(prepared.route);
         int status = 0;
         if (expert_layout == MoeExpertLayout::RawV1) {
-          status = api.layer(
-              blobs.data(), static_cast<int>(blobs.size()), weights.data(),
+          const auto compact = compact_present_edges(blobs, weights);
+            status = api.layer(
+              compact.blobs.data(), static_cast<int>(compact.count), compact.weights.data(),
               inputs[static_cast<std::int64_t>(row)].const_data_ptr<float>(),
               outputs[static_cast<std::int64_t>(row)].data_ptr<float>());
         } else if (expert_layout == MoeExpertLayout::Scale4V2) {
@@ -1311,6 +1431,12 @@ at::Tensor execute_metal_pointer_positions(
               (api.layout_capabilities() & K3_CAP_SCALE4_V2) == 0) {
             throw std::runtime_error(
                 "Metal bridge did not qualify the scale4-v2 descriptor suite");
+          }
+          for (const std::uint8_t* blob : blobs) {
+            if (blob == nullptr) {
+              throw std::runtime_error(
+                  "arrival-driven partial expert groups are not supported for scale4-v2 tiles");
+            }
           }
           std::array<K3MetalExpertDescriptorV1, kMoeRouteTopK> descriptors{};
           for (std::size_t edge = 0; edge < descriptors.size(); ++edge) {
@@ -1383,16 +1509,76 @@ at::Tensor execute_metal_pointer_positions(
     const auto blobs = ordered_expert_pointers(
         prepared.route, expert_ids, expert_span_pointers, geometry);
     const auto weights = route_weights(prepared.route);
-    edge_blobs.insert(edge_blobs.end(), blobs.begin(), blobs.end());
-    edge_weights.insert(edge_weights.end(), weights.begin(), weights.end());
+    // Arrival-driven partial groups leave null blobs for absent experts; the
+    // flat layout carries per-row offsets, so simply omit those edges.
+    for (std::size_t edge = 0; edge < blobs.size(); ++edge) {
+      if (blobs[edge] == nullptr) {
+        continue;
+      }
+      edge_blobs.push_back(blobs[edge]);
+      edge_weights.push_back(weights[edge]);
+    }
     input_rows.push_back(all_host_materialized
                              ? prepared.routed_input_cpu
                              : prepared.routed_input);
     offsets[row + 1] = static_cast<int>(edge_blobs.size());
   }
+#if defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  if (moe_aten_stream_enabled() && expert_layout == MoeExpertLayout::RawV1 &&
+      !options.metal_retain_position_outputs_cpu && !all_host_materialized) {
+    const std::int64_t routed_hidden =
+        static_cast<std::int64_t>(geometry.routed_hidden);
+    const at::Tensor& first = prepared_rows.front()->routed_input;
+    bool contiguous_rows = first.defined() && first.device().is_mps() &&
+        first.scalar_type() == at::kFloat && first.dim() == 2 &&
+        first.size(0) == 1 && first.size(1) == routed_hidden &&
+        first.is_contiguous();
+    for (std::size_t row = 1; contiguous_rows && row < prepared_rows.size(); ++row) {
+      const at::Tensor& candidate = prepared_rows[row]->routed_input;
+      contiguous_rows = candidate.defined() && candidate.is_alias_of(first) &&
+          candidate.is_contiguous() && candidate.sizes() == first.sizes() &&
+          candidate.storage_offset() ==
+              first.storage_offset() + static_cast<std::int64_t>(row) * routed_hidden;
+    }
+    if (contiguous_rows) {
+      const auto n = static_cast<std::int64_t>(prepared_rows.size());
+      const at::Tensor x = first.as_strided({n, routed_hidden}, {routed_hidden, 1},
+                                            first.storage_offset());
+      at::Tensor out = at::empty({n, routed_hidden}, first.options());
+      const bool final_wave = !options.arrival_partial || options.arrival_final;
+      record_trace(options.execution_trace,
+                   MoeExecutionStage::MetalExpertPositionDispatch);
+      const int rc = deltafin::provider_internal::loop_moe_positions_flat_on_aten_stream(
+          x, out, edge_blobs.data(), static_cast<int>(edge_blobs.size()),
+          offsets.data(), static_cast<int>(n), edge_weights.data(), final_wave);
+      if (rc == 0) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true)) {
+          std::fprintf(stderr, "[moe-stream] expert kernels on the ATen stream (rows=%lld)\n",
+                       static_cast<long long>(n));
+        }
+        if (!options.metal_retain_expert_wrappers) {
+          for (const std::uint8_t* pointer : expert_span_pointers) {
+            api.drop(pointer);
+          }
+        }
+        return out;
+      }
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        const char* detail = api.last_error == nullptr ? nullptr : api.last_error();
+        std::fprintf(stderr, "[moe-stream] bridge refused (rc=%d: %s); host path\n", rc,
+                     detail == nullptr ? "no detail" : detail);
+      }
+    }
+  }
+#endif
   at::Tensor inputs = at::cat(input_rows, 0);
   if (!all_host_materialized) {
+    const std::uint64_t sync_started = deltafin::provider_internal::prep_steady_ns();
     inputs = inputs.to(at::kCPU, at::kFloat);
+    deltafin::provider_internal::prep_note_wait(
+        deltafin::provider_internal::prep_steady_ns() - sync_started, 0, false);
   }
   inputs = inputs.contiguous();
   at::Tensor outputs = at::empty(
@@ -1420,6 +1606,12 @@ at::Tensor execute_metal_pointer_positions(
             outputs.data_ptr<float>());
       } else {
         fall_back_to_rows = true;
+      }
+    }
+    for (const std::uint8_t* blob : edge_blobs) {
+      if (blob == nullptr) {
+        throw std::runtime_error(
+            "arrival-driven partial expert groups are not supported for scale4-v2 position tiles");
       }
     }
   } else if (expert_layout == MoeExpertLayout::Scale4V2) {
@@ -1610,6 +1802,27 @@ void flush_metal_expert_cache() {
 #endif
 }
 
+void drop_metal_expert_blobs(const std::uint8_t* const* blobs,
+                             std::uint64_t count) {
+#if !defined(__APPLE__)
+  (void)blobs;
+  (void)count;
+  throw std::runtime_error(
+      "Metal expert cache drop requires an Apple provider build");
+#else
+  const MetalApi& api = metal_api();
+  if (api.drop == nullptr) {
+    throw std::runtime_error(
+        "Metal MXFP4 cache drop is not linked into this provider executable");
+  }
+  for (std::uint64_t index = 0; index < count; ++index) {
+    if (blobs[index] != nullptr) {
+      api.drop(blobs[index]);
+    }
+  }
+#endif
+}
+
 MetalExpertCacheStats metal_expert_cache_stats() {
 #if !defined(__APPLE__)
   throw std::runtime_error(
@@ -1657,6 +1870,14 @@ bool qualify_moe_shared_gate_up(MoeSpineT1& spine) {
   return true;
 }
 
+bool moe_route_async_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("K3_ROUTE_ASYNC");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
 PreparedMoeT1 prepare_moe_t1(const at::Tensor& hidden,
                              const MoeSpineT1& spine,
                              MoeExecutionTrace* execution_trace) {
@@ -1669,36 +1890,171 @@ PreparedMoeT1 prepare_moe_t1(const at::Tensor& hidden,
   }
   validate_spine(spine, hidden.device());
 
+  const bool async_route = moe_route_async_enabled() && hidden.is_mps();
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_MPS_ROUTE_MAILBOX_V1)
+  if (async_route) {
+    // Commit the attention/norm prefix now so the GPU executes it while the
+    // host encodes the router tail below. Scheduling only; values unchanged.
+    static_cast<void>(try_commit_mps_stream_for_route());
+  }
+#endif
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  // Side-queue route (K3_ROUTE_SIDEQUEUE): "shadow" computes the loop-queue
+  // route concurrently and only compares it (stock result used); "on"
+  // consumes it via loop_router_collect and skips the stock chain, falling
+  // back per call.  Both share the same encode path.  Any of the three
+  // router forms qualifies; which kernel the STOCK path uses is irrelevant
+  // to the side queue.
+  bool shadow_route_active = false;
+  bool shadow_takeover_begun = false;
+  const int sidequeue_mode = route_sidequeue_mode();
+  const bool router_row_int8 = spine.router.quantized.defined() &&
+      spine.router.row_scales.defined();
+  const bool router_bf16_owned = !router_row_int8 &&
+      spine.router.original_bf16.is_owned() &&
+      spine.router.original_bf16.owned_storage != nullptr &&
+      spine.router.original_bf16.owned_storage->tensor.defined();
+  const bool router_dense_f32 = !router_row_int8 && !router_bf16_owned &&
+      spine.router.dense_f32.defined();
+  const bool sidequeue_eligible =
+      (sidequeue_mode == 1 || sidequeue_mode == 2) && hidden.is_mps() &&
+      (router_row_int8 || router_bf16_owned || router_dense_f32);
+  if (sidequeue_mode == 2 &&
+      loop_router_pending_layer() == spine.layer_index) {
+    // Step 6 milestone (iii): this layer's route CB was already chained
+    // behind the pre-committed KDA CB at the previous tail; collect will
+    // consume it. Do not begin a second one.
+    shadow_takeover_begun = true;
+    static std::atomic<std::uint64_t> dedup_hits{0};
+    const std::uint64_t n = dedup_hits.fetch_add(1) + 1;
+    if (n == 1 || n % 690 == 0) {
+      std::fprintf(stderr, "[route-chain] dedup_hits=%llu\n",
+                   static_cast<unsigned long long>(n));
+    }
+  } else if (sidequeue_eligible) {
+    bool begun = false;
+    if (router_row_int8) {
+      begun = loop_router_shadow_begin(
+          spine.layer_index, hidden, spine.router.quantized,
+          spine.router.row_scales, spine.router_correction_bias);
+    } else if (router_bf16_owned) {
+      begun = loop_router_shadow_begin_bf16(
+          spine.layer_index, hidden,
+          spine.router.original_bf16.owned_storage->tensor,
+          spine.router.original_bf16.owned_element_offset,
+          spine.router_correction_bias);
+    } else {
+      begun = loop_router_shadow_begin_f32(
+          spine.layer_index, hidden, spine.router.dense_f32,
+          spine.router_correction_bias);
+    }
+    if (sidequeue_mode == 1) {
+      shadow_route_active = begun;
+    } else {
+      shadow_takeover_begun = begun;
+    }
+  }
+#endif
+
   record_trace(execution_trace, MoeExecutionStage::Router);
-  const at::Tensor logits =
-      row_int8_linear(hidden, spine.router, spine.packed_int8_qualified);
-  const at::Tensor scores = at::sigmoid(logits);
-  const at::Tensor choice = at::add(scores, spine.router_correction_bias);
-  const auto [ignored_values, topk_ids] = at::topk(
-      choice, static_cast<std::int64_t>(kMoeRouteTopK), -1, true, false);
-  static_cast<void>(ignored_values);
-  const at::Tensor unnormalized = at::gather(scores, 1, topk_ids);
-  const at::Tensor denominator = at::add(
-      at::sum(unnormalized, std::vector<std::int64_t>{-1}, true), 1.0e-20);
-  const at::Tensor weights = at::div(unnormalized, denominator);
-  // Match KimiSparseMoeBlock scheduling: queue routed_down while route tensors
-  // remain device-resident, then cross only the route host boundary here.
-  record_trace(execution_trace, MoeExecutionStage::RoutedDown);
-  at::Tensor routed_input = row_int8_linear(
-      hidden, spine.routed_down, spine.packed_int8_qualified);
+  // The stock route chain is computed lazily: in side-queue takeover mode
+  // (K3_ROUTE_SIDEQUEUE=on with a successful submit) it is skipped entirely
+  // — the loop queue computes the route — and only runs as the per-call
+  // fallback when the side queue fails to deliver.
+  at::Tensor topk_ids;
+  at::Tensor weights;
+  const auto compute_stock_route = [&]() {
+    const at::Tensor logits =
+        row_int8_linear(hidden, spine.router, spine.packed_int8_qualified);
+    const at::Tensor scores = at::sigmoid(logits);
+    const at::Tensor choice = at::add(scores, spine.router_correction_bias);
+    auto [ignored_values, ids] = at::topk(
+        choice, static_cast<std::int64_t>(kMoeRouteTopK), -1, true, false);
+    static_cast<void>(ignored_values);
+    topk_ids = std::move(ids);
+    const at::Tensor unnormalized = at::gather(scores, 1, topk_ids);
+    const at::Tensor denominator = at::add(
+        at::sum(unnormalized, std::vector<std::int64_t>{-1}, true), 1.0e-20);
+    weights = at::div(unnormalized, denominator);
+  };
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  const bool takeover_begun = shadow_takeover_begun;
+#else
+  const bool takeover_begun = false;
+#endif
+  if (!takeover_begun) {
+    compute_stock_route();
+  }
 
   PreparedMoeT1 prepared;
   prepared.layer_index = spine.layer_index;
   prepared.spine_generation = spine.generation;
   prepared.geometry = spine.geometry;
-  record_trace(execution_trace, MoeExecutionStage::RouteMaterialization);
-  prepared.route = materialize_route_t1(topk_ids, weights, spine.geometry);
+  at::Tensor routed_input;
+  bool route_from_sidequeue = false;
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  if (takeover_begun) {
+    // routed_down rides the ATen queue while the side queue finishes the
+    // route; the collect wait covers only the committed prefix + router
+    // chain, not the projection backlog.
+    record_trace(execution_trace, MoeExecutionStage::RoutedDown);
+    routed_input = row_int8_linear(
+        hidden, spine.routed_down, spine.packed_int8_qualified);
+    record_trace(execution_trace, MoeExecutionStage::RouteMaterialization);
+    route_from_sidequeue = loop_router_collect(
+        spine.layer_index, prepared.route.expert_ids.data(),
+        prepared.route.weight_bits.data());
+    if (route_from_sidequeue) {
+      validate_route(prepared.route, spine.geometry);
+    } else {
+      // Fail-soft: the side queue did not deliver — run the stock chain now
+      // (value-identical; only the encode position moved) and materialize.
+      compute_stock_route();
+      prepared.route =
+          materialize_route_t1(topk_ids, weights, spine.geometry);
+    }
+  } else
+#endif
+  if (async_route) {
+    // Route boundary first: the mailbox event then waits only on ops the
+    // route depends on. The routed_down GEMV is queued directly after, so it
+    // executes while Rust stages the route's expert file reads.
+    record_trace(execution_trace, MoeExecutionStage::RouteMaterialization);
+    prepared.route = materialize_route_t1(topk_ids, weights, spine.geometry);
+    record_trace(execution_trace, MoeExecutionStage::RoutedDown);
+    routed_input = row_int8_linear(
+        hidden, spine.routed_down, spine.packed_int8_qualified);
+  } else {
+    // Match KimiSparseMoeBlock scheduling: queue routed_down while route
+    // tensors remain device-resident, then cross only the route host boundary
+    // here.
+    record_trace(execution_trace, MoeExecutionStage::RoutedDown);
+    routed_input = row_int8_linear(
+        hidden, spine.routed_down, spine.packed_int8_qualified);
+    record_trace(execution_trace, MoeExecutionStage::RouteMaterialization);
+    prepared.route = materialize_route_t1(topk_ids, weights, spine.geometry);
+  }
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  if (shadow_route_active) {
+    loop_router_shadow_compare(spine.layer_index,
+                               prepared.route.expert_ids.data(),
+                               prepared.route.weight_bits.data());
+  }
+#endif
   prepared.identity = hidden;
   prepared.routed_input = std::move(routed_input);
   // Host materialization belongs to expert execution, after Rust has fetched
   // and authenticated the route's expert bytes. Preparing it here would put a
   // second MPS synchronization directly on the demand-I/O critical path.
   return prepared;
+}
+
+bool moe_aten_stream_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* value = std::getenv("K3_MOE_ATEN_STREAM");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
 }
 
 PreparedMoePositionsT1 prepare_moe_positions_t1(
@@ -1747,6 +2103,9 @@ PreparedMoePositionsT1 prepare_moe_positions_t1(
       hidden_rows, spine.routed_down, spine.packed_int8_qualified)
                                        .contiguous();
   record_trace(execution_trace, MoeExecutionStage::RouteMaterialization);
+  deltafin::provider_internal::loop_residency_register_activation(hidden_rows);
+  deltafin::provider_internal::loop_residency_register_activation(logits);
+  deltafin::provider_internal::loop_residency_register_activation(routed_inputs);
   std::vector<MoeRouteT1> routes =
       materialize_route_positions(topk_ids.contiguous(), weights,
                                   spine.geometry);
@@ -1833,10 +2192,25 @@ at::Tensor execute_routed_moe_t1(const PreparedMoeT1& prepared,
   throw std::logic_error("automatic routed-MoE backend remained unresolved");
 }
 
+std::array<const std::uint8_t*, kMoeRouteTopK> loop_route_ordered_expert_blobs(
+    const MoeRouteT1& route, const CanonicalExpertPositionTileT1& experts,
+    const MoeGeometry& geometry) {
+  // Exactly one storage form is populated (validated upstream); reuse the
+  // internal route-edge ordering either way.
+  if (!experts.expert_major_bytes.empty()) {
+    return ordered_expert_pointers(route, experts.expert_ids,
+                                   experts.expert_major_bytes, geometry,
+                                   experts.expert_span_bytes);
+  }
+  return ordered_expert_pointers(route, experts.expert_ids,
+                                 experts.expert_span_pointers, geometry);
+}
+
 at::Tensor execute_routed_moe_positions_t1(
     const std::span<const PreparedMoeT1* const> prepared_rows,
     const CanonicalExpertPositionTileT1& experts,
     const MoeRunOptions& options) {
+  const PartialEdgesScope partial_scope(options.partial_edges);
   const c10::InferenceMode inference_guard;
   if (prepared_rows.empty() ||
       prepared_rows.size() > kMoePositionTileMaxRows) {

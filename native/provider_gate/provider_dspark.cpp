@@ -350,15 +350,17 @@ at::Tensor dspark_yarn_inverse_frequencies(const DSparkShape& shape,
 
 at::Tensor dspark_apply_yarn_rotary_bf16(const at::Tensor& value,
                                          const at::Tensor& positions,
-                                         const DSparkShape& shape) {
+                                         const DSparkShape& shape,
+                                         const std::int64_t maximum_rows) {
   const c10::InferenceMode inference_guard;
   shape.validate();
   if (!value.defined() || value.scalar_type() != at::kBFloat16 ||
       !value.is_contiguous() || value.dim() < 2 || value.device().is_meta() ||
-      value.size(0) < 1 || value.size(0) > kMaximumDraftRows ||
+      value.size(0) < 1 || value.size(0) > maximum_rows ||
       value.size(-1) != shape.qk_rope_head_dim) {
     throw std::invalid_argument(
-        "DSpark rotary input must be contiguous BF16 [1..7,...,rope]");
+        "DSpark rotary input must be contiguous BF16 [T,...,rope] with T "
+        "within the caller's row bound");
   }
   validate_positions(positions, value.device(), value.size(0), shape);
   const at::Tensor inverse =

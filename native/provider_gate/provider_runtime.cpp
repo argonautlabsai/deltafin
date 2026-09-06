@@ -4,8 +4,13 @@
 #include "provider_device.h"
 #include "provider_dspark_model.h"
 #include "provider_kda.h"
+#include "provider_loop.h"
 #include "provider_mla.h"
+#include "provider_pilot.h"
 #include "provider_precision.h"
+#include "provider_prep_timer.h"
+
+#include <unistd.h>
 #include "provider_qwen.h"
 #include "provider_bf16_cpu.h"
 #include "provider_spine_debug.h"
@@ -58,6 +63,8 @@
 #include <vector>
 
 namespace {
+
+void drain_mps_stream_for_source_reclaim();
 
 static_assert(sizeof(DeltafinProviderSessionRequestV1) == 80,
               "session request ABI v1 layout changed");
@@ -502,20 +509,25 @@ struct SpineLayerSlot {
  * source-encoding-neutral so exact original-BF16 can target the same arena in
  * a later qualified path without allocating a second dense template.
  */
-struct SpineFp32ExecutionArena {
-  at::Tensor storage;
-  std::uint64_t owner = 0;
-  std::uint64_t spine_generation = 0;
-  std::uint32_t layer_index = 0;
-  bool occupied = false;
-};
-
 struct SpineFp32ExecutionView {
   std::array<std::optional<at::Tensor>, kLastGlobalWeightSlot + 1> tensors;
   std::uint64_t owner = 0;
   std::uint64_t spine_generation = 0;
   std::uint32_t layer_index = 0;
   std::uint64_t required_elements = 0;
+};
+
+struct SpineFp32ExecutionArena {
+  at::Tensor storage;
+  std::uint64_t owner = 0;
+  std::uint64_t spine_generation = 0;
+  std::uint32_t layer_index = 0;
+  bool occupied = false;
+  /* Step 6: the exact views published for (owner, layer_index), so a
+   * same-layer re-request (pre-commit orchestration materializes one layer
+   * early; the ordinary prepare then asks again) is an idempotent hit
+   * instead of an illegal window re-advance. */
+  SpineFp32ExecutionView cached_view;
 };
 
 enum class SpineFp32ExecutionSource {
@@ -1733,6 +1745,57 @@ std::optional<SpineFp32ExecutionView> maybe_materialize_spine_fp32(
   if (!device.is_mps() || owner == 0) {
     return std::nullopt;
   }
+  // K3_SPINE_FP32_ARENA=0 (diagnostic, 2026-09-02): skip the per-layer
+  // int8->fp32 execution-arena materialize entirely, so every consumer
+  // takes its int8 / packed form. The GPU timeline attributes ~7 ms/layer
+  // of ATen-stream work per token to this materialize (2.3 GB of fp32
+  // writes per layer); this knob prices it under the identity gate.
+  static const bool arena_disabled = [] {
+    const char* value = std::getenv("K3_SPINE_FP32_ARENA");
+    const bool off = value != nullptr && std::strcmp(value, "0") == 0;
+    if (off) {
+      std::fprintf(stderr,
+                   "[spine-fp32] execution arena DISABLED (K3_SPINE_FP32_ARENA=0)\n");
+    }
+    return off;
+  }();
+  if (arena_disabled) {
+    return std::nullopt;
+  }
+  // K3_ROUTE_SYNC_PROBE=1: per-92-layer mean of the fp32 execution-arena
+  // materialization cost — the suspected last ATen segment on hosts where
+  // packed int8 execution is unqualified.
+  static const bool spine_probe = [] {
+    const char* value = std::getenv("K3_ROUTE_SYNC_PROBE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  struct SpineProbeScope {
+    bool active;
+    std::chrono::steady_clock::time_point started;
+    explicit SpineProbeScope(bool enabled)
+        : active(enabled), started(std::chrono::steady_clock::now()) {}
+    ~SpineProbeScope() {
+      if (!active) {
+        return;
+      }
+      const double elapsed_ms =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - started)
+              .count();
+      static double accumulator_ms = 0.0;
+      static std::uint64_t calls = 0;
+      accumulator_ms += elapsed_ms;
+      ++calls;
+      if (calls % 92 == 0) {
+        std::fprintf(stderr,
+                     "[spine-fp32] calls=%llu materialize_mean=%.3fms\n",
+                     static_cast<unsigned long long>(calls),
+                     accumulator_ms / static_cast<double>(calls));
+        accumulator_ms = 0.0;
+        calls = 0;
+      }
+    }
+  } spine_probe_scope{spine_probe};
   SpineFp32ExecutionSource source = SpineFp32ExecutionSource::None;
   std::uint64_t required_elements = 0;
   std::uint32_t matrix_count = 0;
@@ -1830,6 +1893,13 @@ std::optional<SpineFp32ExecutionView> maybe_materialize_spine_fp32(
   SpineFp32ExecutionArena& arena = session.spine_fp32_execution_arena;
   if (arena.occupied) {
     if (arena.owner == owner) {
+      if (layer.layer_index == arena.layer_index &&
+          layer.generation == arena.spine_generation) {
+        // Step 6 idempotent hit: this exact layer was already materialized
+        // for this owner (pre-commit orchestration runs one layer early).
+        // Publish the same views; the window does not advance.
+        return arena.cached_view;
+      }
       if (layer.layer_index <= arena.layer_index) {
         throw std::runtime_error(
             "FP32 spine arena cannot overwrite an unfinished target layer");
@@ -1944,6 +2014,15 @@ std::optional<SpineFp32ExecutionView> maybe_materialize_spine_fp32(
   arena.spine_generation = layer.generation;
   arena.layer_index = layer.layer_index;
   arena.occupied = true;
+  arena.cached_view = view;
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  // A fresh materialization encodes async dequant/upcast work on the ATen
+  // stream; the next fp32-form loop CB must take its private fence to
+  // order those writes before its GEMVs read the arena. (This also closes
+  // the latent ordering race the shared-boundary skip had with each
+  // layer's own dequant — the sync-E drain runs BEFORE this encode.)
+  deltafin::provider_internal::loop_note_fresh_dequant();
+#endif
   return view;
 }
 
@@ -2051,6 +2130,64 @@ deltafin::provider_internal::KdaProjection require_kda_projection(
   }
   return deltafin::provider_internal::KdaProjection{
       tensor.data, tensor.auxiliary};
+}
+
+/* int8-direct (K3_KDA_INT8_DIRECT): projections built from the resident
+ * int8 spine storage (kChar data + fp32 row scales) — the ground-truth
+ * bytes the fp32 execution views are derived from. Returns nullopt if any
+ * projection slot is not row-int8 (caller falls back to the fp32 views).
+ * Conv/norm raw tensors are shared with the fp32 variant. */
+std::optional<deltafin::provider_internal::KdaProjection>
+kda_projection_int8_from_slot(const SpineLayerSlot& layer,
+                              const std::uint32_t slot) {
+  if (slot >= layer.tensors.size() || !layer.tensors[slot].has_value()) {
+    return std::nullopt;
+  }
+  const SpineTensorSlot& tensor = *layer.tensors[slot];
+  if (tensor.encoding != DELTAFIN_PROVIDER_SPINE_ROW_I8_F16_SCALE_V1 ||
+      !tensor.data.defined() || tensor.data.scalar_type() != at::kChar ||
+      !tensor.data.is_contiguous() || !tensor.auxiliary.defined() ||
+      tensor.auxiliary.scalar_type() != at::kFloat ||
+      !tensor.auxiliary.is_contiguous()) {
+    return std::nullopt;
+  }
+  return deltafin::provider_internal::KdaProjection{tensor.data,
+                                                    tensor.auxiliary};
+}
+
+std::optional<deltafin::provider_internal::KdaWeights>
+kda_weights_from_spine_int8(const SpineLayerSlot& layer) {
+  if (!is_kda_layer(layer.layer_index)) {
+    return std::nullopt;
+  }
+  std::array<std::optional<deltafin::provider_internal::KdaProjection>, 8>
+      projections = {
+          kda_projection_int8_from_slot(layer, kKdaQueryProjectionSlot),
+          kda_projection_int8_from_slot(layer, kKdaKeyProjectionSlot),
+          kda_projection_int8_from_slot(layer, kKdaValueProjectionSlot),
+          kda_projection_int8_from_slot(layer, kKdaGateProjectionSlot),
+          kda_projection_int8_from_slot(layer, kKdaFeatureAProjectionSlot),
+          kda_projection_int8_from_slot(layer, kKdaFeatureBProjectionSlot),
+          kda_projection_int8_from_slot(layer, kKdaBetaProjectionSlot),
+          kda_projection_int8_from_slot(layer, kKdaOutputProjectionSlot),
+      };
+  for (const auto& projection : projections) {
+    if (!projection.has_value()) {
+      return std::nullopt;
+    }
+  }
+  return deltafin::provider_internal::KdaWeights{
+      require_kda_raw(layer, kKdaALogSlot, "A_log"),
+      require_kda_raw(layer, kKdaDtBiasSlot, "dt_bias"),
+      require_kda_raw(layer, kKdaQueryConvolutionSlot,
+                      "query convolution"),
+      require_kda_raw(layer, kKdaKeyConvolutionSlot, "key convolution"),
+      require_kda_raw(layer, kKdaValueConvolutionSlot,
+                      "value convolution"),
+      require_kda_raw(layer, kKdaOutputNormSlot, "output norm"),
+      *projections[0], *projections[1], *projections[2], *projections[3],
+      *projections[4], *projections[5], *projections[6], *projections[7],
+  };
 }
 
 deltafin::provider_internal::KdaWeights kda_weights_from_spine(
@@ -4209,6 +4346,36 @@ extern "C" int32_t deltafin_provider_metal_expert_cache_flush_v1(
   });
 }
 
+extern "C" int32_t deltafin_provider_metal_expert_cache_drop_v1(
+    const DeltafinProviderResourceRequestV1* request, const void* const* blobs,
+    const uint64_t blob_count, char* error, const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    require_resource_request(request, "provider Metal expert-cache drop request");
+    if (request->resource != 0) {
+      throw std::invalid_argument(
+          "provider Metal expert-cache drop resource must be zero");
+    }
+    if (blob_count > 0 && blobs == nullptr) {
+      throw std::invalid_argument(
+          "provider Metal expert-cache drop blobs must be non-null");
+    }
+    if (blob_count > 65536) {
+      throw std::invalid_argument(
+          "provider Metal expert-cache drop count exceeds the sane bound");
+    }
+    const auto session = find_session(request->session);
+    const c10::InferenceMode inference_guard;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    if (!session->selected.device.is_mps()) {
+      throw std::invalid_argument(
+          "Metal expert-cache drop requires the selected MPS provider");
+    }
+    deltafin::provider_internal::drop_metal_expert_blobs(
+        reinterpret_cast<const std::uint8_t* const*>(blobs), blob_count);
+  });
+}
+
 extern "C" int32_t deltafin_provider_metal_expert_cache_stats_v1(
     const DeltafinProviderResourceRequestV1* request,
     DeltafinProviderMetalExpertCacheStatsReportV1* report, char* error,
@@ -4646,6 +4813,16 @@ extern "C" int32_t deltafin_provider_prepare_layer_v1(
       produced.ordered_experts[edge] = static_cast<std::uint16_t>(expert);
       produced.ordered_weight_bits[edge] = std::bit_cast<std::uint32_t>(weight);
     }
+    // K3_PILOT_PRIOR: remember this layer's AUTHORITATIVE routing so the next
+    // token's pilot prediction for the same layer can rank candidates with it.
+    // Decode only — `edges` is positions*top_k, so a prefill pass carries many
+    // positions and is not "the previous token's routing" for any one of them.
+    // No-op unless the prior is enabled (default off, byte-identical).
+    if (positions == 1) {
+      deltafin::provider_internal::pilot_prior_record_route(
+          request->layer_index, produced.ordered_experts,
+          static_cast<std::size_t>(edges));
+    }
 
     const auto ticket = session->allocate_resource();
     const auto [ignored, inserted] = session->tickets.emplace(
@@ -4787,10 +4964,9 @@ extern "C" int32_t deltafin_provider_bind_spine_layer_v1(
     }
     const bool retain = (request->flags & kRetainSpineFlag) != 0;
     if (retain) {
-      if (request->layer_index != session->resident_spine_prefix_layers) {
-        throw std::invalid_argument(
-            "provider retained spine layers must append to the ordered prefix");
-      }
+      // Residency may be a spread mask (K3_SPINE_TRANSIENT_SPREAD), so the
+      // only ordering rule is "not already retained"; the count below still
+      // tracks how many layers are resident.
       if (session->resident_spine_layers[request->layer_index] != nullptr) {
         throw std::logic_error(
             "provider retained spine prefix slot is already allocated");
@@ -4801,8 +4977,8 @@ extern "C" int32_t deltafin_provider_bind_spine_layer_v1(
         throw std::invalid_argument(
             "provider cannot retain a layer while the same layer occupies the transient slot");
       }
-    } else if (request->layer_index <
-               session->resident_spine_prefix_layers) {
+    } else if (session->resident_spine_layers[request->layer_index] !=
+               nullptr) {
       throw std::invalid_argument(
           "provider cannot transiently replace a retained spine layer");
     }
@@ -4854,6 +5030,11 @@ extern "C" int32_t deltafin_provider_bind_spine_layer_v1(
       published =
           session->resident_spine_layers[request->layer_index].get();
     } else {
+      if (session->transient_spine_layer != nullptr) {
+        // The previous transient layer's device tensors die with `staged`
+        // after this swap; the loop may still be executing with them.
+        drain_mps_stream_for_source_reclaim();
+      }
       session->transient_spine_layer.swap(staged);
       published = session->transient_spine_layer.get();
     }
@@ -4995,7 +5176,7 @@ extern "C" int32_t deltafin_provider_bind_spine_layer_v2(
           "borrowed CPU spine cannot replace an unreclaimed source use");
     }
     if (request->generation <= session->last_spine_generation ||
-        request->layer_index < session->resident_spine_prefix_layers) {
+        session->resident_spine_layers[request->layer_index] != nullptr) {
       throw std::invalid_argument(
           "borrowed CPU spine generation/layer conflicts with published state");
     }
@@ -5040,6 +5221,12 @@ extern "C" int32_t deltafin_provider_bind_spine_layer_v2(
     // unordered_map publication above is the final potentially throwing
     // operation. unique_ptr swap, scalar commits, and report assignment below
     // are noexcept; a successful return is therefore the sole ownership handoff.
+    if (session->transient_spine_layer != nullptr) {
+      // See the v1 bind path: never destroy a transient layer the GPU may
+      // still be reading. Drains are noexcept-equivalent here in practice;
+      // a poisoned loop tail surfaces as the hard error it already is.
+      drain_mps_stream_for_source_reclaim();
+    }
     session->transient_spine_layer.swap(staged);
     session->last_spine_generation = request->generation;
     maybe_publish_compact_pilot_router(
@@ -5091,6 +5278,20 @@ SpineSourceUseSlot& require_spine_source_use(
                                 " source-use handle is stale or unknown");
   }
   return found->second;
+}
+
+// Completion fence for borrowed (arena-aliased) transient spine tensors:
+// commit and wait for the current MPS stream so no enqueued GPU command can
+// still read the host slab that Rust is about to recycle.
+void drain_mps_stream_for_source_reclaim() {
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+  // Two GPU queues can still be reading a transient layer: the bespoke loop's
+  // own command buffers (spine int8 kernels, KDA/MoE tail — waited through
+  // the loop's tail semaphores) and the ATen MPS stream. Fence both before
+  // any memory the layer borrowed or owned can be recycled.
+  deltafin::provider_internal::loop_moe_tail_drain();
+  deltafin::provider_internal::loop_drain_aten_stream();
+#endif
 }
 
 void clear_borrowed_cpu_carriers(Session& session,
@@ -5166,9 +5367,17 @@ extern "C" int32_t deltafin_provider_spine_source_use_try_reclaim_v2(
       throw std::invalid_argument(
           "provider spine source-use must be sealed before reclaim");
     }
-    // CPU projections and expert completion are synchronous. Clearing every
-    // carrier is the completion fence; after this point no provider object
-    // retains an arena address and Rust may recycle the slab immediately.
+    // CPU projections and expert completion are synchronous, but on the
+    // Metal path the transient layer's borrowed tensors alias the arena slab
+    // through shared-mode MTLBuffers and the GPU reads them asynchronously.
+    // Clearing the carriers only drops the CPU-side objects; Rust then
+    // recycles the slab for the next read while enqueued GPU work may still
+    // be reading it (measured 2026-09-03/04: different text per run with
+    // >20 streamed layers, NaN routes at zero residency, wrong text with five
+    // streamed layers under memory pressure). Drain the MPS stream first so
+    // every command that could touch the alias has completed. The resident
+    // champion path never creates a source use, so this costs it nothing.
+    drain_mps_stream_for_source_reclaim();
     clear_borrowed_cpu_carriers(*session, source, false);
     if (session->spine_source_uses.erase(request->source_use) != 1) {
       throw std::logic_error("provider spine source-use reclaim lost its handle");
@@ -5195,6 +5404,7 @@ extern "C" int32_t deltafin_provider_spine_source_use_abort_v2(
       throw std::invalid_argument(
           "provider spine source-use cannot abort from its current state");
     }
+    drain_mps_stream_for_source_reclaim();
     clear_borrowed_cpu_carriers(*session, source, true);
     if (session->spine_source_uses.erase(request->source_use) != 1) {
       throw std::logic_error("provider spine source-use abort lost its handle");
@@ -6160,7 +6370,11 @@ deltafin::provider_internal::MoeRunOptions target_moe_options(
       .cuda_plan = 0,
       .cuda_auto_fallback =
           request.expert_backend == DELTAFIN_PROVIDER_TARGET_EXPERT_AUTO_V1,
-      .metal_retain_expert_wrappers = retain_metal_wrappers};
+      .metal_retain_expert_wrappers = retain_metal_wrappers,
+      .arrival_partial =
+          (request.flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1) != 0,
+      .arrival_final =
+          (request.flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1) != 0};
 }
 
 deltafin::provider_internal::MoeRunOptions target_moe_plan_options(
@@ -6474,6 +6688,7 @@ extern "C" int32_t deltafin_provider_target_prepare_v1(
 
     deltafin::provider_internal::KdaWeights kda;
     deltafin::provider_internal::MlaWeights mla;
+    deltafin::provider_internal::MlaWeights mla_parity;
     deltafin::provider_internal::TargetDenseWeights dense;
     deltafin::provider_internal::MoeSpineT1 moe;
     auto binding = deltafin::provider_internal::TargetLayerBinding{
@@ -6496,6 +6711,23 @@ extern "C" int32_t deltafin_provider_target_prepare_v1(
       binding.mla_input_bundle = execution == nullptr
           ? spine.mla_input_bundle.get()
           : nullptr;
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+      // K3_MLA_LOOP=parity: the loop chain needs the stable row-int8 spine
+      // forms — the arena views above are DenseF32 and recycled per layer.
+      // Fail-soft: any qualification failure leaves the fields null and the
+      // parity skips; the production bind is never disturbed.
+      if (deltafin::provider_internal::mla_loop_mode() != 0 &&
+          execution != nullptr) {
+        try {
+          mla_parity = mla_weights_from_spine(spine, nullptr);
+          binding.mla_parity_weights = &mla_parity;
+          binding.mla_parity_bundle = spine.mla_input_bundle.get();
+        } catch (...) {
+          binding.mla_parity_weights = nullptr;
+          binding.mla_parity_bundle = nullptr;
+        }
+      }
+#endif
     }
     if (request->layer_index == 0) {
       dense = target_dense_from_spine(spine, execution);
@@ -6570,7 +6802,7 @@ extern "C" int32_t deltafin_provider_target_finish_experts_v1(
                    "provider target expert-finish request");
     if (report->struct_size != sizeof(*report) ||
         (request->flags &
-         ~DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1) != 0 ||
+         ~(DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1 | DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1 | DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1)) != 0 ||
         !all_zero(request->reserved) ||
         request->spine_generation == 0 ||
         request->expert_count != DELTAFIN_PROVIDER_ROUTE_TOP_K_V1 ||
@@ -6963,6 +7195,14 @@ extern "C" int32_t deltafin_provider_target_sequence_prepare_v1(
     std::lock_guard<std::mutex> lock(session->mutex);
     session->require_open();
     require_live_target_sequence(*session, request->sequence);
+    // Attention-timer split (provider_prep_timer.h): everything below —
+    // the arena barrier, fp32 materialize, weight binding and the tape's
+    // prepare_layer — is what Rust's attention_resident timer sees.
+    // Bucketed by tile width: single-position tiles ride the loop /
+    // precommit path, wide drafted tiles the batched ATen path.
+    const deltafin::provider_internal::PrepPhaseScope prep_scope(
+        deltafin::provider_internal::PrepPhase::Prepare,
+        session->target_sequence->position_count() > 1 ? 1 : 0);
     if (request->layer_index !=
         session->target_sequence->next_layer_index()) {
       throw std::invalid_argument(
@@ -6975,13 +7215,21 @@ extern "C" int32_t deltafin_provider_target_sequence_prepare_v1(
           "target-sequence streamed layer lacks its complete residual roster");
     }
 
+    // Step 6 arena barrier: a pre-committed KDA loop CB may still be
+    // reading fp32 execution-arena views; the materializer below recycles
+    // that storage. Wait it out first (no-op without a pre-commit).
+    session->target_sequence->precommit_arena_barrier();
     const auto fp32_execution = maybe_materialize_spine_fp32(
         *session, spine, request->sequence);
     const SpineFp32ExecutionView* execution =
         fp32_execution.has_value() ? &*fp32_execution : nullptr;
+    // K3_GPU_TIMELINE=1: the just-enqueued materialize and everything the
+    // stock prepare path encodes ride the ATen stream's open root CB.
+    deltafin::provider_internal::loop_gpu_timeline_note_aten("aten-prep");
 
     deltafin::provider_internal::KdaWeights kda;
     deltafin::provider_internal::MlaWeights mla;
+    deltafin::provider_internal::MlaWeights mla_parity;
     deltafin::provider_internal::TargetDenseWeights dense;
     deltafin::provider_internal::MoeSpineT1 moe;
     auto binding = deltafin::provider_internal::TargetLayerBinding{
@@ -7004,6 +7252,23 @@ extern "C" int32_t deltafin_provider_target_sequence_prepare_v1(
       binding.mla_input_bundle = execution == nullptr
           ? spine.mla_input_bundle.get()
           : nullptr;
+#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+      // K3_MLA_LOOP=parity: the loop chain needs the stable row-int8 spine
+      // forms — the arena views above are DenseF32 and recycled per layer.
+      // Fail-soft: any qualification failure leaves the fields null and the
+      // parity skips; the production bind is never disturbed.
+      if (deltafin::provider_internal::mla_loop_mode() != 0 &&
+          execution != nullptr) {
+        try {
+          mla_parity = mla_weights_from_spine(spine, nullptr);
+          binding.mla_parity_weights = &mla_parity;
+          binding.mla_parity_bundle = spine.mla_input_bundle.get();
+        } catch (...) {
+          binding.mla_parity_weights = nullptr;
+          binding.mla_parity_bundle = nullptr;
+        }
+      }
+#endif
     }
     if (request->layer_index == 0) {
       dense = target_dense_from_spine(spine, execution);
@@ -7038,6 +7303,35 @@ extern "C" int32_t deltafin_provider_target_sequence_prepare_v1(
     }
 
     const auto kind = session->target_sequence->prepare_layer(binding);
+    // K3_PREP_DELAY_US (diagnostic, default 0): stretch the attention phase
+    // by a fixed host sleep per prepare call, inside the timer scope so
+    // attn_encode proves it applied. The speed slope against the delay says
+    // whether attention sits on the token's critical path (slope ~1) or is
+    // hidden behind the read pipe (slope ~0) — the go/no-go for any
+    // attention-side build, priced before building.
+    static const unsigned long prep_delay_us = [] {
+      const char* value = std::getenv("K3_PREP_DELAY_US");
+      const unsigned long parsed =
+          value == nullptr ? 0UL : std::strtoul(value, nullptr, 10);
+      if (parsed != 0) {
+        std::fprintf(stderr, "[prep-delay] K3_PREP_DELAY_US=%lu applied per prepare call\n",
+                     parsed);
+      }
+      return parsed;
+    }();
+    if (prep_delay_us != 0) {
+      usleep(static_cast<useconds_t>(prep_delay_us));
+    }
+    // K3_GPU_TIMELINE=1: catch a root CB PyTorch rolled to mid-prepare, and
+    // report every two layer-sweeps (the loop path has its own cadence,
+    // the stock path had none).
+    deltafin::provider_internal::loop_gpu_timeline_note_aten("aten-prep");
+    {
+      static std::uint64_t prepare_calls = 0;
+      if (++prepare_calls % 186 == 0) {
+        deltafin::provider_internal::loop_gpu_timeline_flush();
+      }
+    }
     DeltafinProviderTargetSequencePrepareReportV1 produced = {};
     produced.struct_size = sizeof(produced);
     produced.abi_version = DELTAFIN_PROVIDER_ABI_VERSION;
@@ -7092,6 +7386,10 @@ deltafin_provider_target_sequence_take_prefetch_hint_v1(
     std::lock_guard<std::mutex> lock(session->mutex);
     session->require_open();
     require_live_target_sequence(*session, request->resource);
+    // Attention-timer split: the pilot readback inside take_prefetch_hint
+    // is the suspected bulk of Rust's expert_plan bucket.
+    const deltafin::provider_internal::PrepPhaseScope hint_scope(
+        deltafin::provider_internal::PrepPhase::Hint, 0);
 
     // take_prefetch_hint is explicitly fail-soft: an absent roster entry,
     // provider error, already-consumed hint, or poor optional
@@ -7105,8 +7403,9 @@ deltafin_provider_target_sequence_take_prefetch_hint_v1(
     if (hint.expert_count != 0) {
       const std::uint32_t active_layer =
           session->target_sequence->next_layer_index();
-      if (hint.expert_count < DELTAFIN_PROVIDER_ROUTE_TOP_K_V1 ||
-          hint.expert_count > DELTAFIN_PROVIDER_PILOT_MAX_PREFETCH_V1 ||
+      // K3_PILOT_CAP narrows legitimate hints below the top-16 floor; the
+      // Rust plan constructor still enforces its own topup-gated minimum.
+      if (hint.expert_count > DELTAFIN_PROVIDER_PILOT_MAX_PREFETCH_V1 ||
           hint.source_layer != active_layer ||
           hint.target_layer != active_layer + 1 ||
           hint.target_layer >= kK3Layers) {
@@ -7131,6 +7430,180 @@ deltafin_provider_target_sequence_take_prefetch_hint_v1(
   });
 }
 
+extern "C" int32_t deltafin_provider_prep_timer_report_v1(
+    uint64_t* values, const size_t value_count, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (values == nullptr && value_count != 0) {
+      throw std::invalid_argument("provider prep-timer report buffer is null");
+    }
+    deltafin::provider_internal::prep_timer_report(values, value_count);
+  });
+}
+
+namespace {
+
+/* Step 6 pre-commit orchestration: after a finish-experts call completes a
+ * layer via the loop tail, ask the sequence which successor KDA layer is
+ * eligible and hand it a freshly built binding — the SAME per-owner fp32
+ * execution views the later prepare will resolve again (cache hit), so the
+ * pre-computed math is bit-equal to the synchronous path and nothing reads
+ * stale arena storage. Fail-soft by construction. */
+void maybe_precommit_next_kda_layer(auto& session,
+                                    const std::uint64_t spine_generation,
+                                    const auto sequence_owner) noexcept {
+  static const bool orch_probe = [] {
+    const char* value = std::getenv("K3_ROUTE_SYNC_PROBE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  static std::atomic<int> orch_dumps{0};
+  const auto trace = [&](const char* stage) {
+    if (orch_probe && orch_dumps.fetch_add(1) < 12) {
+      std::fprintf(stderr, "[precommit-orch] %s\n", stage);
+    }
+  };
+  // K3_TAIL_ASYNC=1: the just-finished layer's tail CB may be deferred.
+  // Deferring stays legal ONLY while every subsequent consumer of the
+  // layer output is loop-side and event-ordered — i.e. exactly when this
+  // hook chains the successor's KDA CB. On every other exit (not wanted,
+  // not resident, precommit abandoned, exception) the synchronous tail
+  // contract must come back before the caller returns to ATen-side work.
+  // The drain's failure path swallows here (this hook is fail-soft) but
+  // poisons, and the finish ABI raises the hard error.
+  struct DeferredTailGuard {
+    bool chained = false;
+    ~DeferredTailGuard() {
+      // K3_CB_FUSION=1: the layer tail CB is still OPEN (the successor's
+      // KDA/route encoders may have just joined it); every exit of this
+      // hook — chained, skipped, or thrown — must commit it and take the
+      // synchronous tail wait before ATen-side work resumes. Failures
+      // poison sticky and the finish ABI raises them below.
+      if (deltafin::provider_internal::loop_cb_fusion_enabled()) {
+        try {
+          deltafin::provider_internal::loop_fused_flush();
+        } catch (...) {
+        }
+      }
+      if (!chained && deltafin::provider_internal::loop_tail_async_enabled()) {
+        try {
+          deltafin::provider_internal::loop_moe_tail_drain();
+        } catch (...) {
+        }
+      }
+    }
+  } tail_guard;
+  try {
+    if (session.target_sequence == nullptr) {
+      return;
+    }
+    const std::uint32_t want = session.target_sequence->precommit_wanted();
+    if (want == std::numeric_limits<std::uint32_t>::max()) {
+      return;
+    }
+    trace("want");
+    static_cast<void>(spine_generation);
+    // Per-layer bind generations differ, and the finish request only
+    // carries the JUST-FINISHED layer's. The successor's resident slot is
+    // the authority here — with full residency it is stable for the
+    // session, and the tape's cache-version checks guard staleness.
+    if (want >= session.resident_spine_layers.size() ||
+        session.resident_spine_layers[want] == nullptr) {
+      trace("not-resident");
+      return;
+    }
+    const SpineLayerSlot& spine = *session.resident_spine_layers[want];
+    if (spine.target_residual == nullptr) {
+      trace("no-residual");
+      return;
+    }
+    if (deltafin::provider_internal::target_layer_uses_mla(want)) {
+      // Step 4 chain-lite: precommit_wanted only names an MLA successor
+      // in K3_MLA_LOOP=chain mode. The chained CB consumes the resident
+      // int8 spine forms directly — zero arena dependence, no dequant
+      // ordering (the int8-direct precedent), so the fp32 materializer
+      // below is neither needed nor touched.
+      try {
+        deltafin::provider_internal::MlaWeights mla_chain =
+            mla_weights_from_spine(spine, nullptr);
+        auto mla_binding = deltafin::provider_internal::TargetLayerBinding{
+            .layer_index = want,
+            .attention_kind =
+                deltafin::provider_internal::TargetAttentionKind::Mla,
+            .residual = spine.target_residual.get()};
+        mla_binding.mla_parity_weights = &mla_chain;
+        mla_binding.mla_parity_bundle = spine.mla_input_bundle.get();
+        session.target_sequence->try_precommit_next(mla_binding);
+        trace("mla-submitted");
+      } catch (const std::exception& error) {
+        if (orch_probe && orch_dumps.fetch_add(1) < 12) {
+          std::fprintf(stderr, "[precommit-orch] MLA EX: %s\n",
+                       error.what());
+        }
+      } catch (...) {
+        trace("mla-EX-unknown");
+      }
+      return;
+    }
+    const auto fp32_execution =
+        maybe_materialize_spine_fp32(session, spine, sequence_owner);
+    const SpineFp32ExecutionView* execution =
+        fp32_execution.has_value() ? &*fp32_execution : nullptr;
+    // int8-direct (user-approved): pre-committed loop CBs consume the
+    // resident int8 spine directly — no arena dependence, no dequant
+    // ordering, ~4x lighter GEMV reads. Falls back to the fp32 views if
+    // any projection slot is not row-int8.
+    std::optional<deltafin::provider_internal::KdaWeights> kda_int8;
+    if (deltafin::provider_internal::kda_int8_direct_enabled()) {
+      kda_int8 = kda_weights_from_spine_int8(spine);
+    }
+    const bool int8_direct = kda_int8.has_value();
+    deltafin::provider_internal::KdaWeights kda =
+        int8_direct ? std::move(*kda_int8)
+                    : kda_weights_from_spine(spine, execution);
+    if (!int8_direct) {
+      qualify_kda_weights(session, kda);
+    }
+    // Milestone (iii): the router rides along so the route CB can chain
+    // behind the pre-committed KDA CB. int8-direct builds it from the
+    // SLOT forms (execution=nullptr): the chain then dispatches the int8
+    // route kernel and the whole chained pair touches no arena bytes.
+    deltafin::provider_internal::MoeSpineT1 moe =
+        target_moe_from_spine(spine, int8_direct ? nullptr : execution);
+    // fp32-view mode only: complete the just-encoded dequant inside the
+    // host gap and consume the dequant marker so the chained CBs go
+    // fenceless onto the warm queue. int8-direct needs neither (the
+    // dequant marker stays for the next fp32 reader; prepare's own
+    // materialize covers the tail/MLA consumers with their own fences).
+    if (!int8_direct &&
+        deltafin::provider_internal::loop_consume_fresh_marker()) {
+      deltafin::provider_internal::loop_drain_aten_stream();
+    }
+    trace("built");
+    auto binding = deltafin::provider_internal::TargetLayerBinding{
+        .layer_index = want,
+        .attention_kind =
+            deltafin::provider_internal::TargetAttentionKind::Kda,
+        .residual = spine.target_residual.get()};
+    binding.kda_weights = &kda;
+    binding.moe = &moe;
+    session.target_sequence->try_precommit_next(binding);
+    trace("submitted");
+    // The chained-route pending layer is the ground truth that the
+    // successor's KDA+route CBs are actually on the queue behind the
+    // (possibly deferred) tail.
+    tail_guard.chained =
+        deltafin::provider_internal::loop_router_pending_layer() == want;
+  } catch (const std::exception& error) {
+    if (orch_probe && orch_dumps.fetch_add(1) < 12) {
+      std::fprintf(stderr, "[precommit-orch] EX: %s\n", error.what());
+    }
+  } catch (...) {
+    trace("EX-unknown");
+  }
+}
+
+}  // namespace
+
 extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v1(
     const DeltafinProviderTargetSequenceFinishExpertsRequestV1* request,
     DeltafinProviderTargetSequenceFinishExpertsReportV1* report, char* error,
@@ -7145,7 +7618,7 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v1(
                    "provider target-sequence expert request");
     if (report->struct_size != sizeof(*report) ||
         (request->flags &
-         ~DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1) != 0 ||
+         ~(DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1 | DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1 | DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1)) != 0 ||
         !all_zero(request->reserved) ||
         request->spine_generation == 0 || request->row_count == 0 ||
         request->row_count >
@@ -7157,6 +7630,12 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v1(
       throw std::invalid_argument(
           "provider target-sequence expert request has invalid bounds/flags/reserved fields");
     }
+    // Expert-kernel split (2026-09-03): everything below is Rust's
+    // expert_kernel bucket — routed-input host syncs, Metal MoE encode, the
+    // synchronous CB wait, output handling. Bucketed by tile width.
+    const deltafin::provider_internal::PrepPhaseScope finish_scope(
+        deltafin::provider_internal::PrepPhase::Finish,
+        request->row_count > 1 ? 1 : 0);
     for (std::size_t index = 0; index < request->expert_count; ++index) {
       if (request->expert_ids[index] >= kK3Experts ||
           (index != 0 && request->expert_ids[index - 1] >=
@@ -7214,6 +7693,15 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v1(
         static_cast<std::uint16_t>(request->first_row),
         static_cast<std::uint16_t>(request->row_count),
         request->spine_generation, experts, options);
+    {
+      const deltafin::provider_internal::PrepSubScope precommit_scope(2);
+      maybe_precommit_next_kda_layer(*session, request->spine_generation,
+                                     request->sequence);
+    }
+    if (deltafin::provider_internal::loop_tail_poisoned()) {
+      throw std::runtime_error(
+          "deferred loop MoE tail failed after its wait was deferred");
+    }
 
     DeltafinProviderTargetSequenceFinishExpertsReportV1 produced = {};
     produced.struct_size = sizeof(produced);
@@ -7223,7 +7711,11 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v1(
     produced.layer_index = request->layer_index;
     produced.first_row = request->first_row;
     produced.row_count = request->row_count;
-    produced.next_expert_row = request->first_row + request->row_count;
+    produced.next_expert_row =
+        ((request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1) != 0 &&
+         (request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1) == 0)
+            ? request->first_row
+            : request->first_row + request->row_count;
     produced.state = target_sequence_state_value(
         session->target_sequence->state());
     *report = produced;
@@ -7245,7 +7737,7 @@ deltafin_provider_target_sequence_finish_expert_spans_v1(
                    "provider target-sequence scattered expert request");
     if (report->struct_size != sizeof(*report) ||
         (request->flags &
-         ~DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1) != 0 ||
+         ~(DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1 | DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1 | DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1)) != 0 ||
         !all_zero(request->reserved) || request->spine_generation == 0 ||
         request->row_count == 0 ||
         request->row_count >
@@ -7282,6 +7774,11 @@ deltafin_provider_target_sequence_finish_expert_spans_v1(
       throw std::invalid_argument(
           "provider target-sequence scattered expert span does not match its layout");
     }
+    // Expert-kernel split: this export is the Metal scattered-span tile path
+    // (pinned/hit/demand spans) — the one nearly every decode tile takes.
+    const deltafin::provider_internal::PrepPhaseScope finish_scope(
+        deltafin::provider_internal::PrepPhase::Finish,
+        request->row_count > 1 ? 1 : 0);
 
     const auto session = find_session(request->session);
     const c10::InferenceMode inference_guard;
@@ -7320,6 +7817,15 @@ deltafin_provider_target_sequence_finish_expert_spans_v1(
         static_cast<std::uint16_t>(request->first_row),
         static_cast<std::uint16_t>(request->row_count),
         request->spine_generation, experts, options);
+    {
+      const deltafin::provider_internal::PrepSubScope precommit_scope(2);
+      maybe_precommit_next_kda_layer(*session, request->spine_generation,
+                                     request->sequence);
+    }
+    if (deltafin::provider_internal::loop_tail_poisoned()) {
+      throw std::runtime_error(
+          "deferred loop MoE tail failed after its wait was deferred");
+    }
 
     DeltafinProviderTargetSequenceFinishExpertsReportV1 produced = {};
     produced.struct_size = sizeof(produced);
@@ -7329,7 +7835,11 @@ deltafin_provider_target_sequence_finish_expert_spans_v1(
     produced.layer_index = request->layer_index;
     produced.first_row = request->first_row;
     produced.row_count = request->row_count;
-    produced.next_expert_row = request->first_row + request->row_count;
+    produced.next_expert_row =
+        ((request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1) != 0 &&
+         (request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1) == 0)
+            ? request->first_row
+            : request->first_row + request->row_count;
     produced.state =
         target_sequence_state_value(session->target_sequence->state());
     *report = produced;
@@ -7350,7 +7860,7 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v2(
                    "provider target-sequence v2 expert request");
     if (report->struct_size != sizeof(*report) ||
         (request->flags &
-         ~DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1) != 0 ||
+         ~(DELTAFIN_PROVIDER_TARGET_EXPERT_RETAIN_METAL_WRAPPERS_V1 | DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1 | DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1)) != 0 ||
         !all_zero(request->reserved) || request->spine_generation == 0 ||
         request->row_count == 0 ||
         request->row_count >
@@ -7389,6 +7899,10 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v2(
       throw std::invalid_argument(
           "provider target-sequence v2 experts require exactly one canonical contiguous or scattered storage form");
     }
+    // Expert-kernel split: this export is the v2 tile path.
+    const deltafin::provider_internal::PrepPhaseScope finish_scope(
+        deltafin::provider_internal::PrepPhase::Finish,
+        request->row_count > 1 ? 1 : 0);
     if (scattered) {
       for (std::size_t index = 0; index < request->expert_count; ++index) {
         if (request->expert_span_pointers[index] == nullptr ||
@@ -7444,9 +7958,20 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v2(
             *session, request->layer_index, request->spine_generation,
             request->first_row, request->row_count,
             DELTAFIN_PROVIDER_TARGET_SEQUENCE_MAX_EXPERTS_V2);
-    if (canonical.size() != request->expert_count ||
-        !std::equal(canonical.begin(), canonical.end(),
-                    request->expert_ids)) {
+    if ((request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1) != 0) {
+      // Arrival-driven group: a sorted, unique SUBSET of the route union. The
+      // caller proves the groups partition the union by the final call.
+      for (std::uint32_t index = 0; index < request->expert_count; ++index) {
+        const std::uint16_t expert = request->expert_ids[index];
+        if ((index != 0 && request->expert_ids[index - 1] >= expert) ||
+            !std::binary_search(canonical.begin(), canonical.end(), expert)) {
+          throw std::invalid_argument(
+              "target-sequence arrival group is not a sorted subset of the canonical route union");
+        }
+      }
+    } else if (canonical.size() != request->expert_count ||
+               !std::equal(canonical.begin(), canonical.end(),
+                           request->expert_ids)) {
       throw std::invalid_argument(
           "target-sequence v2 expert IDs are not the exact canonical route union");
     }
@@ -7478,6 +8003,15 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v2(
         static_cast<std::uint16_t>(request->first_row),
         static_cast<std::uint16_t>(request->row_count),
         request->spine_generation, experts, options);
+    {
+      const deltafin::provider_internal::PrepSubScope precommit_scope(2);
+      maybe_precommit_next_kda_layer(*session, request->spine_generation,
+                                     request->sequence);
+    }
+    if (deltafin::provider_internal::loop_tail_poisoned()) {
+      throw std::runtime_error(
+          "deferred loop MoE tail failed after its wait was deferred");
+    }
 
     DeltafinProviderTargetSequenceFinishExpertsReportV1 produced = {};
     produced.struct_size = sizeof(produced);
@@ -7487,7 +8021,11 @@ extern "C" int32_t deltafin_provider_target_sequence_finish_experts_v2(
     produced.layer_index = request->layer_index;
     produced.first_row = request->first_row;
     produced.row_count = request->row_count;
-    produced.next_expert_row = request->first_row + request->row_count;
+    produced.next_expert_row =
+        ((request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1) != 0 &&
+         (request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1) == 0)
+            ? request->first_row
+            : request->first_row + request->row_count;
     produced.state =
         target_sequence_state_value(session->target_sequence->state());
     *report = produced;
@@ -7765,6 +8303,15 @@ deltafin_provider_target_sequence_finish_planned_experts_v1(
       cancel_cuda_plan();
       throw;
     }
+    {
+      const deltafin::provider_internal::PrepSubScope precommit_scope(2);
+      maybe_precommit_next_kda_layer(*session, request->spine_generation,
+                                     request->sequence);
+    }
+    if (deltafin::provider_internal::loop_tail_poisoned()) {
+      throw std::runtime_error(
+          "deferred loop MoE tail failed after its wait was deferred");
+    }
     // CUDA success and classified Auto fallback consume the adapter plan
     // internally. cancel_plan is deliberately idempotent, so this one cleanup
     // point also covers CPU-frozen plans and future early-success variants.
@@ -7778,7 +8325,11 @@ deltafin_provider_target_sequence_finish_planned_experts_v1(
     produced.layer_index = request->layer_index;
     produced.first_row = request->first_row;
     produced.row_count = request->row_count;
-    produced.next_expert_row = request->first_row + request->row_count;
+    produced.next_expert_row =
+        ((request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_PARTIAL_V1) != 0 &&
+         (request->flags & DELTAFIN_PROVIDER_TARGET_EXPERT_ARRIVAL_FINAL_V1) == 0)
+            ? request->first_row
+            : request->first_row + request->row_count;
     produced.state =
         target_sequence_state_value(session->target_sequence->state());
     *report = produced;

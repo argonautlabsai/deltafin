@@ -408,8 +408,55 @@ impl RawExpertCorpus {
                 names.push(raw_expert_source_name(layer, expert)?);
             }
         }
-        let catalog = DeferredExactCatalog::open(
+        let hot_dir = expert_hot_tier_dir();
+        if let Some(hot) = &hot_dir {
+            eprintln!(
+                "[native] expert hot tier enabled: {} (probed before {})",
+                hot.display(),
+                model_root.join("k3-experts").display()
+            );
+        }
+        eprintln!(
+            "[native] split-read: {}",
+            crate::storage::split_read_config_report()
+        );
+        // Tier directories for the balanced plan path (K3_PLAN_BALANCE):
+        // 0 hot, 1 dir_c, 2 dir_b, 3 primary.
+        if let Some(hot) = &hot_dir {
+            crate::storage::register_tier_dir(0, hot);
+        }
+        if let Some(c) = expert_dir_c() {
+            crate::storage::register_tier_dir(1, c);
+        }
+        if let Some(b) = expert_dir_b() {
+            crate::storage::register_tier_dir(2, b);
+        }
+        crate::storage::register_tier_dir(3, &model_root.join("k3-experts"));
+        eprintln!(
+            "[native] plan-path balance: {}",
+            if crate::storage::plan_balance_enabled() { "on (lowest expected completion among holders)" } else { "off (static chain dir_c -> hot -> dir_b -> primary)" }
+        );
+        let dir_b = expert_dir_b();
+        if let Some(b) = dir_b {
+            eprintln!(
+                "[native] expert volume B enabled: {} (probed after hot, before {})",
+                b.display(),
+                model_root.join("k3-experts").display()
+            );
+        }
+        let dir_c = expert_dir_c();
+        if let Some(c) = dir_c {
+            eprintln!(
+                "[native] expert volume C enabled: {} (probed before hot and {})",
+                c.display(),
+                model_root.join("k3-experts").display()
+            );
+        }
+        let catalog = DeferredExactCatalog::open_tiered(
             &model_root.join("k3-experts"),
+            hot_dir.as_deref(),
+            dir_b,
+            dir_c,
             names,
             K3_EXPERT_SOURCE_BYTES as u64,
             stream_cache_policy,
@@ -553,6 +600,40 @@ impl RawExpertCorpus {
         canonical_expert_ids: &[u16],
         priority: ReadPriority,
     ) -> Result<ExpertUnionReadTicket> {
+        self.submit_union_inner(reader, layer, canonical_expert_ids, priority, true)?
+            .ok_or_else(|| {
+                DeltafinError::new("blocking expert union submission found no arena slot")
+            })
+    }
+
+    /// Non-blocking union submission for speculative callers (pilot plans,
+    /// true-route top-ups): `None` means the bounded arena has no eligible
+    /// slot right now. Speculation must never park the decode thread on the
+    /// arena condvar — the slots it would wait for can be held by
+    /// speculative tickets only that same thread can claim or drain.
+    pub fn try_submit_union_with_priority(
+        &self,
+        reader: &Reader,
+        layer: u32,
+        canonical_expert_ids: &[u16],
+        priority: ReadPriority,
+    ) -> Result<Option<ExpertUnionReadTicket>> {
+        self.submit_union_inner(reader, layer, canonical_expert_ids, priority, false)
+    }
+
+    fn submit_union_inner(
+        &self,
+        reader: &Reader,
+        layer: u32,
+        canonical_expert_ids: &[u16],
+        priority: ReadPriority,
+        wait_for_slot: bool,
+    ) -> Result<Option<ExpertUnionReadTicket>> {
+        // One balancing epoch per submitted union: the tier probe order should
+        // reflect THIS tile's accumulating load, not the whole run's. A global
+        // counter converges back to the static bandwidth split and buys nothing
+        // (simulated -30.6% versus the fixed chain); the win is per-barrier.
+        crate::storage::tier_balance_new_epoch();
         let selection = canonical_union_selection(layer, canonical_expert_ids)?;
         self.ensure_available(layer, selection.expert_ids())?;
         let (layout, expected_bytes, expected_jobs, scale4_entries, scale4_validation, ticket) =
@@ -566,12 +647,16 @@ impl RawExpertCorpus {
                         ));
                     }
                     let ticket = if selection.len() <= K3_EXPERT_TOP_K {
-                        reader.submit_deferred_exact(
+                        match reader.try_submit_deferred_exact_with_wait(
                             catalog,
                             selection.source_indices(),
                             K3_EXPERT_BUFFER_KIND,
                             priority,
-                        )?
+                            wait_for_slot,
+                        )? {
+                            Some(ticket) => ticket,
+                            None => return Ok(None),
+                        }
                     } else {
                         // The inline catalog batch is intentionally fixed at the hot
                         // decode top-k. A wider sequence union still enters the Reader's
@@ -584,7 +669,14 @@ impl RawExpertCorpus {
                             DEFAULT_EXPERT_CHUNK_BYTES,
                             self.stream_cache_policy,
                         )?;
-                        reader.submit(plan.read_plan(), priority)?
+                        match reader.try_submit_with_wait(
+                            plan.read_plan(),
+                            priority,
+                            wait_for_slot,
+                        )? {
+                            Some(ticket) => ticket,
+                            None => return Ok(None),
+                        }
                     };
                     (
                         ExpertStorageLayout::RawV1,
@@ -621,7 +713,14 @@ impl RawExpertCorpus {
                     let expected_jobs = plan.read_plan().jobs();
                     let scale4_entries = plan.scale4_entries.clone();
                     let reader_verified = plan.scale4_reader_verified.clone();
-                    let ticket = reader.submit(plan.read_plan(), priority)?;
+                    let Some(ticket) = reader.try_submit_with_wait(
+                        plan.read_plan(),
+                        priority,
+                        wait_for_slot,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
                     (
                         ExpertStorageLayout::Scale4V2,
                         expected_bytes,
@@ -637,7 +736,7 @@ impl RawExpertCorpus {
                     )
                 }
             };
-        Ok(ExpertUnionReadTicket {
+        Ok(Some(ExpertUnionReadTicket {
             layer,
             expert_ids: selection.expert_ids().to_vec().into_boxed_slice(),
             layout,
@@ -646,7 +745,7 @@ impl RawExpertCorpus {
             scale4_entries,
             scale4_validation,
             ticket,
-        })
+        }))
     }
 
     /// Submit one scheduling-only expert read without ever admitting a remote
@@ -654,6 +753,58 @@ impl RawExpertCorpus {
     /// demand path remains responsible for fetching and validating misses.
     /// Complete installations reuse the ordinary authenticated one-expert
     /// plan at prefetch priority.
+    /// K3_SUMMER_READ_INTO_SLOT: one raw-v1 expert read whose bytes land
+    /// directly in caller-owned page-aligned memory (a Summer pool slot).
+    /// Raw storage only; None when the corpus is incomplete, the storage is
+    /// not raw-v1, or the destination cannot hold one expert record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_submit_one_into(
+        &self,
+        reader: &Reader,
+        layer: u32,
+        expert: u16,
+        dest_pointer: std::ptr::NonNull<u8>,
+        dest_capacity: usize,
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        priority: ReadPriority,
+    ) -> Result<Option<ExpertUnionReadTicket>> {
+        if self.lazy_missing_files() != 0 {
+            return Ok(None);
+        }
+        let ExpertCorpusStorage::Raw(catalog) = &self.storage else {
+            return Ok(None);
+        };
+        crate::storage::tier_balance_new_epoch();
+        let selection = canonical_union_selection(layer, &[expert])?;
+        self.ensure_available(layer, selection.expert_ids())?;
+        let expected_bytes = checked_batch_bytes(selection.len(), K3_EXPERT_SOURCE_BYTES)?;
+        if selection.len() != 1 || expected_bytes as usize > dest_capacity {
+            return Ok(None);
+        }
+        let Some(ticket) = reader.try_submit_deferred_exact_into(
+            catalog,
+            selection.source_indices(),
+            K3_EXPERT_BUFFER_KIND,
+            priority,
+            dest_pointer,
+            dest_capacity,
+            keepalive,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ExpertUnionReadTicket {
+            layer,
+            expert_ids: selection.expert_ids().to_vec().into_boxed_slice(),
+            layout: ExpertStorageLayout::RawV1,
+            expected_bytes,
+            expected_jobs: selection.len(),
+            scale4_entries: None,
+            scale4_validation: None,
+            ticket,
+        }))
+    }
+
     pub fn try_submit_local_prefetch_one(
         &self,
         reader: &Reader,
@@ -663,8 +814,29 @@ impl RawExpertCorpus {
         if self.lazy_missing_files() != 0 {
             return Ok(None);
         }
-        self.submit_union_with_priority(reader, layer, &[expert], ReadPriority::Prefetch)
-            .map(Some)
+        // Non-blocking by contract: a full arena skips this speculative
+        // read (the authoritative demand path covers the miss) instead of
+        // parking the decode thread on slots only it can release.
+        self.try_submit_union_with_priority(reader, layer, &[expert], ReadPriority::Prefetch)
+    }
+    /// K3_DEMAND_FANOUT: a single-expert DEMAND-class submission for the
+    /// prefetch Reader — demand pops ahead of queued prefetch batches and
+    /// may take the final arena slot, letting a decode miss union fan out
+    /// across both pools (16 files -> 16 workers -> one service round).
+    /// Non-blocking by the same contract as the prefetch sibling.
+    pub fn try_submit_local_demand_one(
+        &self,
+        reader: &Reader,
+        layer: u32,
+        expert: u16,
+    ) -> Result<Option<ExpertUnionReadTicket>> {
+        if self.lazy_missing_files() != 0 {
+            return Ok(None);
+        }
+        // Non-blocking by contract: a full arena skips this speculative
+        // read (the authoritative demand path covers the miss) instead of
+        // parking the decode thread on slots only it can release.
+        self.try_submit_union_with_priority(reader, layer, &[expert], ReadPriority::Demand)
     }
 
     pub fn read_union(
@@ -768,6 +940,51 @@ fn raw_cache_missing_files(model_root: &Path) -> Result<usize> {
             )));
         }
         present[expert_source_index(layer, expert)?] = true;
+    }
+    // The optional second expert volume (K3_EXPERT_DIR_B) is part of the
+    // canonical corpus in the de-striped layout: files found there count as
+    // present. Same strict validation; the fail-closed error applies to
+    // canonical-looking corrupt entries on either volume. The hot tier is
+    // deliberately NOT counted — it remains a pure cache of these files.
+    if let Some(dir_b) = expert_dir_b() {
+        let entries = fs::read_dir(dir_b).map_err(|error| {
+            DeltafinError::new(format!(
+                "scan raw expert cache {}: {error}",
+                dir_b.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                DeltafinError::new(format!(
+                    "scan raw expert cache {}: {error}",
+                    dir_b.display()
+                ))
+            })?;
+            let Some((layer, expert)) = parse_raw_expert_filename(&entry.file_name()) else {
+                continue;
+            };
+            let file_type = entry.file_type().map_err(|error| {
+                DeltafinError::new(format!("inspect raw expert cache entry: {error}"))
+            })?;
+            let metadata = entry.metadata().map_err(|error| {
+                DeltafinError::new(format!(
+                    "inspect raw expert cache entry {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_symlink()
+                || !file_type.is_file()
+                || !metadata.is_file()
+                || metadata.len() != K3_EXPERT_SOURCE_BYTES as u64
+            {
+                return Err(DeltafinError::new(format!(
+                    "canonical raw expert cache entry is not an exact regular {}-byte file: {}",
+                    K3_EXPERT_SOURCE_BYTES,
+                    entry.path().display()
+                )));
+            }
+            present[expert_source_index(layer, expert)?] = true;
+        }
     }
     Ok(present.into_iter().filter(|value| !*value).count())
 }
@@ -916,6 +1133,27 @@ impl ExpertUnionReadTicket {
 
     pub fn drain_cancelled(self) {
         self.ticket.drain_cancelled();
+    }
+
+    /// Arrival-driven compute: indices into `expert_ids()` whose bytes have
+    /// fully landed (the union's sources are in expert-id order).
+    pub fn ready_sources(&self) -> Vec<usize> {
+        self.ticket.ready_sources()
+    }
+
+    /// Block until at least `minimum` experts have landed (or the read
+    /// finished / was cancelled) and return the complete indices.
+    pub fn wait_ready_sources(&self, minimum: usize) -> Vec<usize> {
+        self.ticket.wait_ready_sources(minimum)
+    }
+
+    /// The union slab while in flight; only ready experts' spans are valid.
+    pub fn peek_other(&self) -> &[u8] {
+        self.ticket.peek_other()
+    }
+
+    pub fn check_error(&self) -> Result<()> {
+        self.ticket.check_error()
     }
 
     pub fn wait(self) -> Result<ExpertUnionReadBatch> {
@@ -1077,8 +1315,9 @@ impl ExpertBatchPlan {
         let mut extents = Vec::with_capacity(expert_ids.len());
         let mut descriptors = Vec::with_capacity(expert_ids.len());
         let cache = model_root.join("k3-experts");
+        let hot_dir = expert_hot_tier_dir();
         for (batch_index, &expert) in expert_ids.iter().enumerate() {
-            let path = expert_path(&cache, layer, expert);
+            let path = resolve_expert_path(hot_dir.as_deref(), &cache, layer, expert);
             let expert_destination = batch_index
                 .checked_mul(K3_EXPERT_SOURCE_BYTES)
                 .ok_or_else(|| DeltafinError::new("expert raw offset overflows usize"))?;
@@ -1210,6 +1449,14 @@ impl ExpertBatchPlan {
         );
 
         let raw_root = model_root.join("k3-experts");
+        // 2026-08-27: scale4 reads the RAW expert planes alongside its
+        // sidecar, and used to address them at the primary root only —
+        // invisible to the hot tier and the K3_EXPERT_DIR_B overlay. On a
+        // multi-volume layout that is not merely slow (the recorded -12%
+        // "scale4 bypasses the hot tier"), it fails outright: the first
+        // expert homed off-primary is unopenable and poisons the engine.
+        // Use the same probe chain raw-v1 uses.
+        let scale4_hot_dir = expert_hot_tier_dir();
         let sidecar = manifest.root().join(format!("L{layer}.sc4"));
         let mut extents = Vec::with_capacity(expert_ids.len() * 4);
         let mut source_lengths = Vec::with_capacity(expert_ids.len() + 1);
@@ -1235,7 +1482,8 @@ impl ExpertBatchPlan {
             let expert_destination = slot
                 .checked_mul(K3_SCALE4_BLOB_BYTES)
                 .ok_or_else(|| DeltafinError::new("scale4 expert offset overflows usize"))?;
-            let raw = expert_path(&raw_root, layer, expert);
+            let raw =
+                resolve_expert_path(scale4_hot_dir.as_deref(), &raw_root, layer, expert);
 
             source_lengths.push(DeferredSourceLength::new(
                 &raw,
@@ -1682,6 +1930,134 @@ fn validate_layer(layer: u32) -> Result<()> {
 
 fn expert_path(cache: &Path, layer: u32, expert: u16) -> PathBuf {
     cache.join(format!("L{layer}-E{expert}.bin"))
+}
+
+/// Optional read-side fast tier holding byte-identical copies of hot experts
+/// (K3_EXPERT_HOT_DIR). Unset, empty, or non-directory values disable it.
+fn expert_hot_tier_dir() -> Option<PathBuf> {
+    let raw = std::env::var("K3_EXPERT_HOT_DIR").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => Some(path),
+        _ => None,
+    }
+}
+
+/// Optional second expert volume (K3_EXPERT_DIR_B): the de-striped layout
+/// splits the expert files across two independent NVMe volumes, and this
+/// overlay makes the second one part of the ordinary resolve chain. Same
+/// contract as the hot tier: unset, empty, or non-directory disables it.
+fn expert_dir_b() -> Option<&'static Path> {
+    static DIR_B: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR_B
+        .get_or_init(|| {
+            let raw = std::env::var("K3_EXPERT_DIR_B").ok()?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let path = PathBuf::from(trimmed);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => Some(path),
+                _ => None,
+            }
+        })
+        .as_deref()
+}
+
+/// Optional third expert volume (K3_EXPERT_DIR_C). Same contract as DIR_B.
+///
+/// Added 2026-08-28 for the three-enclosure layout. Storage supply already
+/// EXCEEDS engine demand (16.23 GB/s measured across three separate buses vs
+/// 14.4-14.8 GB/s drawn), so this is NOT expected to raise throughput — nine
+/// prior supply-side experiments were all null. The only mechanism it could
+/// plausibly exploit is demand-miss LATENCY: spreading shards over a third
+/// device shortens per-drive queues, and ~46% of demand-blocked time is
+/// queue-late. The SN8100 on K3C is also 30% faster per cold read (2.34 ms
+/// vs 3.34 ms on the SN7100s). Treat any gain as a latency result, not a
+/// bandwidth one.
+fn expert_dir_c() -> Option<&'static Path> {
+    static DIR_C: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR_C
+        .get_or_init(|| {
+            let raw = std::env::var("K3_EXPERT_DIR_C").ok()?;
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let path = PathBuf::from(trimmed);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => Some(path),
+                _ => None,
+            }
+        })
+        .as_deref()
+}
+
+/// Prefer the hot-tier copy, then the optional second and third volumes, iff
+/// the candidate is a non-symlink regular file of exactly the raw expert
+/// length; anything else falls back to the primary path. A wrong-size or
+/// missing file in an overlay can therefore never break a read — it only
+/// redirects it.
+///
+/// Overlay ORDER IS THE PLACEMENT POLICY: DIR_C first, then the hot tier,
+/// then DIR_B, then the primary root.
+///
+/// **DIR_C DELIBERATELY OUTRANKS EVEN THE HOT TIER**, which looks wrong until
+/// you see the measurement. Trace over 3680 layer-visits: of the 16 experts
+/// routed per layer, **10.28 resolve to the internal hot tier (64.3%)** while
+/// K3A and K3B take 2.87 and 2.85 — and the internal SSD holds only ~41% of
+/// the machine's read capacity (11.68 of 28.73 GB/s measured four-way). So
+/// the hot tier makes internal the straggler on every layer while the other
+/// devices idle, which is what the "14.4-14.8 GB/s demand cap" actually was.
+///
+/// Ranking DIR_C top lets a COPY placed on the third volume take the read
+/// away from the hot tier WITHOUT deleting anything: the hot-tier file and
+/// the K3A/K3B originals all stay exactly where they are, and the whole
+/// experiment reverts by unsetting K3_EXPERT_DIR_C. Placement is therefore
+/// controlled purely by which shards get copied to DIR_C.
+///
+/// Hotness should influence PLACEMENT; it must not dictate the physical
+/// reader.
+fn resolve_expert_path(hot: Option<&Path>, cache: &Path, layer: u32, expert: u16) -> PathBuf {
+    if crate::storage::plan_balance_enabled() {
+        // Balanced plan path (K3_PLAN_BALANCE=1): every tier that holds the
+        // file is a candidate; the lowest expected completion time wins.
+        let tiers: [Option<&Path>; 4] = [hot, expert_dir_c(), expert_dir_b(), Some(cache)];
+        let mut holds = [false; 4];
+        let mut paths: [Option<PathBuf>; 4] = [None, None, None, None];
+        for (tier, dir) in tiers.iter().enumerate() {
+            let Some(dir) = dir else { continue };
+            let candidate = expert_path(dir, layer, expert);
+            if let Ok(metadata) = std::fs::symlink_metadata(&candidate)
+                && metadata.is_file()
+                && metadata.len() == K3_EXPERT_SOURCE_BYTES as u64
+            {
+                holds[tier] = true;
+                paths[tier] = Some(candidate);
+            }
+        }
+        if let Some(tier) = crate::storage::plan_pick_tier(holds, K3_EXPERT_SOURCE_BYTES as u64) {
+            if let Some(path) = paths[tier].take() {
+                return path;
+            }
+        }
+        return expert_path(cache, layer, expert);
+    }
+    for overlay in [expert_dir_c(), hot, expert_dir_b()].into_iter().flatten() {
+        let candidate = expert_path(overlay, layer, expert);
+        if let Ok(metadata) = std::fs::symlink_metadata(&candidate)
+            && metadata.is_file()
+            && metadata.len() == K3_EXPERT_SOURCE_BYTES as u64
+        {
+            return candidate;
+        }
+    }
+    expert_path(cache, layer, expert)
 }
 
 #[cfg(test)]
