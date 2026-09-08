@@ -1,6 +1,11 @@
 # ARGODRIVE Deltafin
 
-A fork of gavamedia/deltafin (MIT) running Kimi K3 from SSDs on Apple Silicon, with the ARGODRIVE storage work. The benchmark package, placement manifests and results are in [`k3-public-bench/`](k3-public-bench/); the measurement instruments are published separately as [ARGODRIVE](https://github.com/argonautlabsai/argodrive). Credits and what this fork changes: [`CREDITS.md`](CREDITS.md). The upstream README follows below the benchmark section.
+**TL;DR** — Kimi K3 (2.8T-parameter MoE, 1.45 TB of expert weights) running on one M5 Max MacBook Pro with 128 GB, experts streamed from four SSDs.
+- **1.00 tok/s** steady decode over a 512-token answer; 1.13 over 128; 0.96 on the public 17-token prompt (upstream reported 0.68).
+- **The honest limit:** a 512-token prompt takes ~6.3 minutes to its first token. Cause found (prefill re-reads each layer's experts 8×), fix planned, not built.
+- **Useful findings:** one drive gives ≈52% of four-drive speed, two ≈73%, three ≈90% — the slowest of each layer's 16 reads sets the pace, not total bandwidth.
+- Every number is one cold run with the exact prompt; per-run logs and placement manifests are in [`k3-public-bench/`](k3-public-bench/).
+- Fork of [gavamedia/deltafin](https://github.com/gavamedia/deltafin) (MIT), who built the engine — see [`CREDITS.md`](CREDITS.md). Instruments: [ARGODRIVE](https://github.com/argonautlabsai/argodrive).
 
 ---
 
