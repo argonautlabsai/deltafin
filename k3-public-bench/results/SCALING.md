@@ -29,6 +29,10 @@ depth.
 
 ## Results
 
+![Decode speed by number of drives serving the experts](charts/drive-ladder.svg)
+
+![Per-drive draw under the engine against each drive's standalone ceiling](charts/drive-draw.svg)
+
 Four-drive figures are medians of two runs (France: three). One-, two- and
 three-drive generation rows are **single runs**; France is a median of three on
 every rung.

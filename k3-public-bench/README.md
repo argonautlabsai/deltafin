@@ -35,6 +35,8 @@ runs, cause not isolated — small differences on this rig need replication.
 | prompt processing, 512-token prompt | ≈1.4 tok/s | ≈1.4 tok/s | none, as expected |
 | first token, 512-token prompt | ≈376 s | ≈375 s | negligible |
 
+![Per-drive draw under the engine vs standalone ceiling](results/charts/drive-draw.svg)
+
 **Steady** excludes the first-token phase: `(generated - 1) / (elapsed_final -
 elapsed_first_token)`. **Inclusive** is `generated / elapsed` from process start
 and therefore contains the cold model load. Both are reported because they

@@ -5,6 +5,8 @@ of record. This page classifies that time from the engine's own phase timers
 and the per-device read counters, both recorded on the standard-length arms
 (`RESULTS-2026-09-08-standard-lengths.md`).
 
+![First token vs drives, and where the four-drive prefill time goes](charts/prefill.svg)
+
 ## Where the time goes
 
 Arm `PP512_OFF_A`, four drives, first token at 373.1 s:

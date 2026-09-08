@@ -24,6 +24,8 @@ on the hardware and quantization described in the package README.
 
 ## Results
 
+![Steady decode by answer length, drafter off and on](charts/steady-by-length.svg)
+
 Median of two runs at every setting.
 
 | test | drafter off | drafter on | drafter gain |

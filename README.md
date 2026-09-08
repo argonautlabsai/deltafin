@@ -23,6 +23,10 @@ run with the exact prompt, and the per-run logs are in
 | 17-token prompt from issue #15 (upstream reported 0.684 there), median of 3 | — | **0.9631** |
 | time to first token, 512-token prompt | ≈376 s | ≈375 s |
 
+![Decode speed by number of drives](k3-public-bench/results/charts/drive-ladder.svg)
+
+![Per-drive draw under the engine vs standalone ceiling](k3-public-bench/results/charts/drive-draw.svg)
+
 Drive-count ladder on the same prompts: one drive ≈52% of the four-drive
 speed, two full mirrors ≈73%, three ≈90% ([`results/SCALING.md`](k3-public-bench/results/SCALING.md)).
 Why prefill is slow and what fixes it: [`results/PREFILL.md`](k3-public-bench/results/PREFILL.md).
