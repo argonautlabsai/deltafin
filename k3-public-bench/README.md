@@ -37,6 +37,8 @@ runs, cause not isolated — small differences on this rig need replication.
 
 ![Per-drive draw under the engine vs standalone ceiling](results/charts/drive-draw.svg)
 
+![Per-drive read throughput during one 200-token run, all four drives](results/charts/read-timeline.svg)
+
 **Steady** excludes the first-token phase: `(generated - 1) / (elapsed_final -
 elapsed_first_token)`. **Inclusive** is `generated / elapsed` from process start
 and therefore contains the cold model load. Both are reported because they
