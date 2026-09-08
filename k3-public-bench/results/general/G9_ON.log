@@ -1,0 +1,470 @@
+ARM G9_ON START 14:08:47 overrides: K3_QWEN_ALLOW_CHAT=1 K3_CHAT_THINKING=0 tokens=200 chat=1 pressure_gb=60 prompt=[Translate the following into formal French and then back into English: "The quarterly report is due on Friday and the board expects a summary of cash flow."]
+[config] resolved: surface=DirectRun device=Auto spine=Auto spine_read_threads=auto spine_fd_cache=auto spine_stream_nocache=auto expert_stream_nocache=auto spine_resident_bytes=16000000000 provider_resident_layers=93 expert_read_threads=64 expert_prefetch_threads=12 expert_backend=Auto expert_scale4=Auto expert_pin_bytes=0 expert_heat=true expert_overlays=[hot=/Volumes/Green/serve-b-green:18017files dir_b=/Volumes/White/k3-experts-b:36018files dir_c=/Volumes/Yellow/serve3-green:15287files] pilot_gate=Off pilot_gate_threshold=0.1 pilot_gate_warmup=16 quality=QualityPolicy { target_authority: FullK3, routed_experts: 16, activation_precision: Fp32, resident_weights: QuantizedInt8 } dspark=Off dspark_max_context=8192 dspark_min_auto_speedup=0.03 dspark_miss_tolerance=1 dspark_max_drafts=7 qwen=On reasoning_effort=default router_trace_mode=Off router_trace_path=none chat=true stats=true layer_profile=false max_new=200
+[residency] residency set created
+[residency] queue attached (1 queues)
+[native] exact scale4-v2 expert storage unavailable (inspect scale4 manifest $K3_DIR/deltafin-root-local/k3-experts-scale4/scale4-manifest.json: No such file or directory (os error 2)); using raw-v1
+[native] expert hot tier enabled: /Volumes/Green/serve-b-green (probed before $K3_DIR/deltafin-root-local/k3-experts)
+[native] expert volume B enabled: /Volumes/White/k3-experts-b (probed after hot, before $K3_DIR/deltafin-root-local/k3-experts)
+[native] expert volume C enabled: /Volumes/Yellow/serve3-green (probed before hot and $K3_DIR/deltafin-root-local/k3-experts)
+[native] host=macos/aarch64 device=mps experts=metal/raw-v1 root=$K3_DIR/deltafin-root-local spine=loose-deferred representation=quantized-int8 (non-weight-exact) layers=93 globals=2 resident=93/93 (50.74 GiB) transient=0.00 GiB readers=spine:4t/expert:64t/prefetch:12t spine-fdcache=0/0fd cpu-expert:4t router-trace=false lazy-missing=0 LibTorch=2.13.0
+[native] optional Qwen: state=qwen3-0.6b model+KV-reserve=4.91 GiB verify-reserve=0.00 GiB/9 positions admitted-context=4389 tokens startup-error=none
+[native] context cache: initial=16 tokens/45.00 MiB, growth=2.81 MiB per capacity token, startup reserve=256 tokens/832.03 MiB, exact-expanded cap=4369 / model contract=1048576 tokens (live peak admission required beyond reserve)
+[native] verify snapshots: 452.81 MiB per candidate boundary, width 1..=64 (fresh peak admission; otherwise ordinary exact decode)
+[native] native target structure ready (all 16 routed experts; physical real-weight sequence parity not yet recorded for this backend/representation)
+[native] expert arena: slots=1 prefetch_slots=128
+[native] probe-order: dir_c_first
+[native] mirror-cost: rated
+[native] mirror: enabled=false mode=0 internal_cost_us=1502 enclosure_cost_us=948 bias=internal:1.00,K3C:1.00,K3B:1.00,K3A:1.00 outstanding=0/0/0/0
+[native] retain: enabled=false cap_gb=8 layers=63..=92
+[native] summer: enabled=false cap_gb=8 policy=lfru sample=16
+[native] expert heat: weight=11837 passes recording=true; pin tier: candidates=0 charged=0.00 GiB
+[spine-fp32] execution arena DISABLED (K3_SPINE_FP32_ARENA=0)
+[residency] queue attached (2 queues)
+[residency] 1 allocations, 1.09 GiB pinned
+[residency] 2 allocations, 1.10 GiB pinned
+[residency] 4 allocations, 2.28 GiB pinned
+[residency] 8 allocations, 4.47 GiB pinned
+[residency] 16 allocations, 8.86 GiB pinned
+[residency] 32 allocations, 17.04 GiB pinned
+[residency] 64 allocations, 34.16 GiB pinned
+**
+[stats] generated=1 elapsed=43.146s speed=0.0232 token/s (43.146 s/token) chunks=1 committed_rows=51 verify_tx=0 drafts=0/0 layer_passes=93 expert_rows=4692 expert_tiles=748
+[opens] expert file opens=313 total=0.011s mean=0.034ms requested_bytes=817141972160 (817.1 GB)
+[arrival] tiles=748 waves=821 uncovered_wait=32.076s dispatch=5.948s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359131.762697 chunks=1 sequence=43.143s read_wait=0.171s bind_upload=1.627s attention_resident=2.799s expert_read_prefetch=0.426s expert_demand_read=0.000s expert_plan=0.000s expert_hint=0.000s expert_submit=0.000s expert_kernel=38.027s source_fence=0.000s tail_head_sync=0.017s layer_other=0.043s expert_read_gross=0.426s plan_hint=0.000s plan_sched=0.000s attn_total=2.798s attn_encode=0.697s attn_wait=2.101s attn_drain=0.000s kernel_total=5.943s kernel_host=0.266s kernel_wait=5.238s kernel_drain=0.439s
+[attn-split] single: calls=0 total=0.000s encode=0.000s wait=0.000s drain=0.000s waits=0 untimed=0 | wide: calls=93 total=2.798s encode=0.697s wait=2.101s drain=0.000s waits=92 untimed=92 | hint: calls=92 total=0.000s encode=0.000s wait=0.000s drain=0.000s waits=0 untimed=0
+[kernel-split] single: calls=84 total=0.071s encode=0.015s wait=0.023s drain=0.033s waits=84 untimed=0 | wide: calls=737 total=5.873s encode=0.252s wait=5.215s drain=0.405s waits=737 untimed=0
+[kernel-sub] materialize=0.091s moe=5.732s precommit=0.000s rest=0.120s
+[metal-cache] calls=4765 zero_copy_wraps=186 copies=0 cache_entries=64 bindless=true
+[residency] queue attached (3 queues)
+[route-chain] chained=1
+[route-chain] dedup_hits=1
+French
+[stats] generated=2 elapsed=48.283s speed=0.0414 token/s (24.141 s/token) chunks=2 committed_rows=52 verify_tx=1 drafts=0/2 layer_passes=186 expert_rows=4784 expert_tiles=840
+[verify-width] w1=0 w2=1 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=0              (w1 share 0.0% of 1 transactions)
+[opens] expert file opens=10587 total=0.148s mean=0.014ms requested_bytes=917301886144 (917.3 GB)
+[arrival] tiles=773 waves=872 uncovered_wait=32.335s dispatch=6.102s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359136.899638 chunks=2 sequence=44.605s read_wait=0.171s bind_upload=1.627s attention_resident=2.909s expert_read_prefetch=1.396s expert_demand_read=0.584s expert_plan=0.080s expert_hint=0.000s expert_submit=0.000s expert_kernel=38.391s source_fence=0.000s tail_head_sync=0.035s layer_other=0.045s expert_read_gross=1.315s plan_hint=0.079s plan_sched=0.001s attn_total=3.425s attn_encode=0.905s attn_wait=2.489s attn_drain=0.031s kernel_total=6.796s kernel_host=0.405s kernel_wait=5.539s kernel_drain=0.852s
+[attn-split] single: calls=93 total=0.110s encode=0.056s wait=0.023s drain=0.031s waits=161 untimed=21 | wide: calls=186 total=3.315s encode=0.848s wait=2.467s drain=0.000s waits=184 untimed=184 | hint: calls=276 total=0.158s encode=0.001s wait=0.157s drain=0.000s waits=241 untimed=241
+[kernel-split] single: calls=180 total=0.425s encode=0.024s wait=0.026s drain=0.374s waits=185 untimed=71 | wide: calls=851 total=6.371s encode=0.381s wait=5.513s drain=0.478s waits=851 untimed=0
+[kernel-sub] materialize=0.147s moe=6.111s precommit=0.344s rest=0.193s
+[metal-cache] calls=5203 zero_copy_wraps=265 copies=0 cache_entries=143 bindless=true
+ (
+[stats] generated=3 elapsed=49.682s speed=0.0604 token/s (16.561 s/token) chunks=3 committed_rows=53 verify_tx=1 drafts=0/2 layer_passes=279 expert_rows=4876 expert_tiles=932
+[verify-width] w1=0 w2=1 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=0              (w1 share 0.0% of 1 transactions)
+[opens] expert file opens=14357 total=0.196s mean=0.014ms requested_bytes=950334700736 (950.3 GB)
+[arrival] tiles=774 waves=877 uncovered_wait=32.344s dispatch=6.111s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359138.298498 chunks=3 sequence=46.003s read_wait=0.171s bind_upload=1.627s attention_resident=2.980s expert_read_prefetch=2.372s expert_demand_read=1.193s expert_plan=0.150s expert_hint=0.000s expert_submit=0.000s expert_kernel=38.725s source_fence=0.000s tail_head_sync=0.050s layer_other=0.046s expert_read_gross=2.222s plan_hint=0.148s plan_sched=0.002s attn_total=3.496s attn_encode=0.927s attn_wait=2.515s attn_drain=0.054s kernel_total=7.121s kernel_host=0.414s kernel_wait=5.544s kernel_drain=1.162s
+[attn-split] single: calls=186 total=0.181s encode=0.079s wait=0.048s drain=0.054s waits=322 untimed=40 | wide: calls=186 total=3.315s encode=0.848s wait=2.467s drain=0.000s waits=184 untimed=184 | hint: calls=368 total=0.226s encode=0.001s wait=0.226s drain=0.000s waits=332 untimed=332
+[kernel-split] single: calls=276 total=0.750s encode=0.034s wait=0.031s drain=0.685s waits=286 untimed=155 | wide: calls=851 total=6.371s encode=0.381s wait=5.513s drain=0.478s waits=851 untimed=0
+[kernel-sub] materialize=0.147s moe=6.119s precommit=0.657s rest=0.198s
+[metal-cache] calls=5299 zero_copy_wraps=265 copies=0 cache_entries=143 bindless=true
+form
+[stats] generated=4 elapsed=51.104s speed=0.0783 token/s (12.776 s/token) chunks=4 committed_rows=54 verify_tx=1 drafts=0/2 layer_passes=372 expert_rows=4968 expert_tiles=1024
+[verify-width] w1=0 w2=1 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=0              (w1 share 0.0% of 1 transactions)
+[opens] expert file opens=18186 total=0.247s mean=0.014ms requested_bytes=983893900480 (983.9 GB)
+[arrival] tiles=775 waves=881 uncovered_wait=32.352s dispatch=6.118s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359139.721233 chunks=4 sequence=47.424s read_wait=0.171s bind_upload=1.627s attention_resident=3.052s expert_read_prefetch=3.349s expert_demand_read=1.805s expert_plan=0.225s expert_hint=0.000s expert_submit=0.000s expert_kernel=39.079s source_fence=0.000s tail_head_sync=0.067s layer_other=0.048s expert_read_gross=3.124s plan_hint=0.222s plan_sched=0.003s attn_total=3.567s attn_encode=0.949s attn_wait=2.550s attn_drain=0.069s kernel_total=7.466s kernel_host=0.423s kernel_wait=5.548s kernel_drain=1.495s
+[attn-split] single: calls=279 total=0.252s encode=0.100s wait=0.083s drain=0.069s waits=483 untimed=72 | wide: calls=186 total=3.315s encode=0.848s wait=2.467s drain=0.000s waits=184 untimed=184 | hint: calls=460 total=0.301s encode=0.001s wait=0.299s drain=0.000s waits=423 untimed=423
+[kernel-split] single: calls=371 total=1.094s encode=0.042s wait=0.035s drain=1.017s waits=385 untimed=234 | wide: calls=851 total=6.371s encode=0.381s wait=5.513s drain=0.478s waits=851 untimed=0
+[kernel-sub] materialize=0.147s moe=6.126s precommit=0.990s rest=0.202s
+[metal-cache] calls=5394 zero_copy_wraps=265 copies=0 cache_entries=143 bindless=true
+al
+[stats] generated=5 elapsed=52.582s speed=0.0951 token/s (10.516 s/token) chunks=5 committed_rows=55 verify_tx=1 drafts=0/2 layer_passes=465 expert_rows=5060 expert_tiles=1116
+[verify-width] w1=0 w2=1 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=0              (w1 share 0.0% of 1 transactions)
+[opens] expert file opens=22084 total=0.301s mean=0.014ms requested_bytes=1018102348992 (1018.1 GB)
+[arrival] tiles=776 waves=889 uncovered_wait=32.363s dispatch=6.128s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359141.199203 chunks=5 sequence=48.899s read_wait=0.171s bind_upload=1.627s attention_resident=3.129s expert_read_prefetch=4.356s expert_demand_read=2.431s expert_plan=0.304s expert_hint=0.000s expert_submit=0.000s expert_kernel=39.451s source_fence=0.000s tail_head_sync=0.084s layer_other=0.049s expert_read_gross=4.052s plan_hint=0.299s plan_sched=0.004s attn_total=3.645s attn_encode=0.972s attn_wait=2.578s attn_drain=0.095s kernel_total=7.827s kernel_host=0.433s kernel_wait=5.554s kernel_drain=1.840s
+[attn-split] single: calls=372 total=0.330s encode=0.124s wait=0.112s drain=0.095s waits=644 untimed=94 | wide: calls=186 total=3.315s encode=0.848s wait=2.467s drain=0.000s waits=184 untimed=184 | hint: calls=552 total=0.378s encode=0.001s wait=0.376s drain=0.000s waits=514 untimed=514
+[kernel-split] single: calls=470 total=1.456s encode=0.052s wait=0.041s drain=1.362s waits=492 untimed=323 | wide: calls=851 total=6.371s encode=0.381s wait=5.513s drain=0.478s waits=851 untimed=0
+[kernel-sub] materialize=0.147s moe=6.137s precommit=1.337s rest=0.206s
+[metal-cache] calls=5493 zero_copy_wraps=265 copies=0 cache_entries=143 bindless=true
+):**  
+
+[stats] generated=8 elapsed=55.426s speed=0.1443 token/s (6.928 s/token) chunks=6 committed_rows=58 verify_tx=2 drafts=2/4 layer_passes=558 expert_rows=5336 expert_tiles=1208
+[verify-width] w1=0 w2=2 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=0              (w1 share 0.0% of 2 transactions)
+[opens] expert file opens=28531 total=0.385s mean=0.014ms requested_bytes=1082430684352 (1082.4 GB)
+[arrival] tiles=796 waves=928 uncovered_wait=32.501s dispatch=6.247s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359144.042917 chunks=6 sequence=51.698s read_wait=0.171s bind_upload=1.627s attention_resident=3.604s expert_read_prefetch=6.020s expert_demand_read=3.569s expert_plan=0.379s expert_hint=0.000s expert_submit=0.000s expert_kernel=40.087s source_fence=0.000s tail_head_sync=0.105s layer_other=0.051s expert_read_gross=5.640s plan_hint=0.373s plan_sched=0.006s attn_total=4.120s attn_encode=1.068s attn_wait=2.957s attn_drain=0.095s kernel_total=8.325s kernel_host=0.562s kernel_wait=5.864s kernel_drain=1.899s
+[attn-split] single: calls=372 total=0.330s encode=0.124s wait=0.112s drain=0.095s waits=644 untimed=94 | wide: calls=279 total=3.790s encode=0.944s wait=2.845s drain=0.000s waits=276 untimed=276 | hint: calls=644 total=0.452s encode=0.002s wait=0.450s drain=0.000s waits=646 untimed=646
+[kernel-split] single: calls=470 total=1.456s encode=0.052s wait=0.041s drain=1.362s waits=492 untimed=323 | wide: calls=962 total=6.869s encode=0.510s wait=5.822s drain=0.537s waits=962 untimed=0
+[kernel-sub] materialize=0.213s moe=6.509s precommit=1.337s rest=0.265s
+[metal-cache] calls=5826 zero_copy_wraps=266 copies=0 cache_entries=144 bindless=true
+Le
+[stats] generated=9 elapsed=61.545s speed=0.1462 token/s (6.838 s/token) chunks=7 committed_rows=59 verify_tx=3 drafts=2/6 layer_passes=651 expert_rows=5428 expert_tiles=1300
+[verify-width] w1=0 w2=3 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=0              (w1 share 0.0% of 3 transactions)
+[opens] expert file opens=39103 total=0.521s mean=0.013ms requested_bytes=1185354316992 (1185.4 GB)
+[arrival] tiles=823 waves=986 uncovered_wait=32.683s dispatch=6.392s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359150.161785 chunks=7 sequence=53.159s read_wait=0.171s bind_upload=1.627s attention_resident=3.847s expert_read_prefetch=6.969s expert_demand_read=4.156s expert_plan=0.452s expert_hint=0.000s expert_submit=0.000s expert_kernel=40.340s source_fence=0.000s tail_head_sync=0.120s layer_other=0.053s expert_read_gross=6.517s plan_hint=0.445s plan_sched=0.007s attn_total=4.796s attn_encode=1.195s attn_wait=3.478s attn_drain=0.124s kernel_total=9.045s kernel_host=0.698s kernel_wait=6.147s kernel_drain=2.200s
+[attn-split] single: calls=465 total=0.572s encode=0.191s wait=0.258s drain=0.124s waits=805 untimed=167 | wide: calls=372 total=4.224s encode=1.004s wait=3.220s drain=0.000s waits=368 untimed=368 | hint: calls=828 total=0.599s encode=0.002s wait=0.597s drain=0.000s waits=889 untimed=889
+[kernel-split] single: calls=568 total=1.698s encode=0.064s wait=0.046s drain=1.589s waits=597 untimed=387 | wide: calls=1079 total=7.346s encode=0.635s wait=6.101s drain=0.611s waits=1079 untimed=0
+[kernel-sub] materialize=0.269s moe=6.873s precommit=1.568s rest=0.334s
+[metal-cache] calls=6275 zero_copy_wraps=266 copies=0 cache_entries=144 bindless=true
+ rapport trimest
+[stats] generated=12 elapsed=64.618s speed=0.1857 token/s (5.385 s/token) chunks=8 committed_rows=62 verify_tx=4 drafts=4/8 layer_passes=744 expert_rows=5704 expert_tiles=1392
+[verify-width] w1=0 w2=4 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=0              (w1 share 0.0% of 4 transactions)
+[opens] expert file opens=45639 total=0.609s mean=0.013ms requested_bytes=1254789004480 (1254.8 GB)
+[arrival] tiles=854 waves=1047 uncovered_wait=32.899s dispatch=6.556s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359153.235073 chunks=8 sequence=56.189s read_wait=0.171s bind_upload=1.627s attention_resident=4.333s expert_read_prefetch=8.795s expert_demand_read=5.438s expert_plan=0.523s expert_hint=0.000s expert_submit=0.000s expert_kernel=41.043s source_fence=0.000s tail_head_sync=0.132s layer_other=0.055s expert_read_gross=8.272s plan_hint=0.513s plan_sched=0.009s attn_total=5.282s attn_encode=1.285s attn_wait=3.873s attn_drain=0.124s kernel_total=9.530s kernel_host=0.809s kernel_wait=6.459s kernel_drain=2.263s
+[attn-split] single: calls=465 total=0.572s encode=0.191s wait=0.258s drain=0.124s waits=805 untimed=167 | wide: calls=465 total=4.710s encode=1.094s wait=3.616s drain=0.000s waits=460 untimed=460 | hint: calls=920 total=0.667s encode=0.003s wait=0.665s drain=0.000s waits=1045 untimed=1045
+[kernel-split] single: calls=568 total=1.698s encode=0.064s wait=0.046s drain=1.589s waits=597 untimed=387 | wide: calls=1201 total=7.832s encode=0.746s wait=6.413s drain=0.673s waits=1201 untimed=0
+[kernel-sub] materialize=0.322s moe=7.252s precommit=1.568s rest=0.388s
+[metal-cache] calls=6641 zero_copy_wraps=266 copies=0 cache_entries=144 bindless=true
+riel doit
+[stats] generated=14 elapsed=70.540s speed=0.1985 token/s (5.039 s/token) chunks=9 committed_rows=64 verify_tx=5 drafts=5/16 layer_passes=837 expert_rows=6532 expert_tiles=1484
+[verify-width] w1=0 w2=4 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=1              (w1 share 0.0% of 5 transactions)
+[opens] expert file opens=51411 total=0.743s mean=0.014ms requested_bytes=1377628650688 (1377.6 GB)
+[arrival] tiles=946 waves=1230 uncovered_wait=35.569s dispatch=7.754s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359159.157087 chunks=9 sequence=61.895s read_wait=0.171s bind_upload=1.627s attention_resident=5.432s expert_read_prefetch=9.496s expert_demand_read=5.861s expert_plan=0.615s expert_hint=0.000s expert_submit=0.000s expert_kernel=44.911s source_fence=0.000s tail_head_sync=0.165s layer_other=0.061s expert_read_gross=8.881s plan_hint=0.599s plan_sched=0.015s attn_total=6.381s attn_encode=1.401s attn_wait=4.856s attn_drain=0.124s kernel_total=10.727s kernel_host=1.019s kernel_wait=7.349s kernel_drain=2.359s
+[attn-split] single: calls=465 total=0.572s encode=0.191s wait=0.258s drain=0.124s waits=805 untimed=167 | wide: calls=558 total=5.809s encode=1.210s wait=4.599s drain=0.000s waits=552 untimed=552 | hint: calls=1012 total=0.754s encode=0.004s wait=0.750s drain=0.000s waits=1226 untimed=1226
+[kernel-split] single: calls=568 total=1.698s encode=0.064s wait=0.046s drain=1.589s waits=597 untimed=387 | wide: calls=1384 total=9.029s encode=0.956s wait=7.303s drain=0.770s waits=1384 untimed=0
+[kernel-sub] materialize=0.450s moe=8.251s precommit=1.568s rest=0.458s
+[metal-cache] calls=8288 zero_copy_wraps=443 copies=0 cache_entries=177 bindless=true
+ être remis
+[stats] generated=17 elapsed=73.534s speed=0.2312 token/s (4.326 s/token) chunks=10 committed_rows=67 verify_tx=6 drafts=7/18 layer_passes=930 expert_rows=6808 expert_tiles=1576
+[verify-width] w1=0 w2=5 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=1              (w1 share 0.0% of 6 transactions)
+[opens] expert file opens=58153 total=0.876s mean=0.015ms requested_bytes=1443220470976 (1443.2 GB)
+[arrival] tiles=962 waves=1260 uncovered_wait=35.740s dispatch=7.844s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359162.150498 chunks=10 sequence=64.804s read_wait=0.171s bind_upload=1.627s attention_resident=5.890s expert_read_prefetch=11.303s expert_demand_read=7.110s expert_plan=0.682s expert_hint=0.000s expert_submit=0.000s expert_kernel=45.537s source_fence=0.000s tail_head_sync=0.181s layer_other=0.063s expert_read_gross=10.621s plan_hint=0.665s plan_sched=0.017s attn_total=6.839s attn_encode=1.511s attn_wait=5.204s attn_drain=0.124s kernel_total=11.182s kernel_host=1.131s kernel_wait=7.631s kernel_drain=2.419s
+[attn-split] single: calls=465 total=0.572s encode=0.191s wait=0.258s drain=0.124s waits=805 untimed=167 | wide: calls=651 total=6.266s encode=1.320s wait=4.946s drain=0.000s waits=644 untimed=644 | hint: calls=1104 total=0.819s encode=0.004s wait=0.815s drain=0.000s waits=1366 untimed=1366
+[kernel-split] single: calls=568 total=1.698s encode=0.064s wait=0.046s drain=1.589s waits=597 untimed=387 | wide: calls=1490 total=9.483s encode=1.068s wait=7.585s drain=0.830s waits=1490 untimed=0
+[kernel-sub] materialize=0.503s moe=8.597s precommit=1.568s rest=0.513s
+[metal-cache] calls=8606 zero_copy_wraps=459 copies=0 cache_entries=193 bindless=true
+ vend
+[stats] generated=18 elapsed=80.891s speed=0.2225 token/s (4.494 s/token) chunks=11 committed_rows=68 verify_tx=7 drafts=7/26 layer_passes=1023 expert_rows=6900 expert_tiles=1668
+[verify-width] w1=0 w2=5 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=2              (w1 share 0.0% of 7 transactions)
+[opens] expert file opens=67841 total=1.112s mean=0.016ms requested_bytes=1600391396544 (1600.4 GB)
+[arrival] tiles=1055 waves=1449 uncovered_wait=38.757s dispatch=9.027s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359169.507897 chunks=11 sequence=66.383s read_wait=0.171s bind_upload=1.627s attention_resident=6.142s expert_read_prefetch=12.368s expert_demand_read=7.709s expert_plan=0.746s expert_hint=0.000s expert_submit=0.000s expert_kernel=45.782s source_fence=0.000s tail_head_sync=0.195s layer_other=0.064s expert_read_gross=11.622s plan_hint=0.727s plan_sched=0.018s attn_total=8.189s attn_encode=1.681s attn_wait=6.335s attn_drain=0.173s kernel_total=12.590s kernel_host=1.351s kernel_wait=8.503s kernel_drain=2.735s
+[attn-split] single: calls=558 total=0.825s encode=0.249s wait=0.403s drain=0.173s waits=966 untimed=237 | wide: calls=744 total=7.364s encode=1.432s wait=5.932s drain=0.000s waits=736 untimed=736 | hint: calls=1288 total=0.972s encode=0.005s wait=0.966s drain=0.000s waits=1638 untimed=1638
+[kernel-split] single: calls=665 total=1.935s encode=0.076s wait=0.051s drain=1.808s waits=700 untimed=454 | wide: calls=1673 total=10.655s encode=1.276s wait=8.452s drain=0.927s waits=1673 untimed=0
+[kernel-sub] materialize=0.622s moe=9.582s precommit=1.791s rest=0.595s
+[metal-cache] calls=10350 zero_copy_wraps=459 copies=0 cache_entries=193 bindless=true
+redi et le
+[stats] generated=21 elapsed=83.787s speed=0.2506 token/s (3.990 s/token) chunks=12 committed_rows=71 verify_tx=8 drafts=9/28 layer_passes=1116 expert_rows=7176 expert_tiles=1760
+[verify-width] w1=0 w2=6 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=2              (w1 share 0.0% of 8 transactions)
+[opens] expert file opens=74450 total=1.221s mean=0.016ms requested_bytes=1664868973760 (1664.9 GB)
+[arrival] tiles=1071 waves=1480 uncovered_wait=38.860s dispatch=9.114s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359172.403809 chunks=12 sequence=69.237s read_wait=0.171s bind_upload=1.627s attention_resident=6.605s expert_read_prefetch=14.165s expert_demand_read=8.916s expert_plan=0.811s expert_hint=0.000s expert_submit=0.000s expert_kernel=46.359s source_fence=0.000s tail_head_sync=0.211s layer_other=0.066s expert_read_gross=13.354s plan_hint=0.790s plan_sched=0.020s attn_total=8.651s attn_encode=1.780s attn_wait=6.698s attn_drain=0.173s kernel_total=13.063s kernel_host=1.466s kernel_wait=8.800s kernel_drain=2.797s
+[attn-split] single: calls=558 total=0.825s encode=0.249s wait=0.403s drain=0.173s waits=966 untimed=237 | wide: calls=837 total=7.826s encode=1.531s wait=6.295s drain=0.000s waits=828 untimed=828 | hint: calls=1380 total=1.034s encode=0.006s wait=1.029s drain=0.000s waits=1766 untimed=1766
+[kernel-split] single: calls=665 total=1.935s encode=0.076s wait=0.051s drain=1.808s waits=700 untimed=454 | wide: calls=1780 total=11.128s encode=1.390s wait=8.749s drain=0.989s waits=1780 untimed=0
+[kernel-sub] materialize=0.678s moe=9.944s precommit=1.791s rest=0.650s
+[metal-cache] calls=10671 zero_copy_wraps=459 copies=0 cache_entries=193 bindless=true
+ conseil d'administration attend
+[stats] generated=28 elapsed=89.743s speed=0.3120 token/s (3.205 s/token) chunks=13 committed_rows=78 verify_tx=9 drafts=15/36 layer_passes=1209 expert_rows=8004 expert_tiles=1852
+[verify-width] w1=0 w2=6 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=3              (w1 share 0.0% of 9 transactions)
+[opens] expert file opens=80262 total=1.370s mean=0.017ms requested_bytes=1789875682496 (1789.9 GB)
+[arrival] tiles=1162 waves=1660 uncovered_wait=41.936s dispatch=10.254s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359178.359355 chunks=13 sequence=75.089s read_wait=0.171s bind_upload=1.627s attention_resident=7.734s expert_read_prefetch=14.635s expert_demand_read=9.153s expert_plan=0.898s expert_hint=0.000s expert_submit=0.000s expert_kernel=50.590s source_fence=0.000s tail_head_sync=0.227s layer_other=0.072s expert_read_gross=13.736s plan_hint=0.871s plan_sched=0.027s attn_total=9.780s attn_encode=1.888s attn_wait=7.719s attn_drain=0.173s kernel_total=14.216s kernel_host=1.675s kernel_wait=9.648s kernel_drain=2.893s
+[attn-split] single: calls=558 total=0.825s encode=0.249s wait=0.403s drain=0.173s waits=966 untimed=237 | wide: calls=930 total=8.955s encode=1.639s wait=7.316s drain=0.000s waits=920 untimed=920 | hint: calls=1472 total=1.115s encode=0.007s wait=1.108s drain=0.000s waits=1947 untimed=1947
+[kernel-split] single: calls=665 total=1.935s encode=0.076s wait=0.051s drain=1.808s waits=700 untimed=454 | wide: calls=1961 total=12.281s encode=1.599s wait=9.597s drain=1.085s waits=1961 untimed=0
+[kernel-sub] materialize=0.804s moe=10.901s precommit=1.791s rest=0.721s
+[metal-cache] calls=12300 zero_copy_wraps=652 copies=0 cache_entries=193 bindless=true
+ un
+[stats] generated=29 elapsed=97.197s speed=0.2984 token/s (3.352 s/token) chunks=14 committed_rows=79 verify_tx=10 drafts=15/44 layer_passes=1302 expert_rows=8096 expert_tiles=1944
+[verify-width] w1=0 w2=6 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=4              (w1 share 0.0% of 10 transactions)
+[opens] expert file opens=90009 total=1.581s mean=0.018ms requested_bytes=1951389531328 (1951.4 GB)
+[arrival] tiles=1255 waves=1850 uncovered_wait=45.132s dispatch=11.424s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359185.813678 chunks=14 sequence=76.604s read_wait=0.171s bind_upload=1.627s attention_resident=7.962s expert_read_prefetch=15.644s expert_demand_read=9.777s expert_plan=0.950s expert_hint=0.000s expert_submit=0.000s expert_kernel=50.852s source_fence=0.000s tail_head_sync=0.241s layer_other=0.074s expert_read_gross=14.694s plan_hint=0.922s plan_sched=0.028s attn_total=11.142s attn_encode=2.014s attn_wait=8.924s attn_drain=0.204s kernel_total=15.626s kernel_host=1.902s kernel_wait=10.510s kernel_drain=3.214s
+[attn-split] single: calls=651 total=1.053s encode=0.294s wait=0.555s drain=0.204s waits=1127 untimed=308 | wide: calls=1023 total=10.089s encode=1.720s wait=8.369s drain=0.000s waits=1012 untimed=1012 | hint: calls=1656 total=1.263s encode=0.008s wait=1.255s drain=0.000s waits=2219 untimed=2219
+[kernel-split] single: calls=763 total=2.186s encode=0.087s wait=0.057s drain=2.041s waits=805 untimed=514 | wide: calls=2144 total=13.440s encode=1.815s wait=10.453s drain=1.173s waits=2144 untimed=0
+[kernel-sub] materialize=0.935s moe=11.865s precommit=2.028s rest=0.797s
+[metal-cache] calls=14045 zero_copy_wraps=652 copies=0 cache_entries=193 bindless=true
+ résumé
+[stats] generated=32 elapsed=100.292s speed=0.3191 token/s (3.134 s/token) chunks=15 committed_rows=82 verify_tx=11 drafts=17/46 layer_passes=1395 expert_rows=8372 expert_tiles=2036
+[verify-width] w1=0 w2=7 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=4              (w1 share 0.0% of 11 transactions)
+[opens] expert file opens=96535 total=1.978s mean=0.020ms requested_bytes=2020499504320 (2020.5 GB)
+[arrival] tiles=1284 waves=1906 uncovered_wait=45.438s dispatch=11.612s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359188.908784 chunks=15 sequence=79.657s read_wait=0.171s bind_upload=1.627s attention_resident=8.455s expert_read_prefetch=17.349s expert_demand_read=10.938s expert_plan=1.024s expert_hint=0.000s expert_submit=0.000s expert_kernel=51.681s source_fence=0.000s tail_head_sync=0.264s layer_other=0.076s expert_read_gross=16.325s plan_hint=0.994s plan_sched=0.030s attn_total=11.634s attn_encode=2.108s attn_wait=9.323s attn_drain=0.204s kernel_total=16.148s kernel_host=2.027s kernel_wait=10.839s kernel_drain=3.282s
+[attn-split] single: calls=651 total=1.053s encode=0.294s wait=0.555s drain=0.204s waits=1127 untimed=308 | wide: calls=1116 total=10.581s encode=1.814s wait=8.768s drain=0.000s waits=1104 untimed=1104 | hint: calls=1748 total=1.336s encode=0.009s wait=1.327s drain=0.000s waits=2370 untimed=2370
+[kernel-split] single: calls=763 total=2.186s encode=0.087s wait=0.057s drain=2.041s waits=805 untimed=514 | wide: calls=2263 total=13.962s encode=1.940s wait=10.781s drain=1.241s waits=2263 untimed=0
+[kernel-sub] materialize=0.991s moe=12.266s precommit=2.028s rest=0.863s
+[metal-cache] calls=14402 zero_copy_wraps=655 copies=0 cache_entries=196 bindless=true
+ des
+[stats] generated=33 elapsed=107.981s speed=0.3056 token/s (3.272 s/token) chunks=16 committed_rows=83 verify_tx=12 drafts=17/54 layer_passes=1488 expert_rows=8464 expert_tiles=2128
+[verify-width] w1=0 w2=7 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=5              (w1 share 0.0% of 12 transactions)
+[opens] expert file opens=106387 total=2.244s mean=0.021ms requested_bytes=2188128566464 (2188.1 GB)
+[arrival] tiles=1377 waves=2094 uncovered_wait=48.796s dispatch=12.704s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359196.598101 chunks=16 sequence=81.236s read_wait=0.171s bind_upload=1.627s attention_resident=8.723s expert_read_prefetch=18.377s expert_demand_read=11.573s expert_plan=1.101s expert_hint=0.000s expert_submit=0.000s expert_kernel=51.945s source_fence=0.000s tail_head_sync=0.281s layer_other=0.078s expert_read_gross=17.276s plan_hint=1.070s plan_sched=0.031s attn_total=12.861s attn_encode=2.287s attn_wait=10.331s attn_drain=0.244s kernel_total=17.484s kernel_host=2.268s kernel_wait=11.600s kernel_drain=3.615s
+[attn-split] single: calls=744 total=1.321s encode=0.360s wait=0.717s drain=0.244s waits=1288 untimed=387 | wide: calls=1209 total=11.540s encode=1.927s wait=9.613s drain=0.000s waits=1196 untimed=1196 | hint: calls=1932 total=1.513s encode=0.010s wait=1.503s drain=0.000s waits=2642 untimed=2642
+[kernel-split] single: calls=859 total=2.440s encode=0.099s wait=0.063s drain=2.278s waits=906 untimed=572 | wide: calls=2446 total=15.044s encode=2.169s wait=11.537s drain=1.338s waits=2446 untimed=0
+[kernel-sub] materialize=1.120s moe=13.139s precommit=2.269s rest=0.956s
+[metal-cache] calls=16145 zero_copy_wraps=655 copies=0 cache_entries=196 bindless=true
+ flux de tr
+[stats] generated=36 elapsed=110.901s speed=0.3246 token/s (3.081 s/token) chunks=17 committed_rows=86 verify_tx=13 drafts=19/56 layer_passes=1581 expert_rows=8740 expert_tiles=2220
+[verify-width] w1=0 w2=8 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=5              (w1 share 0.0% of 13 transactions)
+[opens] expert file opens=112974 total=2.360s mean=0.021ms requested_bytes=2255273278656 (2255.3 GB)
+[arrival] tiles=1401 waves=2141 uncovered_wait=48.981s dispatch=12.840s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359199.517441 chunks=17 sequence=84.111s read_wait=0.171s bind_upload=1.627s attention_resident=9.209s expert_read_prefetch=20.036s expert_demand_read=12.683s expert_plan=1.177s expert_hint=0.000s expert_submit=0.000s expert_kernel=52.653s source_fence=0.000s tail_head_sync=0.300s layer_other=0.081s expert_read_gross=18.859s plan_hint=1.144s plan_sched=0.033s attn_total=13.347s attn_encode=2.393s attn_wait=10.710s attn_drain=0.244s kernel_total=18.007s kernel_host=2.399s kernel_wait=11.924s kernel_drain=3.685s
+[attn-split] single: calls=744 total=1.321s encode=0.360s wait=0.717s drain=0.244s waits=1288 untimed=387 | wide: calls=1302 total=12.026s encode=2.034s wait=9.993s drain=0.000s waits=1288 untimed=1288 | hint: calls=2024 total=1.587s encode=0.010s wait=1.577s drain=0.000s waits=2785 untimed=2785
+[kernel-split] single: calls=859 total=2.440s encode=0.099s wait=0.063s drain=2.278s waits=906 untimed=572 | wide: calls=2561 total=15.567s encode=2.300s wait=11.861s drain=1.407s waits=2561 untimed=0
+[kernel-sub] materialize=1.175s moe=13.536s precommit=2.269s rest=1.027s
+[metal-cache] calls=16490 zero_copy_wraps=655 copies=0 cache_entries=196 bindless=true
+ésorerie.
+
+
+[stats] generated=40 elapsed=117.942s speed=0.3391 token/s (2.949 s/token) chunks=18 committed_rows=90 verify_tx=14 drafts=22/64 layer_passes=1674 expert_rows=9568 expert_tiles=2312
+[verify-width] w1=0 w2=8 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=6              (w1 share 0.0% of 14 transactions)
+[opens] expert file opens=118760 total=2.509s mean=0.021ms requested_bytes=2396669131968 (2396.7 GB)
+[arrival] tiles=1493 waves=2324 uncovered_wait=53.238s dispatch=14.002s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359206.559260 chunks=18 sequence=91.075s read_wait=0.171s bind_upload=1.627s attention_resident=10.257s expert_read_prefetch=20.508s expert_demand_read=12.931s expert_plan=1.296s expert_hint=0.000s expert_submit=0.000s expert_kernel=58.074s source_fence=0.000s tail_head_sync=0.316s layer_other=0.088s expert_read_gross=19.212s plan_hint=1.256s plan_sched=0.039s attn_total=14.394s attn_encode=2.511s attn_wait=11.639s attn_drain=0.244s kernel_total=19.169s kernel_host=2.620s kernel_wait=12.760s kernel_drain=3.789s
+[attn-split] single: calls=744 total=1.321s encode=0.360s wait=0.717s drain=0.244s waits=1288 untimed=387 | wide: calls=1395 total=13.074s encode=2.152s wait=10.922s drain=0.000s waits=1380 untimed=1380 | hint: calls=2116 total=1.699s encode=0.011s wait=1.688s drain=0.000s waits=2966 untimed=2966
+[kernel-split] single: calls=859 total=2.440s encode=0.099s wait=0.063s drain=2.278s waits=906 untimed=572 | wide: calls=2744 total=16.729s encode=2.521s wait=12.697s drain=1.511s waits=2744 untimed=0
+[kernel-sub] materialize=1.307s moe=14.488s precommit=2.269s rest=1.105s
+[metal-cache] calls=18137 zero_copy_wraps=655 copies=0 cache_entries=196 bindless=true
+**English (back
+[stats] generated=44 elapsed=123.066s speed=0.3575 token/s (2.797 s/token) chunks=19 committed_rows=94 verify_tx=15 drafts=25/70 layer_passes=1767 expert_rows=10212 expert_tiles=2404
+[verify-width] w1=0 w2=8 w3=0 w4=0 w5=0 w6=1 w7=0 w8+=6              (w1 share 0.0% of 15 transactions)
+[opens] expert file opens=124712 total=2.637s mean=0.021ms requested_bytes=2507269536960 (2507.3 GB)
+[arrival] tiles=1578 waves=2493 uncovered_wait=55.545s dispatch=14.945s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359211.683121 chunks=19 sequence=96.117s read_wait=0.171s bind_upload=1.627s attention_resident=11.234s expert_read_prefetch=21.219s expert_demand_read=13.419s expert_plan=1.404s expert_hint=0.000s expert_submit=0.000s expert_kernel=61.400s source_fence=0.000s tail_head_sync=0.339s layer_other=0.093s expert_read_gross=19.815s plan_hint=1.358s plan_sched=0.045s attn_total=15.371s attn_encode=2.619s attn_wait=12.508s attn_drain=0.244s kernel_total=20.187s kernel_host=2.806s kernel_wait=13.507s kernel_drain=3.874s
+[attn-split] single: calls=744 total=1.321s encode=0.360s wait=0.717s drain=0.244s waits=1288 untimed=387 | wide: calls=1488 total=14.050s encode=2.259s wait=11.791s drain=0.000s waits=1472 untimed=1472 | hint: calls=2208 total=1.801s encode=0.012s wait=1.789s drain=0.000s waits=3146 untimed=3146
+[kernel-split] single: calls=859 total=2.440s encode=0.099s wait=0.063s drain=2.278s waits=906 untimed=572 | wide: calls=2920 total=17.747s encode=2.707s wait=13.444s drain=1.596s waits=2920 untimed=0
+[kernel-sub] materialize=1.413s moe=15.330s precommit=2.269s rest=1.175s
+[metal-cache] calls=19369 zero_copy_wraps=655 copies=0 cache_entries=196 bindless=true
+-
+[stats] generated=45 elapsed=129.827s speed=0.3466 token/s (2.885 s/token) chunks=20 committed_rows=95 verify_tx=16 drafts=25/76 layer_passes=1860 expert_rows=10304 expert_tiles=2496
+[verify-width] w1=0 w2=8 w3=0 w4=0 w5=0 w6=2 w7=0 w8+=6              (w1 share 0.0% of 16 transactions)
+[opens] expert file opens=134623 total=2.849s mean=0.021ms requested_bytes=2657509260480 (2657.5 GB)
+[arrival] tiles=1665 waves=2668 uncovered_wait=58.080s dispatch=15.866s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359218.443309 chunks=20 sequence=97.619s read_wait=0.171s bind_upload=1.627s attention_resident=11.495s expert_read_prefetch=22.133s expert_demand_read=13.993s expert_plan=1.471s expert_hint=0.000s expert_submit=0.000s expert_kernel=61.708s source_fence=0.000s tail_head_sync=0.356s layer_other=0.095s expert_read_gross=20.661s plan_hint=1.425s plan_sched=0.046s attn_total=16.510s attn_encode=2.737s attn_wait=13.480s attn_drain=0.293s kernel_total=21.441s kernel_host=3.020s kernel_wait=14.179s kernel_drain=4.242s
+[attn-split] single: calls=837 total=1.582s encode=0.405s wait=0.884s drain=0.293s waits=1449 untimed=458 | wide: calls=1581 total=14.929s encode=2.332s wait=12.596s drain=0.000s waits=1564 untimed=1564 | hint: calls=2392 total=1.966s encode=0.013s wait=1.952s drain=0.000s waits=3418 untimed=3418
+[kernel-split] single: calls=954 total=2.736s encode=0.114s wait=0.068s drain=2.554s waits=1005 untimed=630 | wide: calls=3097 total=18.706s encode=2.906s wait=14.111s drain=1.688s waits=3097 untimed=0
+[kernel-sub] materialize=1.525s moe=16.109s precommit=2.550s rest=1.258s
+[metal-cache] calls=20703 zero_copy_wraps=655 copies=0 cache_entries=196 bindless=true
+translation):**
+[stats] generated=48 elapsed=132.909s speed=0.3611 token/s (2.769 s/token) chunks=21 committed_rows=98 verify_tx=17 drafts=27/78 layer_passes=1953 expert_rows=10580 expert_tiles=2588
+[verify-width] w1=0 w2=9 w3=0 w4=0 w5=0 w6=2 w7=0 w8+=6              (w1 share 0.0% of 17 transactions)
+[opens] expert file opens=141299 total=2.977s mean=0.021ms requested_bytes=2726013877440 (2726.0 GB)
+[arrival] tiles=1690 waves=2717 uncovered_wait=58.314s dispatch=16.010s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359221.525675 chunks=21 sequence=100.638s read_wait=0.171s bind_upload=1.627s attention_resident=11.987s expert_read_prefetch=23.922s expert_demand_read=15.224s expert_plan=1.548s expert_hint=0.000s expert_submit=0.000s expert_kernel=62.423s source_fence=0.000s tail_head_sync=0.376s layer_other=0.097s expert_read_gross=22.374s plan_hint=1.499s plan_sched=0.048s attn_total=17.002s attn_encode=2.848s attn_wait=13.861s attn_drain=0.293s kernel_total=21.922s kernel_host=3.130s kernel_wait=14.483s kernel_drain=4.308s
+[attn-split] single: calls=837 total=1.582s encode=0.405s wait=0.884s drain=0.293s waits=1449 untimed=458 | wide: calls=1674 total=15.420s encode=2.444s wait=12.977s drain=0.000s waits=1656 untimed=1656 | hint: calls=2484 total=2.040s encode=0.014s wait=2.026s drain=0.000s waits=3571 untimed=3571
+[kernel-split] single: calls=954 total=2.736s encode=0.114s wait=0.068s drain=2.554s waits=1005 untimed=630 | wide: calls=3213 total=19.186s encode=3.017s wait=14.415s drain=1.754s waits=3213 untimed=0
+[kernel-sub] materialize=1.577s moe=16.483s precommit=2.550s rest=1.312s
+[metal-cache] calls=21051 zero_copy_wraps=655 copies=0 cache_entries=196 bindless=true
+  
+The quarterly report is due on Friday and
+[stats] generated=57 elapsed=139.368s speed=0.4090 token/s (2.445 s/token) chunks=22 committed_rows=107 verify_tx=18 drafts=35/86 layer_passes=2046 expert_rows=11408 expert_tiles=2680
+[verify-width] w1=0 w2=9 w3=0 w4=0 w5=0 w6=2 w7=0 w8+=7              (w1 share 0.0% of 18 transactions)
+[opens] expert file opens=147085 total=3.116s mean=0.021ms requested_bytes=2861478755520 (2861.5 GB)
+[arrival] tiles=1782 waves=2900 uncovered_wait=62.041s dispatch=17.138s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359227.985527 chunks=22 sequence=107.018s read_wait=0.171s bind_upload=1.627s attention_resident=12.979s expert_read_prefetch=24.421s expert_demand_read=15.430s expert_plan=1.651s expert_hint=0.000s expert_submit=0.000s expert_kernel=67.279s source_fence=0.000s tail_head_sync=0.402s layer_other=0.104s expert_read_gross=22.770s plan_hint=1.596s plan_sched=0.054s attn_total=17.994s attn_encode=2.949s attn_wait=14.752s attn_drain=0.293s kernel_total=23.049s kernel_host=3.358s kernel_wait=15.282s kernel_drain=4.408s
+[attn-split] single: calls=837 total=1.582s encode=0.405s wait=0.884s drain=0.293s waits=1449 untimed=458 | wide: calls=1767 total=16.412s encode=2.545s wait=13.868s drain=0.000s waits=1748 untimed=1748 | hint: calls=2576 total=2.137s encode=0.015s wait=2.122s drain=0.000s waits=3752 untimed=3752
+[kernel-split] single: calls=954 total=2.736s encode=0.114s wait=0.068s drain=2.554s waits=1005 untimed=630 | wide: calls=3396 total=20.313s encode=3.245s wait=15.214s drain=1.854s waits=3396 untimed=0
+[kernel-sub] materialize=1.713s moe=17.394s precommit=2.550s rest=1.392s
+[metal-cache] calls=22698 zero_copy_wraps=838 copies=0 cache_entries=183 bindless=true
+ the board of
+[stats] generated=60 elapsed=146.062s speed=0.4108 token/s (2.434 s/token) chunks=23 committed_rows=110 verify_tx=19 drafts=37/94 layer_passes=2139 expert_rows=12236 expert_tiles=2772
+[verify-width] w1=0 w2=9 w3=0 w4=0 w5=0 w6=2 w7=0 w8+=8              (w1 share 0.0% of 19 transactions)
+[opens] expert file opens=152877 total=3.275s mean=0.021ms requested_bytes=3004366126272 (3004.4 GB)
+[arrival] tiles=1874 waves=3082 uncovered_wait=65.932s dispatch=18.310s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359234.678520 chunks=23 sequence=113.604s read_wait=0.171s bind_upload=1.627s attention_resident=14.056s expert_read_prefetch=24.840s expert_demand_read=15.563s expert_plan=1.750s expert_hint=0.000s expert_submit=0.000s expert_kernel=72.342s source_fence=0.000s tail_head_sync=0.422s layer_other=0.111s expert_read_gross=23.090s plan_hint=1.689s plan_sched=0.060s attn_total=19.070s attn_encode=3.029s attn_wait=15.747s attn_drain=0.293s kernel_total=24.220s kernel_host=3.598s kernel_wait=16.116s kernel_drain=4.506s
+[attn-split] single: calls=837 total=1.582s encode=0.405s wait=0.884s drain=0.293s waits=1449 untimed=458 | wide: calls=1860 total=17.488s encode=2.625s wait=14.864s drain=0.000s waits=1840 untimed=1840 | hint: calls=2668 total=2.230s encode=0.016s wait=2.214s drain=0.000s waits=3933 untimed=3933
+[kernel-split] single: calls=954 total=2.736s encode=0.114s wait=0.068s drain=2.554s waits=1005 untimed=630 | wide: calls=3578 total=21.484s encode=3.484s wait=16.048s drain=1.952s waits=3578 untimed=0
+[kernel-sub] materialize=1.860s moe=18.339s precommit=2.550s rest=1.470s
+[metal-cache] calls=24336 zero_copy_wraps=1026 copies=0 cache_entries=188 bindless=true
+ directors expects a summary of
+[stats] generated=65 elapsed=150.294s speed=0.4325 token/s (2.312 s/token) chunks=24 committed_rows=115 verify_tx=20 drafts=41/98 layer_passes=2232 expert_rows=12696 expert_tiles=2864
+[verify-width] w1=0 w2=9 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=8              (w1 share 0.0% of 20 transactions)
+[opens] expert file opens=158866 total=3.411s mean=0.021ms requested_bytes=3103964445888 (3104.0 GB)
+[arrival] tiles=1958 waves=3248 uncovered_wait=67.524s dispatch=19.018s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359238.911295 chunks=24 sequence=117.765s read_wait=0.171s bind_upload=1.627s attention_resident=14.792s expert_read_prefetch=25.868s expert_demand_read=16.181s expert_plan=1.834s expert_hint=0.000s expert_submit=0.000s expert_kernel=74.712s source_fence=0.000s tail_head_sync=0.445s layer_other=0.115s expert_read_gross=24.033s plan_hint=1.770s plan_sched=0.064s attn_total=19.807s attn_encode=3.148s attn_wait=16.366s attn_drain=0.293s kernel_total=24.997s kernel_host=3.738s kernel_wait=16.663s kernel_drain=4.595s
+[attn-split] single: calls=837 total=1.582s encode=0.405s wait=0.884s drain=0.293s waits=1449 untimed=458 | wide: calls=1953 total=18.225s encode=2.743s wait=15.482s drain=0.000s waits=1932 untimed=1932 | hint: calls=2760 total=2.310s encode=0.017s wait=2.294s drain=0.000s waits=4114 untimed=4114
+[kernel-split] single: calls=954 total=2.736s encode=0.114s wait=0.068s drain=2.554s waits=1005 untimed=630 | wide: calls=3752 total=22.261s encode=3.625s wait=16.595s drain=2.041s waits=3752 untimed=0
+[kernel-sub] materialize=1.928s moe=18.984s precommit=2.550s rest=1.535s
+[metal-cache] calls=25206 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+ cash flows
+[stats] generated=67 elapsed=157.068s speed=0.4266 token/s (2.344 s/token) chunks=25 committed_rows=117 verify_tx=21 drafts=42/106 layer_passes=2325 expert_rows=13524 expert_tiles=2956
+[verify-width] w1=0 w2=9 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 21 transactions)
+[opens] expert file opens=164688 total=3.640s mean=0.022ms requested_bytes=3243184438464 (3243.2 GB)
+[arrival] tiles=2050 waves=3431 uncovered_wait=71.437s dispatch=20.138s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359245.685128 chunks=25 sequence=124.452s read_wait=0.171s bind_upload=1.627s attention_resident=15.889s expert_read_prefetch=26.396s expert_demand_read=16.488s expert_plan=1.942s expert_hint=0.000s expert_submit=0.000s expert_kernel=79.746s source_fence=0.000s tail_head_sync=0.466s layer_other=0.122s expert_read_gross=24.454s plan_hint=1.871s plan_sched=0.071s attn_total=20.903s attn_encode=3.283s attn_wait=17.327s attn_drain=0.293s kernel_total=26.115s kernel_host=3.956s kernel_wait=17.472s kernel_drain=4.687s
+[attn-split] single: calls=837 total=1.582s encode=0.405s wait=0.884s drain=0.293s waits=1449 untimed=458 | wide: calls=2046 total=19.322s encode=2.879s wait=16.443s drain=0.000s waits=2024 untimed=2024 | hint: calls=2852 total=2.411s encode=0.018s wait=2.393s drain=0.000s waits=4295 untimed=4295
+[kernel-split] single: calls=954 total=2.736s encode=0.114s wait=0.068s drain=2.554s waits=1005 untimed=630 | wide: calls=3935 total=23.379s encode=3.842s wait=17.404s drain=2.133s waits=3935 untimed=0
+[kernel-sub] materialize=2.058s moe=19.896s precommit=2.550s rest=1.610s
+[metal-cache] calls=26853 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+.
+[stats] generated=68 elapsed=161.798s speed=0.4203 token/s (2.379 s/token) chunks=26 committed_rows=118 verify_tx=22 drafts=42/108 layer_passes=2418 expert_rows=13616 expert_tiles=3048
+[verify-width] w1=0 w2=10 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 22 transactions)
+[opens] expert file opens=175475 total=3.813s mean=0.022ms requested_bytes=3354337672384 (3354.3 GB)
+[arrival] tiles=2093 waves=3519 uncovered_wait=71.871s dispatch=20.409s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359250.414434 chunks=26 sequence=125.966s read_wait=0.171s bind_upload=1.627s attention_resident=16.137s expert_read_prefetch=27.374s expert_demand_read=17.059s expert_plan=2.014s expert_hint=0.000s expert_submit=0.000s expert_kernel=80.019s source_fence=0.000s tail_head_sync=0.479s layer_other=0.124s expert_read_gross=25.359s plan_hint=1.942s plan_sched=0.072s attn_total=21.636s attn_encode=3.425s attn_wait=17.877s attn_drain=0.334s kernel_total=26.908s kernel_host=4.104s kernel_wait=17.807s kernel_drain=4.997s
+[attn-split] single: calls=930 total=1.829s encode=0.462s wait=1.033s drain=0.334s waits=1610 untimed=513 | wide: calls=2139 total=19.807s encode=2.963s wait=16.845s drain=0.000s waits=2116 untimed=2116 | hint: calls=3036 total=2.564s encode=0.019s wait=2.545s drain=0.000s waits=4564 untimed=4564
+[kernel-split] single: calls=1051 total=2.997s encode=0.127s wait=0.072s drain=2.798s waits=1108 untimed=692 | wide: calls=4067 total=23.911s encode=3.977s wait=17.735s drain=2.199s waits=4067 untimed=0
+[kernel-sub] materialize=2.131s moe=20.307s precommit=2.799s rest=1.672s
+[metal-cache] calls=27346 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+[qwen-roundtrip-skip] n=1 history_len=119: assistant prefix preservation
+[route-chain] chained=690
+[route-chain] dedup_hits=690
+
+[stats] generated=69 elapsed=163.368s speed=0.4224 token/s (2.368 s/token) chunks=27 committed_rows=119 verify_tx=22 drafts=42/108 layer_passes=2511 expert_rows=13708 expert_tiles=3140
+[verify-width] w1=0 w2=10 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 22 transactions)
+[opens] expert file opens=179537 total=3.884s mean=0.022ms requested_bytes=3389932371136 (3389.9 GB)
+[arrival] tiles=2094 waves=3527 uncovered_wait=71.883s dispatch=20.417s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359251.985288 chunks=27 sequence=127.494s read_wait=0.171s bind_upload=1.627s attention_resident=16.202s expert_read_prefetch=28.488s expert_demand_read=17.685s expert_plan=2.103s expert_hint=0.000s expert_submit=0.000s expert_kernel=80.353s source_fence=0.000s tail_head_sync=0.493s layer_other=0.125s expert_read_gross=26.384s plan_hint=2.030s plan_sched=0.073s attn_total=21.701s attn_encode=3.447s attn_wait=17.900s attn_drain=0.354s kernel_total=27.230s kernel_host=4.114s kernel_wait=17.811s kernel_drain=5.304s
+[attn-split] single: calls=1023 total=1.894s encode=0.484s wait=1.056s drain=0.354s waits=1771 untimed=538 | wide: calls=2139 total=19.807s encode=2.963s wait=16.845s drain=0.000s waits=2116 untimed=2116 | hint: calls=3128 total=2.652s encode=0.019s wait=2.633s drain=0.000s waits=4655 untimed=4655
+[kernel-split] single: calls=1150 total=3.318s encode=0.137s wait=0.076s drain=3.105s waits=1215 untimed=780 | wide: calls=4067 total=23.911s encode=3.977s wait=17.735s drain=2.199s waits=4067 untimed=0
+[kernel-sub] materialize=2.131s moe=20.315s precommit=3.107s rest=1.677s
+[metal-cache] calls=27445 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+
+[stats] generated=70 elapsed=164.839s speed=0.4247 token/s (2.355 s/token) chunks=28 committed_rows=120 verify_tx=22 drafts=42/108 layer_passes=2604 expert_rows=13800 expert_tiles=3232
+[verify-width] w1=0 w2=10 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 22 transactions)
+[opens] expert file opens=183572 total=3.948s mean=0.022ms requested_bytes=3425263877312 (3425.3 GB)
+[arrival] tiles=2095 waves=3533 uncovered_wait=71.891s dispatch=20.426s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359253.455440 chunks=28 sequence=128.963s read_wait=0.171s bind_upload=1.627s attention_resident=16.275s expert_read_prefetch=29.495s expert_demand_read=18.273s expert_plan=2.182s expert_hint=0.000s expert_submit=0.000s expert_kernel=80.724s source_fence=0.000s tail_head_sync=0.509s layer_other=0.127s expert_read_gross=27.313s plan_hint=2.107s plan_sched=0.074s attn_total=21.774s attn_encode=3.469s attn_wait=17.928s attn_drain=0.377s kernel_total=27.592s kernel_host=4.124s kernel_wait=17.817s kernel_drain=5.650s
+[attn-split] single: calls=1116 total=1.967s encode=0.506s wait=1.084s drain=0.377s waits=1932 untimed=561 | wide: calls=2139 total=19.807s encode=2.963s wait=16.845s drain=0.000s waits=2116 untimed=2116 | hint: calls=3220 total=2.730s encode=0.019s wait=2.711s drain=0.000s waits=4746 untimed=4746
+[kernel-split] single: calls=1247 total=3.680s encode=0.147s wait=0.082s drain=3.451s waits=1318 untimed=857 | wide: calls=4067 total=23.911s encode=3.977s wait=17.735s drain=2.199s waits=4067 untimed=0
+[kernel-sub] materialize=2.131s moe=20.324s precommit=3.456s rest=1.681s
+[metal-cache] calls=27542 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+
+[stats] generated=71 elapsed=166.316s speed=0.4269 token/s (2.342 s/token) chunks=29 committed_rows=121 verify_tx=22 drafts=42/108 layer_passes=2697 expert_rows=13892 expert_tiles=3324
+[verify-width] w1=0 w2=10 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 22 transactions)
+[opens] expert file opens=187454 total=4.001s mean=0.021ms requested_bytes=3459314384064 (3459.3 GB)
+[arrival] tiles=2096 waves=3540 uncovered_wait=71.905s dispatch=20.436s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359254.932404 chunks=29 sequence=130.439s read_wait=0.171s bind_upload=1.627s attention_resident=16.371s expert_read_prefetch=30.455s expert_demand_read=18.807s expert_plan=2.257s expert_hint=0.000s expert_submit=0.000s expert_kernel=81.125s source_fence=0.000s tail_head_sync=0.526s layer_other=0.128s expert_read_gross=28.198s plan_hint=2.181s plan_sched=0.075s attn_total=21.869s attn_encode=3.509s attn_wait=17.959s attn_drain=0.401s kernel_total=27.979s kernel_host=4.134s kernel_wait=17.823s kernel_drain=6.021s
+[attn-split] single: calls=1209 total=2.062s encode=0.547s wait=1.115s drain=0.401s waits=2093 untimed=589 | wide: calls=2139 total=19.807s encode=2.963s wait=16.845s drain=0.000s waits=2116 untimed=2116 | hint: calls=3312 total=2.804s encode=0.019s wait=2.784s drain=0.000s waits=4837 untimed=4837
+[kernel-split] single: calls=1345 total=4.068s encode=0.157s wait=0.089s drain=3.822s waits=1423 untimed=945 | wide: calls=4067 total=23.911s encode=3.977s wait=17.735s drain=2.199s waits=4067 untimed=0
+[kernel-sub] materialize=2.131s moe=20.333s precommit=3.829s rest=1.686s
+[metal-cache] calls=27640 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+
+[stats] generated=72 elapsed=167.833s speed=0.4290 token/s (2.331 s/token) chunks=30 committed_rows=122 verify_tx=22 drafts=42/108 layer_passes=2790 expert_rows=13984 expert_tiles=3416
+[verify-width] w1=0 w2=10 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 22 transactions)
+[opens] expert file opens=191550 total=4.077s mean=0.021ms requested_bytes=3495181089984 (3495.2 GB)
+[arrival] tiles=2097 waves=3545 uncovered_wait=71.915s dispatch=20.442s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359256.449775 chunks=30 sequence=131.955s read_wait=0.171s bind_upload=1.627s attention_resident=16.441s expert_read_prefetch=31.539s expert_demand_read=19.420s expert_plan=2.332s expert_hint=0.000s expert_submit=0.000s expert_kernel=81.472s source_fence=0.000s tail_head_sync=0.539s layer_other=0.130s expert_read_gross=29.208s plan_hint=2.255s plan_sched=0.076s attn_total=21.939s attn_encode=3.530s attn_wait=17.996s attn_drain=0.413s kernel_total=28.316s kernel_host=4.144s kernel_wait=17.827s kernel_drain=6.345s
+[attn-split] single: calls=1302 total=2.132s encode=0.567s wait=1.152s drain=0.413s waits=2254 untimed=618 | wide: calls=2139 total=19.807s encode=2.963s wait=16.845s drain=0.000s waits=2116 untimed=2116 | hint: calls=3404 total=2.877s encode=0.020s wait=2.857s drain=0.000s waits=4928 untimed=4928
+[kernel-split] single: calls=1441 total=4.405s encode=0.167s wait=0.092s drain=4.146s waits=1524 untimed=1025 | wide: calls=4067 total=23.911s encode=3.977s wait=17.735s drain=2.199s waits=4067 untimed=0
+[kernel-sub] materialize=2.131s moe=20.340s precommit=4.155s rest=1.690s
+[metal-cache] calls=27736 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+
+[stats] generated=73 elapsed=169.314s speed=0.4312 token/s (2.319 s/token) chunks=31 committed_rows=123 verify_tx=22 drafts=42/108 layer_passes=2883 expert_rows=14076 expert_tiles=3508
+[verify-width] w1=0 w2=10 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 22 transactions)
+[opens] expert file opens=195513 total=4.142s mean=0.021ms requested_bytes=3529880894656 (3529.9 GB)
+[arrival] tiles=2098 waves=3553 uncovered_wait=71.927s dispatch=20.455s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359257.931396 chunks=31 sequence=133.435s read_wait=0.171s bind_upload=1.627s attention_resident=16.513s expert_read_prefetch=32.554s expert_demand_read=20.012s expert_plan=2.412s expert_hint=0.000s expert_submit=0.000s expert_kernel=81.847s source_fence=0.000s tail_head_sync=0.556s layer_other=0.132s expert_read_gross=30.142s plan_hint=2.334s plan_sched=0.077s attn_total=22.012s attn_encode=3.551s attn_wait=18.020s attn_drain=0.440s kernel_total=28.679s kernel_host=4.156s kernel_wait=17.833s kernel_drain=6.690s
+[attn-split] single: calls=1395 total=2.204s encode=0.589s wait=1.176s drain=0.440s waits=2415 untimed=635 | wide: calls=2139 total=19.807s encode=2.963s wait=16.845s drain=0.000s waits=2116 untimed=2116 | hint: calls=3496 total=2.956s encode=0.020s wait=2.936s drain=0.000s waits=5019 untimed=5019
+[kernel-split] single: calls=1540 total=4.768s encode=0.178s wait=0.098s drain=4.491s waits=1631 untimed=1106 | wide: calls=4067 total=23.911s encode=3.977s wait=17.735s drain=2.199s waits=4067 untimed=0
+[kernel-sub] materialize=2.131s moe=20.352s precommit=4.501s rest=1.695s
+[metal-cache] calls=27835 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+
+[stats] generated=74 elapsed=170.875s speed=0.4331 token/s (2.309 s/token) chunks=32 committed_rows=124 verify_tx=22 drafts=42/108 layer_passes=2976 expert_rows=14168 expert_tiles=3600
+[verify-width] w1=0 w2=10 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 22 transactions)
+[opens] expert file opens=199667 total=4.213s mean=0.021ms requested_bytes=3566309080256 (3566.3 GB)
+[arrival] tiles=2099 waves=3559 uncovered_wait=71.938s dispatch=20.463s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359259.491820 chunks=32 sequence=134.995s read_wait=0.171s bind_upload=1.627s attention_resident=16.594s expert_read_prefetch=33.605s expert_demand_read=20.648s expert_plan=2.488s expert_hint=0.000s expert_submit=0.000s expert_kernel=82.258s source_fence=0.000s tail_head_sync=0.571s layer_other=0.133s expert_read_gross=31.117s plan_hint=2.409s plan_sched=0.078s attn_total=22.092s attn_encode=3.577s attn_wait=18.050s attn_drain=0.464s kernel_total=29.079s kernel_host=4.167s kernel_wait=17.837s kernel_drain=7.075s
+[attn-split] single: calls=1488 total=2.285s encode=0.614s wait=1.206s drain=0.464s waits=2576 untimed=657 | wide: calls=2139 total=19.807s encode=2.963s wait=16.845s drain=0.000s waits=2116 untimed=2116 | hint: calls=3588 total=3.031s encode=0.020s wait=3.011s drain=0.000s waits=5110 untimed=5110
+[kernel-split] single: calls=1637 total=5.167s encode=0.189s wait=0.102s drain=4.876s waits=1734 untimed=1192 | wide: calls=4067 total=23.911s encode=3.977s wait=17.735s drain=2.199s waits=4067 untimed=0
+[kernel-sub] materialize=2.131s moe=20.361s precommit=4.887s rest=1.700s
+[metal-cache] calls=27932 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+
+[stats] generated=75 elapsed=172.517s speed=0.4347 token/s (2.300 s/token) chunks=33 committed_rows=125 verify_tx=22 drafts=42/108 layer_passes=3069 expert_rows=14260 expert_tiles=3692
+[verify-width] w1=0 w2=10 w3=0 w4=1 w5=0 w6=2 w7=0 w8+=9              (w1 share 0.0% of 22 transactions)
+[opens] expert file opens=203931 total=4.298s mean=0.021ms requested_bytes=3603676085440 (3603.7 GB)
+[arrival] tiles=2100 waves=3564 uncovered_wait=71.947s dispatch=20.472s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=359261.133456 chunks=33 sequence=136.635s read_wait=0.171s bind_upload=1.627s attention_resident=16.683s expert_read_prefetch=34.758s expert_demand_read=21.321s expert_plan=2.567s expert_hint=0.000s expert_submit=0.000s expert_kernel=82.638s source_fence=0.000s tail_head_sync=0.587s layer_other=0.135s expert_read_gross=32.191s plan_hint=2.487s plan_sched=0.079s attn_total=22.181s attn_encode=3.611s attn_wait=18.090s attn_drain=0.480s kernel_total=29.450s kernel_host=4.177s kernel_wait=17.842s kernel_drain=7.431s
+[attn-split] single: calls=1581 total=2.373s encode=0.648s wait=1.246s drain=0.480s waits=2737 untimed=687 | wide: calls=2139 total=19.807s encode=2.963s wait=16.845s drain=0.000s waits=2116 untimed=2116 | hint: calls=3680 total=3.109s encode=0.020s wait=3.089s drain=0.000s waits=5201 untimed=5201
+[kernel-split] single: calls=1733 total=5.539s encode=0.200s wait=0.107s drain=5.232s waits=1835 untimed=1273 | wide: calls=4067 total=23.911s encode=3.977s wait=17.735s drain=2.199s waits=4067 untimed=0
+[kernel-sub] materialize=2.131s moe=20.369s precommit=5.246s rest=1.704s
+[metal-cache] calls=28028 zero_copy_wraps=1042 copies=0 cache_entries=204 bindless=true
+
+[native] Qwen proposals=23 tokens=42/108 fallbacks=1 verify-memory-rejections=0 wide-loads=1 wide-invocations=3 wide-skips=10 wide-failures=0 raw-overrides=1 raw-override-failures=1
+WALL_SECONDS=180

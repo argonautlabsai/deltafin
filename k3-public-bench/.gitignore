@@ -1,0 +1,5 @@
+# The upstream .gitignore drops *.log and *.out; the arm logs here ARE the results.
+!*.log
+!*.out
+!**/*.log
+!**/*.out

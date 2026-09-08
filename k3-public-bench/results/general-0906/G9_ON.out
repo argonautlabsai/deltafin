@@ -1,0 +1,6 @@
+[k3-measure] G9_ON  device map: internal=disk0 Yellow=disk4 Green=disk8 White=disk6 
+$K3_DIR/k3-measure.sh: line 55:  2686 Terminated: 15          sh -c "\"$K3_DIR/k3-diskscope\" 200 999999 \"$K3_OUT/$arm.csv\" $devs" > /dev/null 2>&1
+$K3_DIR/k3-measure.sh: line 55:  2687 Terminated: 15          ( while :; do
+    "$K3_DIR/k3-memsample.sh"; sleep 1;
+done ) > "$K3_OUT/$arm.sys" 2> /dev/null
+[k3-measure] G9_ON done rc=0 -> $K3_DIR/k3-public-bench/results/general-0906/G9_ON.{csv,sys,log}

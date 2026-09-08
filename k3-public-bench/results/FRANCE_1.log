@@ -1,0 +1,88 @@
+[config] resolved: surface=DirectRun device=Auto spine=Auto spine_read_threads=auto spine_fd_cache=auto spine_stream_nocache=auto expert_stream_nocache=auto spine_resident_bytes=16000000000 provider_resident_layers=93 expert_read_threads=64 expert_prefetch_threads=8 expert_backend=Auto expert_scale4=Auto expert_pin_bytes=0 expert_heat=true expert_overlays=[hot=/Volumes/White/k3-experts-b:50265files dir_b=/Volumes/Green/k3-experts-full:82432files dir_c=/Volumes/Yellow/serve3-green:26684files] pilot_gate=Off pilot_gate_threshold=0.1 pilot_gate_warmup=16 quality=QualityPolicy { target_authority: FullK3, routed_experts: 16, activation_precision: Fp32, resident_weights: QuantizedInt8 } dspark=Off dspark_max_context=8192 dspark_min_auto_speedup=0.03 dspark_miss_tolerance=1 dspark_max_drafts=7 qwen=On reasoning_effort=default router_trace_mode=Off router_trace_path=none chat=false stats=true layer_profile=false max_new=17
+[residency] residency set created
+[residency] queue attached (1 queues)
+[native] exact scale4-v2 expert storage unavailable (inspect scale4 manifest $K3_DIR/deltafin-root-local/k3-experts-scale4/scale4-manifest.json: No such file or directory (os error 2)); using raw-v1
+[native] expert hot tier enabled: /Volumes/White/k3-experts-b (probed before $K3_DIR/deltafin-root-local/k3-experts)
+[native] split-read: chunks=2 demand_chunks=2 prefetch_hot_side_chunks=1 demand_home=hot-first-both-chunks tier_balance=1 split_eta=1 trace=0
+[native] plan-path balance: on (lowest expected completion among holders)
+[native] expert volume B enabled: /Volumes/Green/k3-experts-full (probed after hot, before $K3_DIR/deltafin-root-local/k3-experts)
+[native] expert volume C enabled: /Volumes/Yellow/serve3-green (probed before hot and $K3_DIR/deltafin-root-local/k3-experts)
+[native] host=macos/aarch64 device=mps experts=metal/raw-v1 root=$K3_DIR/deltafin-root-local spine=loose-deferred representation=quantized-int8 (non-weight-exact) layers=93 globals=2 resident=93/93 (50.74 GiB) transient=0.00 GiB readers=spine:4t/expert:64t/prefetch:8t spine-fdcache=0/0fd cpu-expert:4t router-trace=false lazy-missing=0 LibTorch=2.13.0
+[native] optional Qwen: state=qwen3-0.6b model+KV-reserve=4.91 GiB verify-reserve=0.00 GiB/9 positions admitted-context=4389 tokens startup-error=none
+[native] context cache: initial=16 tokens/45.00 MiB, growth=2.81 MiB per capacity token, startup reserve=256 tokens/832.03 MiB, exact-expanded cap=4369 / model contract=1048576 tokens (live peak admission required beyond reserve)
+[native] verify snapshots: 452.81 MiB per candidate boundary, width 1..=64 (fresh peak admission; otherwise ordinary exact decode)
+[native] native target structure ready (all 16 routed experts; physical real-weight sequence parity not yet recorded for this backend/representation)
+[native] expert arena: slots=1 prefetch_slots=64
+[native] probe-order: dir_c_first
+[native] mirror-cost: rated
+[native] mirror: enabled=false mode=0 internal_cost_us=1502 enclosure_cost_us=948 bias=internal:1.00,K3C:1.00,K3B:1.00,K3A:1.00 outstanding=0/0/0/0
+[native] retain: enabled=false cap_gb=8 layers=63..=92
+[native] summer: enabled=false cap_gb=8 policy=lfru sample=16
+[native] expert heat: weight=11842 passes recording=true; pin tier: candidates=0 charged=0.00 GiB
+[spine-fp32] execution arena DISABLED (K3_SPINE_FP32_ARENA=0)
+[residency] queue attached (2 queues)
+[residency] 1 allocations, 1.09 GiB pinned
+[residency] 2 allocations, 1.10 GiB pinned
+[residency] 4 allocations, 1.70 GiB pinned
+[residency] 8 allocations, 4.47 GiB pinned
+[residency] 16 allocations, 8.27 GiB pinned
+[residency] 32 allocations, 17.04 GiB pinned
+[residency] 64 allocations, 33.58 GiB pinned
+ Paris
+[stats] generated=1 elapsed=9.354s speed=0.1069 token/s (9.354 s/token) chunks=1 committed_rows=5 verify_tx=0 drafts=0/0 layer_passes=93 expert_rows=460 expert_tiles=118
+[opens] expert file opens=948 total=0.086s mean=0.090ms requested_bytes=157540318400 (157.5 GB)
+[split-eta] chunks served hot=1366 dir_c=1008 dir_b=1255 primary=2595
+[arrival] tiles=118 waves=275 uncovered_wait=3.885s dispatch=0.938s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=461812.069006 chunks=1 sequence=9.352s read_wait=1.601s bind_upload=1.444s attention_resident=1.183s expert_read_prefetch=0.246s expert_demand_read=0.000s expert_plan=0.000s expert_hint=0.000s expert_submit=0.000s expert_kernel=4.824s source_fence=0.000s tail_head_sync=0.016s layer_other=0.007s expert_read_gross=0.246s plan_hint=0.000s plan_sched=0.000s attn_total=1.183s attn_encode=0.569s attn_wait=0.614s attn_drain=0.000s kernel_total=0.938s kernel_host=0.153s kernel_wait=0.647s kernel_drain=0.138s
+[attn-split] single: calls=0 total=0.000s encode=0.000s wait=0.000s drain=0.000s waits=0 untimed=0 | wide: calls=93 total=1.183s encode=0.569s wait=0.614s drain=0.000s waits=92 untimed=92 | hint: calls=92 total=0.000s encode=0.000s wait=0.000s drain=0.000s waits=0 untimed=0
+[kernel-split] single: calls=183 total=0.145s encode=0.027s wait=0.054s drain=0.064s waits=183 untimed=0 | wide: calls=92 total=0.793s encode=0.126s wait=0.593s drain=0.073s waits=92 untimed=0
+[kernel-sub] materialize=0.062s moe=0.795s precommit=0.000s rest=0.081s
+[metal-cache] calls=617 zero_copy_wraps=248 copies=0 cache_entries=64 bindless=true
+. The E
+[stats] generated=4 elapsed=11.806s speed=0.3388 token/s (2.952 s/token) chunks=2 committed_rows=8 verify_tx=1 drafts=2/2 layer_passes=186 expert_rows=736 expert_tiles=210
+[verify-width] w1=0 w2=1 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=0              (w1 share 0.0% of 1 transactions)
+[opens] expert file opens=4815 total=0.154s mean=0.032ms requested_bytes=220684172480 (220.7 GB)
+[split-eta] chunks served hot=2572 dir_c=1770 dir_b=2399 primary=5135
+[arrival] tiles=169 waves=341 uncovered_wait=4.806s dispatch=1.174s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=461814.520727 chunks=2 sequence=11.742s read_wait=1.601s bind_upload=1.444s attention_resident=1.565s expert_read_prefetch=0.885s expert_demand_read=0.449s expert_plan=0.108s expert_hint=0.000s expert_submit=0.000s expert_kernel=6.177s source_fence=0.000s tail_head_sync=0.029s layer_other=0.010s expert_read_gross=0.777s plan_hint=0.058s plan_sched=0.051s attn_total=1.565s attn_encode=0.648s attn_wait=0.917s attn_drain=0.000s kernel_total=1.369s kernel_host=0.272s kernel_wait=0.903s kernel_drain=0.193s
+[attn-split] single: calls=0 total=0.000s encode=0.000s wait=0.000s drain=0.000s waits=0 untimed=0 | wide: calls=186 total=1.565s encode=0.648s wait=0.917s drain=0.000s waits=184 untimed=184 | hint: calls=184 total=0.057s encode=0.000s wait=0.057s drain=0.000s waits=153 untimed=153
+[kernel-split] single: calls=183 total=0.145s encode=0.027s wait=0.054s drain=0.064s waits=183 untimed=0 | wide: calls=199 total=1.224s encode=0.245s wait=0.849s drain=0.129s waits=199 untimed=0
+[kernel-sub] materialize=0.122s moe=1.111s precommit=0.000s rest=0.136s
+[metal-cache] calls=938 zero_copy_wraps=312 copies=0 cache_entries=128 bindless=true
+iffel Tower is located in Paris. The Lou
+[stats] generated=13 elapsed=16.353s speed=0.7950 token/s (1.258 s/token) chunks=3 committed_rows=17 verify_tx=2 drafts=10/10 layer_passes=279 expert_rows=1564 expert_tiles=302
+[verify-width] w1=0 w2=1 w3=0 w4=0 w5=0 w6=0 w7=0 w8+=1              (w1 share 0.0% of 2 transactions)
+[opens] expert file opens=10335 total=0.295s mean=0.029ms requested_bytes=342418324672 (342.4 GB)
+[split-eta] chunks served hot=4618 dir_c=3136 dir_b=4435 primary=9500
+[arrival] tiles=260 waves=521 uncovered_wait=6.696s dispatch=2.212s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=461819.067500 chunks=3 sequence=16.208s read_wait=1.601s bind_upload=1.444s attention_resident=2.569s expert_read_prefetch=1.383s expert_demand_read=0.711s expert_plan=0.188s expert_hint=0.000s expert_submit=0.000s expert_kernel=9.119s source_fence=0.000s tail_head_sync=0.046s layer_other=0.015s expert_read_gross=1.195s plan_hint=0.133s plan_sched=0.055s attn_total=2.568s attn_encode=0.768s attn_wait=1.800s attn_drain=0.000s kernel_total=2.420s kernel_host=0.456s kernel_wait=1.698s kernel_drain=0.266s
+[attn-split] single: calls=0 total=0.000s encode=0.000s wait=0.000s drain=0.000s waits=0 untimed=0 | wide: calls=279 total=2.568s encode=0.768s wait=1.800s drain=0.000s waits=276 untimed=276 | hint: calls=276 total=0.133s encode=0.001s wait=0.132s drain=0.000s waits=334 untimed=334
+[kernel-split] single: calls=183 total=0.145s encode=0.027s wait=0.054s drain=0.064s waits=183 untimed=0 | wide: calls=380 total=2.275s encode=0.429s wait=1.644s drain=0.202s waits=380 untimed=0
+[kernel-sub] materialize=0.241s moe=1.989s precommit=0.000s rest=0.190s
+[metal-cache] calls=2567 zero_copy_wraps=487 copies=0 cache_entries=175 bindless=true
+vre Museum is also
+[stats] generated=17 elapsed=19.081s speed=0.8909 token/s (1.122 s/token) chunks=4 committed_rows=21 verify_tx=3 drafts=13/13 layer_passes=372 expert_rows=1932 expert_tiles=394
+[verify-width] w1=0 w2=1 w3=1 w4=0 w5=0 w6=0 w7=0 w8+=1              (w1 share 0.0% of 3 transactions)
+[opens] expert file opens=14755 total=0.372s mean=0.025ms requested_bytes=415283363008 (415.3 GB)
+[split-eta] chunks served hot=5965 dir_c=4002 dir_b=5764 primary=12337
+[arrival] tiles=323 waves=617 uncovered_wait=7.616s dispatch=2.571s
+[retain] enabled=false cap_gb=8 layers=63..=92 consults=0 wanted=0 hits=0 inserts=0 served=0.0MB
+[summer] enabled=false cap_gb=8 sample=16 consults=0 wanted=0 hits=0 hit_rate=0.0% misses=0 inserts=0 evictions=0 recycled=0 allocs=0 pin_skips=0 gated=0 ramp=2..50 bar=0 suppressed=0 wide_skips=0 served=0.0MB copied=0.0MB ssd_avoided=0.0GB live=0/0.0GB model=0 protected=0 declined=0 topup_suppressed=0 aged=0 into=0/0/0 pending=0
+[mirror-split] internal=0 K3C=0 K3B=0 K3A=0  shares=0%/0%/0%/0%
+[phases] mono=461821.795736 chunks=4 sequence=18.895s read_wait=1.601s bind_upload=1.444s attention_resident=3.014s expert_read_prefetch=2.163s expert_demand_read=1.313s expert_plan=0.267s expert_hint=0.000s expert_submit=0.000s expert_kernel=10.560s source_fence=0.000s tail_head_sync=0.063s layer_other=0.018s expert_read_gross=1.896s plan_hint=0.211s plan_sched=0.057s attn_total=3.013s attn_encode=0.857s attn_wait=2.157s attn_drain=0.000s kernel_total=2.940s kernel_host=0.590s kernel_wait=2.016s kernel_drain=0.334s
+[attn-split] single: calls=0 total=0.000s encode=0.000s wait=0.000s drain=0.000s waits=0 untimed=0 | wide: calls=372 total=3.013s encode=0.857s wait=2.157s drain=0.000s waits=368 untimed=368 | hint: calls=368 total=0.210s encode=0.002s wait=0.209s drain=0.000s waits=506 untimed=506
+[kernel-split] single: calls=183 total=0.145s encode=0.027s wait=0.054s drain=0.064s waits=183 untimed=0 | wide: calls=505 total=2.795s encode=0.563s wait=1.963s drain=0.269s waits=505 untimed=0
+[kernel-sub] materialize=0.310s moe=2.379s precommit=0.000s rest=0.250s
+[metal-cache] calls=3067 zero_copy_wraps=487 copies=0 cache_entries=175 bindless=true
+
+[native] Qwen proposals=3 tokens=13/13 fallbacks=0 verify-memory-rejections=0 wide-loads=0 wide-invocations=0 wide-skips=2 wide-failures=0 raw-overrides=1 raw-override-failures=0
+WALL_SECONDS=21.160

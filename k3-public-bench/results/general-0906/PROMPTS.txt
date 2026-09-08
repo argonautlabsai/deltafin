@@ -1,0 +1,10 @@
+Explain how a central bank sets interest rates and what happens when it raises them.
+Write a Python function that parses a CSV of transactions and returns the top five payees by total amount, with a short explanation.
+List twelve capital cities in Europe with their countries, one per line.
+Describe the water cycle for a ten-year-old.
+A company has revenue of 4,200,000, cost of sales of 2,650,000, operating expenses of 910,000 and tax at 20%. Calculate gross profit, operating profit and net profit, showing each step.
+Summarise the plot of a heist story you invent, in three paragraphs.
+What are the main differences between VAT and sales tax, and which countries use each?
+Give a step-by-step recipe for a simple tomato pasta sauce.
+Translate the following into formal French and then back into English: "The quarterly report is due on Friday and the board expects a summary of cash flow."
+Explain what a Mixture-of-Experts model is and why it is hard to run on a laptop.
