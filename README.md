@@ -1,6 +1,27 @@
 # ARGODRIVE Deltafin
 
-A fork of gavamedia/deltafin (MIT) running Kimi K3 from SSDs on Apple Silicon, with the ARGODRIVE storage work. The benchmark package, placement manifests and results are in [`k3-public-bench/`](k3-public-bench/); the measurement instruments are published separately as [ARGODRIVE](https://github.com/argonautlabsai/argodrive). Credits and what this fork changes: [`CREDITS.md`](CREDITS.md). The upstream README follows.
+A fork of gavamedia/deltafin (MIT) running Kimi K3 from SSDs on Apple Silicon, with the ARGODRIVE storage work. The benchmark package, placement manifests and results are in [`k3-public-bench/`](k3-public-bench/); the measurement instruments are published separately as [ARGODRIVE](https://github.com/argonautlabsai/argodrive). Credits and what this fork changes: [`CREDITS.md`](CREDITS.md). The upstream README follows below the benchmark section.
+
+---
+
+## ARGODRIVE Deltafin benchmarks — M5 Max, 128 GB, experts streamed from four SSDs
+
+Measured 2026-09-08 with this fork's configuration of record
+([`k3-public-bench/env.sh`](k3-public-bench/env.sh)); every number is one cold
+run with the exact prompt, and the per-run logs are in
+[`k3-public-bench/results/`](k3-public-bench/results/).
+
+| test | drafter off | drafter on |
+|---|---:|---:|
+| steady decode, 512 generated tokens | 0.9232 tok/s | **1.0015 tok/s** |
+| steady decode, 128 generated tokens | 0.9261 | **1.1252** |
+| 17-token prompt from issue #15 (upstream reported 0.684 there), median of 3 | — | **0.9631** |
+| time to first token, 512-token prompt | ≈376 s | ≈375 s |
+
+Drive-count ladder on the same prompts: one drive ≈52% of the four-drive
+speed, two full mirrors ≈73%, three ≈90% ([`results/SCALING.md`](k3-public-bench/results/SCALING.md)).
+Why prefill is slow and what fixes it: [`results/PREFILL.md`](k3-public-bench/results/PREFILL.md).
+Definitions, identity scope and precision statement: [`k3-public-bench/README.md`](k3-public-bench/README.md).
 
 ---
 
@@ -24,11 +45,11 @@ All 16 experts, every single token. No shortcuts, no "close enough." It's exactl
 
 The quality rule is simple: **K3 itself decides every token**, and nobody else. Small draft models are allowed to guess ahead (that's where much of the speed comes from), but K3 checks every guess, and nothing reaches you without its official sign-off.
 
-### Latest Benchmarks on an M1 Max laptop
+### Upstream benchmarks on an M1 Max laptop (gavamedia/deltafin, unchanged — not this fork's numbers)
 
 * 0.2901 token/s (3.447 s/token) — 1.9% higher throughput than last update
 
-#### Historical M1 benchmarks:
+#### Upstream's historical M1 benchmarks:
 
 * 0.2847 token/s (August 2, 2026) — 7.0% higher throughput
 * 0.2660 token/s (July 30, 2026) — 102.9% higher throughput
