@@ -17,8 +17,8 @@ run with the exact prompt, and the per-run logs are in
 [`k3-public-bench/results/`](k3-public-bench/results/).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="k3-public-bench/results/charts/hero-dark.svg">
-  <img src="k3-public-bench/results/charts/hero.svg" alt="1.00 tok/s steady over 512 tokens; 1.13 over 128; 0.96 on the public prompt; 6.3 min to first token on a 512-token prompt">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/hero-dark.svg">
+  <img src="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/hero.svg" alt="1.00 tok/s steady over 512 tokens; 1.13 over 128; 0.96 on the public prompt; 6.3 min to first token on a 512-token prompt">
 </picture>
 
 | | drafter off | drafter on |
@@ -32,18 +32,18 @@ Steady = decode rate after the first token; inclusive rates and the four-decimal
 [`results/RESULTS-2026-09-08-standard-lengths.md`](k3-public-bench/results/RESULTS-2026-09-08-standard-lengths.md).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="k3-public-bench/results/charts/drive-ladder-dark.svg">
-  <img src="k3-public-bench/results/charts/drive-ladder.svg" alt="Decode speed by number of drives: one drive about 52%, two about 73%, three about 90% of four-drive speed">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drive-ladder-dark.svg">
+  <img src="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drive-ladder.svg" alt="Decode speed by number of drives: one drive about 52%, two about 73%, three about 90% of four-drive speed">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="k3-public-bench/results/charts/drives-live-dark.svg">
-  <img src="k3-public-bench/results/charts/drives-live.svg" alt="Animated replay of the four drives' read throughput during the 200-token record arm">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drives-live-dark.svg">
+  <img src="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drives-live.svg" alt="Animated replay of the four drives' read throughput during the 200-token record arm">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="k3-public-bench/results/charts/drive-draw-dark.svg">
-  <img src="k3-public-bench/results/charts/drive-draw.svg" alt="Per-drive draw under the engine vs standalone ceiling">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drive-draw-dark.svg">
+  <img src="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drive-draw.svg" alt="Per-drive draw under the engine vs standalone ceiling">
 </picture>
 
 Drive-count ladder on the same prompts: one drive ≈52% of the four-drive

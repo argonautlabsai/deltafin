@@ -36,18 +36,18 @@ runs, cause not isolated — small differences on this rig need replication.
 | first token, 512-token prompt | ≈376 s | ≈375 s | negligible |
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/charts/drives-live-dark.svg">
-  <img src="results/charts/drives-live.svg" alt="Animated replay of the four drives' read throughput during the 200-token record arm">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drives-live-dark.svg">
+  <img src="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drives-live.svg" alt="Animated replay of the four drives' read throughput during the 200-token record arm">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/charts/drive-draw-dark.svg">
-  <img src="results/charts/drive-draw.svg" alt="Per-drive draw under the engine vs standalone ceiling">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drive-draw-dark.svg">
+  <img src="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/drive-draw.svg" alt="Per-drive draw under the engine vs standalone ceiling">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="results/charts/read-timeline-dark.svg">
-  <img src="results/charts/read-timeline.svg" alt="Per-drive read throughput during one 200-token run, all four drives">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/read-timeline-dark.svg">
+  <img src="https://raw.githubusercontent.com/argonautlabsai/deltafin/main/k3-public-bench/results/charts/read-timeline.svg" alt="Per-drive read throughput during one 200-token run, all four drives">
 </picture>
 
 **Steady** excludes the first-token phase: `(generated - 1) / (elapsed_final -
