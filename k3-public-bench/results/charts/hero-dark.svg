@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="745.92pt" height="137.52pt" viewBox="0 0 745.92 137.52" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-09-09T17:43:55.984177</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.10.9, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 137.52 
+L 745.92 137.52 
+L 745.92 0 
+L 0 0 
+z
+" style="fill: #0d1117"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 25.92 115.92 
+L 180 115.92 
+Q 187.2 115.92 187.2 114.804 
+L 187.2 23.436 
+Q 187.2 22.32 180 22.32 
+L 25.92 22.32 
+Q 18.72 22.32 18.72 23.436 
+L 18.72 114.804 
+Q 18.72 115.92 25.92 115.92 
+z
+" clip-path="url(#p52779b59c1)" style="fill: #161b22; stroke: #30363d; stroke-width: 0.9; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 204.48 115.92 
+L 358.56 115.92 
+Q 365.76 115.92 365.76 114.804 
+L 365.76 23.436 
+Q 365.76 22.32 358.56 22.32 
+L 204.48 22.32 
+Q 197.28 22.32 197.28 23.436 
+L 197.28 114.804 
+Q 197.28 115.92 204.48 115.92 
+z
+" clip-path="url(#p52779b59c1)" style="fill: #161b22; stroke: #30363d; stroke-width: 0.9; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 383.04 115.92 
+L 537.12 115.92 
+Q 544.32 115.92 544.32 114.804 
+L 544.32 23.436 
+Q 544.32 22.32 537.12 22.32 
+L 383.04 22.32 
+Q 375.84 22.32 375.84 23.436 
+L 375.84 114.804 
+Q 375.84 115.92 383.04 115.92 
+z
+" clip-path="url(#p52779b59c1)" style="fill: #161b22; stroke: #30363d; stroke-width: 0.9; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 561.6 115.92 
+L 715.68 115.92 
+Q 722.88 115.92 722.88 114.804 
+L 722.88 23.436 
+Q 722.88 22.32 715.68 22.32 
+L 561.6 22.32 
+Q 554.4 22.32 554.4 23.436 
+L 554.4 114.804 
+Q 554.4 115.92 561.6 115.92 
+z
+" clip-path="url(#p52779b59c1)" style="fill: #161b22; stroke: #30363d; stroke-width: 0.9; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_1">
+    <text style="font-weight: 700; font-size: 17px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #e6edf3" x="33.12" y="63.010937" transform="rotate(-0 33.12 63.010937)">1.00 tok/s</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 7.9px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #b1bac4" x="33.12" y="94.339906" transform="rotate(-0 33.12 94.339906)">steady decode, 512-token answer</text>
+   </g>
+   <g id="text_3">
+    <text style="font-weight: 700; font-size: 17px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #e6edf3" x="211.68" y="63.010937" transform="rotate(-0 211.68 63.010937)">1.13 tok/s</text>
+   </g>
+   <g id="text_4">
+    <text style="font-size: 7.9px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #b1bac4" x="211.68" y="94.339906" transform="rotate(-0 211.68 94.339906)">steady decode, 128 tokens</text>
+   </g>
+   <g id="text_5">
+    <text style="font-weight: 700; font-size: 17px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #e6edf3" x="390.24" y="63.010937" transform="rotate(-0 390.24 63.010937)">0.96 tok/s</text>
+   </g>
+   <g id="text_6">
+    <text style="font-size: 7.9px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #b1bac4" x="390.24" y="94.339906" transform="rotate(-0 390.24 94.339906)">17-token public prompt (upstream 0.68)</text>
+   </g>
+   <g id="text_7">
+    <text style="font-weight: 700; font-size: 17px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #b1bac4" x="568.8" y="63.010937" transform="rotate(-0 568.8 63.010937)">6.3 min</text>
+   </g>
+   <g id="text_8">
+    <text style="font-size: 7.9px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #b1bac4" x="568.8" y="94.339906" transform="rotate(-0 568.8 94.339906)">to first token, 512-token prompt</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p52779b59c1">
+   <rect x="12.96" y="12.96" width="720" height="111.6"/>
+  </clipPath>
+ </defs>
+</svg>

@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="456.311719pt" height="337.617641pt" viewBox="0 0 456.311719 337.617641" xmlns="http://www.w3.org/2000/svg" version="1.1">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="475.088062pt" height="295.655325pt" viewBox="0 0 475.088062 295.655325" xmlns="http://www.w3.org/2000/svg" version="1.1">
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:date>2026-09-08T23:29:34.656092</dc:date>
+    <dc:date>2026-09-09T17:43:55.693936</dc:date>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -21,19 +21,19 @@
  </defs>
  <g id="figure_1">
   <g id="patch_1">
-   <path d="M 0 337.617641 
-L 456.311719 337.617641 
-L 456.311719 0 
+   <path d="M 0 295.655325 
+L 475.088062 295.655325 
+L 475.088062 0 
 L 0 0 
 z
 " style="fill: #fcfcfb"/>
   </g>
   <g id="axes_1">
    <g id="patch_2">
-    <path d="M 40.28125 260.406281 
-L 397.40125 260.406281 
-L 397.40125 27.558281 
-L 40.28125 27.558281 
+    <path d="M 48.704063 231.822125 
+L 462.128062 231.822125 
+L 462.128062 48.078125 
+L 48.704063 48.078125 
 z
 " style="fill: #fcfcfb"/>
    </g>
@@ -41,185 +41,176 @@ z
     <g id="xtick_1">
      <g id="line2d_1"/>
      <g id="text_1">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="116.10247" y="271.504719" transform="rotate(-0 116.10247 271.504719)">128 generated tokens</text>
+      <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="161.456062" y="244.280797" transform="rotate(-0 161.456062 244.280797)">128 generated tokens</text>
      </g>
     </g>
     <g id="xtick_2">
      <g id="line2d_2"/>
      <g id="text_2">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="321.58003" y="271.504719" transform="rotate(-0 321.58003 271.504719)">512 generated tokens</text>
+      <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="349.376062" y="244.280797" transform="rotate(-0 349.376062 244.280797)">512 generated tokens</text>
      </g>
     </g>
    </g>
    <g id="matplotlib.axis_2">
     <g id="ytick_1">
      <g id="line2d_3">
-      <path d="M 40.28125 260.406281 
-L 397.40125 260.406281 
-" clip-path="url(#p17ee0b9c05)" style="fill: none; stroke: #ecebe6; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 48.704063 231.822125 
+L 462.128062 231.822125 
+" clip-path="url(#p2d15a2b8c4)" style="fill: none; stroke: #eceae4; stroke-width: 0.7; stroke-linecap: square"/>
      </g>
      <g id="line2d_4"/>
      <g id="text_3">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #52514e" x="36.78125" y="264.2055" transform="rotate(-0 36.78125 264.2055)">0.0</text>
+      <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: end; fill: #52514e" x="42.704063" y="235.051461" transform="rotate(-0 42.704063 235.051461)">0.0</text>
      </g>
     </g>
     <g id="ytick_2">
      <g id="line2d_5">
-      <path d="M 40.28125 224.583512 
-L 397.40125 224.583512 
-" clip-path="url(#p17ee0b9c05)" style="fill: none; stroke: #ecebe6; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 48.704063 163.768792 
+L 462.128062 163.768792 
+" clip-path="url(#p2d15a2b8c4)" style="fill: none; stroke: #eceae4; stroke-width: 0.7; stroke-linecap: square"/>
      </g>
      <g id="line2d_6"/>
      <g id="text_4">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #52514e" x="36.78125" y="228.382731" transform="rotate(-0 36.78125 228.382731)">0.2</text>
+      <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: end; fill: #52514e" x="42.704063" y="166.998128" transform="rotate(-0 42.704063 166.998128)">0.5</text>
      </g>
     </g>
     <g id="ytick_3">
      <g id="line2d_7">
-      <path d="M 40.28125 188.760743 
-L 397.40125 188.760743 
-" clip-path="url(#p17ee0b9c05)" style="fill: none; stroke: #ecebe6; stroke-width: 0.8; stroke-linecap: square"/>
+      <path d="M 48.704063 95.715458 
+L 462.128062 95.715458 
+" clip-path="url(#p2d15a2b8c4)" style="fill: none; stroke: #eceae4; stroke-width: 0.7; stroke-linecap: square"/>
      </g>
      <g id="line2d_8"/>
      <g id="text_5">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #52514e" x="36.78125" y="192.559962" transform="rotate(-0 36.78125 192.559962)">0.4</text>
+      <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: end; fill: #52514e" x="42.704063" y="98.944794" transform="rotate(-0 42.704063 98.944794)">1.0</text>
      </g>
     </g>
-    <g id="ytick_4">
-     <g id="line2d_9">
-      <path d="M 40.28125 152.937974 
-L 397.40125 152.937974 
-" clip-path="url(#p17ee0b9c05)" style="fill: none; stroke: #ecebe6; stroke-width: 0.8; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_10"/>
-     <g id="text_6">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #52514e" x="36.78125" y="156.737192" transform="rotate(-0 36.78125 156.737192)">0.6</text>
-     </g>
-    </g>
-    <g id="ytick_5">
-     <g id="line2d_11">
-      <path d="M 40.28125 117.115204 
-L 397.40125 117.115204 
-" clip-path="url(#p17ee0b9c05)" style="fill: none; stroke: #ecebe6; stroke-width: 0.8; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_12"/>
-     <g id="text_7">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #52514e" x="36.78125" y="120.914423" transform="rotate(-0 36.78125 120.914423)">0.8</text>
-     </g>
-    </g>
-    <g id="ytick_6">
-     <g id="line2d_13">
-      <path d="M 40.28125 81.292435 
-L 397.40125 81.292435 
-" clip-path="url(#p17ee0b9c05)" style="fill: none; stroke: #ecebe6; stroke-width: 0.8; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_14"/>
-     <g id="text_8">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #52514e" x="36.78125" y="85.091654" transform="rotate(-0 36.78125 85.091654)">1.0</text>
-     </g>
-    </g>
-    <g id="ytick_7">
-     <g id="line2d_15">
-      <path d="M 40.28125 45.469666 
-L 397.40125 45.469666 
-" clip-path="url(#p17ee0b9c05)" style="fill: none; stroke: #ecebe6; stroke-width: 0.8; stroke-linecap: square"/>
-     </g>
-     <g id="line2d_16"/>
-     <g id="text_9">
-      <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: end; fill: #52514e" x="36.78125" y="49.268885" transform="rotate(-0 36.78125 49.268885)">1.2</text>
-     </g>
-    </g>
-    <g id="text_10">
-     <text style="font-size: 10px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="14.798438" y="143.982281" transform="rotate(-90 14.798438 143.982281)">tokens per second (steady)</text>
+    <g id="text_6">
+     <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="19.418672" y="139.950125" transform="rotate(-90 19.418672 139.950125)">tokens per second (steady)</text>
     </g>
    </g>
    <g id="patch_3">
-    <path d="M 56.513977 260.406281 
-L 114.047694 260.406281 
-L 114.047694 94.528948 
-L 56.513977 94.528948 
+    <path d="M 111.718462 357.870509 
+L 154.817662 357.870509 
+Q 157.697662 357.870509 157.697662 354.990509 
+L 157.697662 108.653741 
+Q 157.697662 105.773741 154.817662 105.773741 
+L 111.718462 105.773741 
+Q 108.838462 105.773741 108.838462 108.653741 
+L 108.838462 354.990509 
+Q 108.838462 357.870509 111.718462 357.870509 
 z
-" clip-path="url(#p17ee0b9c05)" style="fill: #2a78d6"/>
+" clip-path="url(#pda79197279)" style="fill: #b3b1a8"/>
    </g>
    <g id="patch_4">
-    <path d="M 118.157245 260.406281 
-L 175.690962 260.406281 
-L 175.690962 58.867382 
-L 118.157245 58.867382 
+    <path d="M 168.094462 384.969346 
+L 211.193662 384.969346 
+Q 214.073662 384.969346 214.073662 382.089346 
+L 214.073662 81.554904 
+Q 214.073662 78.674904 211.193662 78.674904 
+L 168.094462 78.674904 
+Q 165.214462 78.674904 165.214462 81.554904 
+L 165.214462 382.089346 
+Q 165.214462 384.969346 168.094462 384.969346 
 z
-" clip-path="url(#p17ee0b9c05)" style="fill: #eb6834"/>
+" clip-path="url(#pfb6d55972e)" style="fill: #c2683b"/>
    </g>
    <g id="patch_5">
-    <path d="M 261.991538 260.406281 
-L 319.525255 260.406281 
-L 319.525255 95.048378 
-L 261.991538 95.048378 
+    <path d="M 299.638462 357.4758 
+L 342.737662 357.4758 
+Q 345.617662 357.4758 345.617662 354.5958 
+L 345.617662 109.04845 
+Q 345.617662 106.16845 342.737662 106.16845 
+L 299.638462 106.16845 
+Q 296.758462 106.16845 296.758462 109.04845 
+L 296.758462 354.5958 
+Q 296.758462 357.4758 299.638462 357.4758 
 z
-" clip-path="url(#p17ee0b9c05)" style="fill: #2a78d6"/>
+" clip-path="url(#p2f857cbd06)" style="fill: #b3b1a8"/>
    </g>
    <g id="patch_6">
-    <path d="M 323.634806 260.406281 
-L 381.168523 260.406281 
-L 381.168523 81.023764 
-L 323.634806 81.023764 
+    <path d="M 356.014462 368.132952 
+L 399.113662 368.132952 
+Q 401.993662 368.132952 401.993662 365.252952 
+L 401.993662 98.391298 
+Q 401.993662 95.511298 399.113662 95.511298 
+L 356.014462 95.511298 
+Q 353.134462 95.511298 353.134462 98.391298 
+L 353.134462 365.252952 
+Q 353.134462 368.132952 356.014462 368.132952 
 z
-" clip-path="url(#p17ee0b9c05)" style="fill: #eb6834"/>
+" clip-path="url(#p4450269cac)" style="fill: #c2683b"/>
    </g>
    <g id="patch_7">
-    <path d="M 40.28125 260.406281 
-L 397.40125 260.406281 
-" style="fill: none; stroke: #c3c2b7; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+    <path d="M 48.704062 231.822125 
+L 462.128062 231.822125 
+" style="fill: none; stroke: #cfcdc5; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="text_7">
+    <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="133.268062" y="102.371074" transform="rotate(-0 133.268062 102.371074)">0.93</text>
+   </g>
+   <g id="text_8">
+    <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="189.644062" y="75.272237" transform="rotate(-0 189.644062 75.272237)">1.13</text>
+   </g>
+   <g id="text_9">
+    <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="161.456062" y="63.049858" transform="rotate(-0 161.456062 63.049858)">+21% with the drafter</text>
+   </g>
+   <g id="text_10">
+    <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="321.188063" y="102.765784" transform="rotate(-0 321.188063 102.765784)">0.92</text>
    </g>
    <g id="text_11">
-    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="85.280836" y="90.946671" transform="rotate(-0 85.280836 90.946671)">0.93</text>
+    <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="377.564062" y="92.108632" transform="rotate(-0 377.564062 92.108632)">1.00</text>
    </g>
    <g id="text_12">
-    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="146.924104" y="55.285105" transform="rotate(-0 146.924104 55.285105)">1.13</text>
+    <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #52514e" x="349.376062" y="63.049858" transform="rotate(-0 349.376062 63.049858)">+8% with the drafter</text>
    </g>
    <g id="text_13">
-    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="116.10247" y="41.887389" transform="rotate(-0 116.10247 41.887389)">drafter gain +21.5%</text>
+    <text style="font-size: 9px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #52514e" x="48.704063" y="37.937926" transform="rotate(-0 48.704063 37.937926)">The speculative advantage decays as the answer grows</text>
    </g>
    <g id="text_14">
-    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="290.758396" y="91.466102" transform="rotate(-0 290.758396 91.466102)">0.92</text>
-   </g>
-   <g id="text_15">
-    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="352.401664" y="77.441487" transform="rotate(-0 352.401664 77.441487)">1.00</text>
-   </g>
-   <g id="text_16">
-    <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: middle; fill: #52514e" x="321.58003" y="41.887389" transform="rotate(-0 321.58003 41.887389)">drafter gain +8.5%</text>
-   </g>
-   <g id="text_17">
-    <text style="font-size: 11px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #0b0b0b" x="40.28125" y="15.558281" transform="rotate(-0 40.28125 15.558281)">Plain decode is flat with answer length; the speculative advantage decays</text>
+    <text style="font-weight: 700; font-size: 12px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #0b0b0b" x="48.704063" y="22.078125" transform="rotate(-0 48.704063 22.078125)">Plain decode is flat with answer length</text>
    </g>
    <g id="legend_1">
     <g id="patch_8">
-     <path d="M 105.730938 324.945922 
-L 123.730938 324.945922 
-L 123.730938 318.645922 
-L 105.730938 318.645922 
+     <path d="M 156.239656 278.717591 
+L 165.589656 278.717591 
+L 165.589656 270.557591 
+L 156.239656 270.557591 
 z
-" style="fill: #2a78d6; stroke: #2a78d6; stroke-linejoin: miter"/>
+" style="fill: #b3b1a8; stroke: #b3b1a8; stroke-linejoin: miter"/>
     </g>
-    <g id="text_18">
-     <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #0b0b0b" x="130.930938" y="324.945922" transform="rotate(-0 130.930938 324.945922)">drafter off (plain decode)</text>
+    <g id="text_15">
+     <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #52514e" x="172.389656" y="277.527591" transform="rotate(-0 172.389656 277.527591)">drafter off (plain decode)</text>
     </g>
     <g id="patch_9">
-     <path d="M 261.975156 324.945922 
-L 279.975156 324.945922 
-L 279.975156 318.645922 
-L 261.975156 318.645922 
+     <path d="M 296.153641 278.717591 
+L 305.503641 278.717591 
+L 305.503641 270.557591 
+L 296.153641 270.557591 
 z
-" style="fill: #eb6834; stroke: #eb6834; stroke-linejoin: miter"/>
+" style="fill: #c2683b; stroke: #c2683b; stroke-linejoin: miter"/>
     </g>
-    <g id="text_19">
-     <text style="font-size: 9px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #0b0b0b" x="287.175156" y="324.945922" transform="rotate(-0 287.175156 324.945922)">drafter on</text>
+    <g id="text_16">
+     <text style="font-size: 8.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; text-anchor: start; fill: #52514e" x="312.303641" y="277.527591" transform="rotate(-0 312.303641 277.527591)">drafter on</text>
     </g>
    </g>
   </g>
  </g>
  <defs>
-  <clipPath id="p17ee0b9c05">
-   <rect x="40.28125" y="27.558281" width="357.12" height="232.848"/>
+  <clipPath id="p2d15a2b8c4">
+   <rect x="48.704063" y="48.078125" width="413.424" height="183.744"/>
+  </clipPath>
+  <clipPath id="pda79197279">
+   <rect x="84.408862" y="105.773741" width="97.7184" height="126.048384"/>
+  </clipPath>
+  <clipPath id="pfb6d55972e">
+   <rect x="140.784862" y="78.674904" width="97.7184" height="153.147221"/>
+  </clipPath>
+  <clipPath id="p2f857cbd06">
+   <rect x="272.328862" y="106.16845" width="97.7184" height="125.653675"/>
+  </clipPath>
+  <clipPath id="p4450269cac">
+   <rect x="328.704862" y="95.511298" width="97.7184" height="136.310827"/>
   </clipPath>
  </defs>
 </svg>

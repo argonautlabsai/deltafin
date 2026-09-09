@@ -16,16 +16,35 @@ Measured 2026-09-08 with this fork's configuration of record
 run with the exact prompt, and the per-run logs are in
 [`k3-public-bench/results/`](k3-public-bench/results/).
 
-| test | drafter off | drafter on |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="k3-public-bench/results/charts/hero-dark.svg">
+  <img src="k3-public-bench/results/charts/hero.svg" alt="1.00 tok/s steady over 512 tokens; 1.13 over 128; 0.96 on the public prompt; 6.3 min to first token on a 512-token prompt">
+</picture>
+
+| | drafter off | drafter on |
 |---|---:|---:|
-| steady decode, 512 generated tokens | 0.9232 tok/s | **1.0015 tok/s** |
-| steady decode, 128 generated tokens | 0.9261 | **1.1252** |
-| 17-token prompt from issue #15 (upstream reported 0.684 there), median of 3 | — | **0.9631** |
-| time to first token, 512-token prompt | ≈376 s | ≈375 s |
+| **Steady decode**, 512-token answer (tok/s) | 0.92 | **1.00** |
+| **Steady decode**, 128-token answer (tok/s) | 0.93 | **1.13** |
+| **Public 17-token prompt** (issue #15; upstream reported 0.68), median of 3 (tok/s) | — | **0.96** |
+| **Time to first token**, 512-token prompt | 6.3 min | 6.3 min |
 
-![Decode speed by number of drives](k3-public-bench/results/charts/drive-ladder.svg)
+Steady = decode rate after the first token; inclusive rates and the four-decimal values are in
+[`results/RESULTS-2026-09-08-standard-lengths.md`](k3-public-bench/results/RESULTS-2026-09-08-standard-lengths.md).
 
-![Per-drive draw under the engine vs standalone ceiling](k3-public-bench/results/charts/drive-draw.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="k3-public-bench/results/charts/drive-ladder-dark.svg">
+  <img src="k3-public-bench/results/charts/drive-ladder.svg" alt="Decode speed by number of drives: one drive about 52%, two about 73%, three about 90% of four-drive speed">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="k3-public-bench/results/charts/drives-live-dark.svg">
+  <img src="k3-public-bench/results/charts/drives-live.svg" alt="Animated replay of the four drives' read throughput during the 200-token record arm">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="k3-public-bench/results/charts/drive-draw-dark.svg">
+  <img src="k3-public-bench/results/charts/drive-draw.svg" alt="Per-drive draw under the engine vs standalone ceiling">
+</picture>
 
 Drive-count ladder on the same prompts: one drive ≈52% of the four-drive
 speed, two full mirrors ≈73%, three ≈90% ([`results/SCALING.md`](k3-public-bench/results/SCALING.md)).
@@ -54,17 +73,19 @@ All 16 experts, every single token. No shortcuts, no "close enough." It's exactl
 
 The quality rule is simple: **K3 itself decides every token**, and nobody else. Small draft models are allowed to guess ahead (that's where much of the speed comes from), but K3 checks every guess, and nothing reaches you without its official sign-off.
 
-### Upstream benchmarks on an M1 Max laptop (gavamedia/deltafin, unchanged — not this fork's numbers)
+<details>
+<summary><b>Upstream's own benchmarks on an M1 Max laptop</b> (gavamedia/deltafin, unchanged — not this fork's numbers; the fork's results are at the top of this page)</summary>
 
 * 0.2901 token/s (3.447 s/token) — 1.9% higher throughput than last update
 
-#### Upstream's historical M1 benchmarks:
+Upstream's historical M1 benchmarks:
 
 * 0.2847 token/s (August 2, 2026) — 7.0% higher throughput
 * 0.2660 token/s (July 30, 2026) — 102.9% higher throughput
 * 0.1311 token/s (July 28, 2026) — 829.8% higher throughput
 * 0.0141 token/s (July 27, 2026)
 
+</details>
 
 <div align="center">
 

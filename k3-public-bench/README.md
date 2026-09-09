@@ -35,9 +35,20 @@ runs, cause not isolated — small differences on this rig need replication.
 | prompt processing, 512-token prompt | ≈1.4 tok/s | ≈1.4 tok/s | none, as expected |
 | first token, 512-token prompt | ≈376 s | ≈375 s | negligible |
 
-![Per-drive draw under the engine vs standalone ceiling](results/charts/drive-draw.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/charts/drives-live-dark.svg">
+  <img src="results/charts/drives-live.svg" alt="Animated replay of the four drives' read throughput during the 200-token record arm">
+</picture>
 
-![Per-drive read throughput during one 200-token run, all four drives](results/charts/read-timeline.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/charts/drive-draw-dark.svg">
+  <img src="results/charts/drive-draw.svg" alt="Per-drive draw under the engine vs standalone ceiling">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/charts/read-timeline-dark.svg">
+  <img src="results/charts/read-timeline.svg" alt="Per-drive read throughput during one 200-token run, all four drives">
+</picture>
 
 **Steady** excludes the first-token phase: `(generated - 1) / (elapsed_final -
 elapsed_first_token)`. **Inclusive** is `generated / elapsed` from process start
