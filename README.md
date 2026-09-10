@@ -7,6 +7,27 @@
 - Every number is one cold run with the exact prompt; per-run logs and placement manifests are in [`k3-public-bench/`](k3-public-bench/).
 - Fork of [gavamedia/deltafin](https://github.com/gavamedia/deltafin) (MIT), who built the engine — see [`CREDITS.md`](CREDITS.md). Instruments: [ARGODRIVE](https://github.com/argonautlabsai/argodrive).
 
+## Try ARGODRIVE and share your results
+
+Help us find out how these results transfer to other machines. We are looking
+for the first **five independent successful installations** and **three
+reproduced benchmark comparisons**. These are goals, not counts of completed reports.
+
+1. **Install this fork:** follow [New Installation](#1-new-installation) below.
+   Check the [requirements](docs/REQUIREMENTS.md) before downloading model weights.
+2. **Measure your setup:** use the [benchmark guide](k3-public-bench/README.md).
+   Its four-drive configuration is a reference recipe; adapt the model paths
+   and placement to your hardware before running it. Installing the fork alone
+   does not recreate that layout.
+3. **Share what happened:** copy the [hardware and results template](docs/COMMUNITY_RESULTS.md)
+   into a new [Discussion](https://github.com/argonautlabsai/deltafin/discussions).
+   Successful installs, slower results and setup failures are all useful.
+
+The [ARGODRIVE dashboard and measurement tools](https://github.com/argonautlabsai/argodrive)
+help inspect drive activity and saved runs. They currently require local setup;
+a packaged Mac app is not available yet. Keep diagnostic runs separate from
+timed comparisons and record whether monitoring was enabled.
+
 ---
 
 ## ARGODRIVE Deltafin benchmarks — M5 Max, 128 GB, experts streamed from four SSDs
@@ -126,11 +147,16 @@ Deltafin is the other experiment: every expert byte exactly as Moonshot shipped 
 
 ## 1. New Installation
 
+The commands below install **the ARGODRIVE fork** containing the storage work
+and benchmark package described above. The original engine is maintained at
+[gavamedia/deltafin](https://github.com/gavamedia/deltafin); see
+[credits](CREDITS.md) for attribution.
+
 Deltafin installs almost everything it needs. See [Requirements](docs/REQUIREMENTS.md) if you're missing anything.
 
 ```bash
 # 1. Get it
-git clone https://github.com/gavamedia/deltafin.git
+git clone https://github.com/argonautlabsai/deltafin.git
 cd deltafin
 
 # 2. Build it
