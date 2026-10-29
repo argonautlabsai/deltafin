@@ -950,17 +950,22 @@ class TargetSequenceTape::Impl {
         // previous layer's output; a deferred tail must complete first.
         loop_moe_tail_drain();
 #endif
-      std::optional<PrepSubScope> moe_scope;
-      moe_scope.emplace(1);
       const bool arrival_partial = options.arrival_partial;
       const bool arrival_final = !arrival_partial || options.arrival_final;
       if (arrival_partial) {
         execution_options.partial_edges = true;
       }
-      at::Tensor routed_outputs = execute_routed_moe_positions_t1(
-          std::span<const PreparedMoeT1* const>(prepared.data(), row_count),
-          experts, execution_options);
-      moe_scope.reset();
+      at::Tensor routed_outputs;
+      {
+        // Finish-timer sub-region 1 covers the routed MoE execution only. A
+        // plain RAII scope rather than std::optional: GCC 13's
+        // maybe-uninitialized analysis rejects the optional's destructor
+        // under -Werror on Linux.
+        const PrepSubScope moe_scope(1);
+        routed_outputs = execute_routed_moe_positions_t1(
+            std::span<const PreparedMoeT1* const>(prepared.data(), row_count),
+            experts, execution_options);
+      }
       if (arrival_partial) {
         // Accumulate this group's contribution; only the FINAL group completes
         // the rows from the running sum (a changed fp32 summation order —
