@@ -9331,6 +9331,8 @@ mod tests {
             expert_plan: None,
             capture_dspark: false,
             full_commit_only: true,
+            pending_expert_arrival: None,
+            arrival_dispatched: Vec::new(),
         };
         let error = sequence.commit_prefix(3).unwrap_err();
         assert!(error.to_string().contains("cannot commit a partial prefix"));

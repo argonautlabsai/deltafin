@@ -14503,6 +14503,7 @@ mod tests {
             retained,
             hits,
             demand,
+            demand_ticket: _,
         } = second
         else {
             panic!("tier-resident tile did not use the scattered lease");
