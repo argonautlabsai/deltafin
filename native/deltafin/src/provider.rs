@@ -1880,9 +1880,19 @@ const _: [(); 40] = [(); std::mem::offset_of!(CudaCacheConfigureReportV1, config
 /// The caller must keep the arena alive, unmoved and page-aligned for as long
 /// as it stays registered.
 pub(crate) fn register_metal_arena(base: *const u8, len: u64) -> i32 {
-    // SAFETY: `base`/`len` describe a live, page-aligned host allocation the
-    // caller owns for the process lifetime; the Metal side only reads it.
-    unsafe { k3_metal_register_arena(base, len) }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `base`/`len` describe a live, page-aligned host allocation the
+        // caller owns for the process lifetime; the Metal side only reads it.
+        unsafe { k3_metal_register_arena(base, len) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No Metal layer on this host: the arena stays plain host memory and
+        // the caller reports the unregistered state (never silent).
+        let _ = (base, len);
+        -1
+    }
 }
 
 unsafe extern "C" {
@@ -1891,6 +1901,7 @@ unsafe extern "C" {
     /// Register a host arena with the Metal layer so every expert span inside
     /// it shares ONE MTLBuffer wrap and ONE `useResource` residency call per
     /// dispatch. `len == 0` unregisters. Returns 0 on success.
+    #[cfg(target_os = "macos")]
     fn k3_metal_register_arena(base: *const u8, len: u64) -> i32;
     #[cfg(all(test, target_os = "macos"))]
     fn deltafin_route_mailbox_metallib_cycle_test_v1(cycles: i32) -> i32;
