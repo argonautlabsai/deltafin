@@ -54,8 +54,11 @@ namespace deltafin::provider_internal {
 namespace {
 
 constexpr std::size_t kCudaLayerStrata = 92;
+/* The budget bound is the whole routed corpus (92 layers x 896 experts): a
+ * learned, heat-seeded tier legitimately holds far more than one token's
+ * 92 x 16 route union once discrete VRAM allows it. */
 constexpr std::size_t kCudaMaximumExperts =
-    kCudaLayerStrata * kMoeRouteTopK;
+    kCudaLayerStrata * static_cast<std::size_t>(k3_moe_geometry().experts);
 
 void validate_cache_policy(const CudaMoeCachePolicy& policy) {
   if ((policy.automatic_capacity && policy.capacity_experts != 0) ||
@@ -146,6 +149,14 @@ CudaMoeHostFallback CudaMoeExpertCache::materialize_plan_for_cpu(
     const std::uint64_t) {
   throw std::runtime_error(impl_->reason);
 }
+
+CudaMoeCacheAdmitReport CudaMoeExpertCache::admit(
+    const std::uint32_t, const std::span<const std::uint16_t>,
+    const std::span<const std::uint8_t>, const bool) {
+  throw std::runtime_error(impl_->reason);
+}
+
+CudaMoeCacheStats CudaMoeExpertCache::stats() const { return {}; }
 
 void CudaMoeExpertCache::poison_external(const char* failure) noexcept {
   try {
@@ -528,10 +539,18 @@ struct CudaMoeExpertCache::Impl {
     // checking, so dropping these owners cannot recycle storage still in use.
     // Keep the pinned stages/events until destruction: their DMA may still be
     // in flight, and the destructor performs the required host-side wait.
+    drop_all_residents();
+  }
+
+  void drop_all_residents() noexcept {
     for (auto& layer : layers) {
       layer.clear();
     }
+    for (auto& layer : pinned_layers) {
+      layer.clear();
+    }
     resident_entries = 0;
+    pinned_entries = 0;
   }
 
   /*
@@ -548,10 +567,7 @@ struct CudaMoeExpertCache::Impl {
       return false;
     }
     --rebuilds_remaining;
-    for (auto& layer : layers) {
-      layer.clear();
-    }
-    resident_entries = 0;
+    drop_all_residents();
     budget_ready = false;
     try {
       const c10::cuda::CUDAGuard guard(device);
@@ -707,6 +723,15 @@ struct CudaMoeExpertCache::Impl {
   Resident* hit(const std::uint32_t layer_index,
                 const std::uint16_t expert) {
     const std::size_t slot = layer_slot(layer_index);
+    // Pinned residents carry no recency: they are never eviction victims.
+    auto& pins = pinned_layers[slot];
+    const auto pinned_found = std::find_if(
+        pins.begin(), pins.end(), [expert](const Entry& entry) {
+          return entry.expert == expert;
+        });
+    if (pinned_found != pins.end()) {
+      return &pinned_found->resident;
+    }
     auto& entries = layers[slot];
     const auto found = std::find_if(
         entries.begin(), entries.end(), [expert](const Entry& entry) {
@@ -815,11 +840,17 @@ struct CudaMoeExpertCache::Impl {
     }
     Resident uploaded = upload(source, source_bytes);
     if (capacity != 0) {
-      while (resident_entries >= capacity) {
+      // Pinned residents hold their share of the budget; only the LRU set
+      // yields. A budget that is entirely pinned executes the miss from its
+      // upload without retaining it.
+      while (resident_entries + pinned_entries >= capacity &&
+             resident_entries != 0) {
         evict_global_lru();
       }
-      layers[slot].push_back(Entry{expert, uploaded, ++use_clock});
-      ++resident_entries;
+      if (resident_entries + pinned_entries < capacity) {
+        layers[slot].push_back(Entry{expert, uploaded, ++use_clock});
+        ++resident_entries;
+      }
     }
     return uploaded;
   }
@@ -861,6 +892,75 @@ struct CudaMoeExpertCache::Impl {
         index * static_cast<std::size_t>(kCudaExpertSpan);
   }
 
+  CudaMoeCacheAdmitReport admit(
+      const std::uint32_t layer_index,
+      const std::span<const std::uint16_t> canonical_experts,
+      const std::span<const std::uint8_t> expert_major_bytes,
+      const bool pinned) {
+    establish_budget();
+    const std::size_t slot = layer_slot(layer_index);
+    CudaMoeCacheAdmitReport report;
+    for (std::size_t index = 0; index < canonical_experts.size(); ++index) {
+      const std::uint16_t expert = canonical_experts[index];
+      auto& lru = layers[slot];
+      auto& pins = pinned_layers[slot];
+      const auto lru_found = std::find_if(
+          lru.begin(), lru.end(), [expert](const Entry& entry) {
+            return entry.expert == expert;
+          });
+      if (lru_found != lru.end()) {
+        if (pinned) {
+          // Promote an LRU resident into the pinned set without a re-upload.
+          Entry promoted = std::move(*lru_found);
+          lru.erase(lru_found);
+          --resident_entries;
+          promoted.last_use = 0;
+          pins.push_back(std::move(promoted));
+          ++pinned_entries;
+        }
+        ++report.already_resident;
+        continue;
+      }
+      if (std::any_of(pins.begin(), pins.end(), [expert](const Entry& entry) {
+            return entry.expert == expert;
+          })) {
+        ++report.already_resident;
+        continue;
+      }
+      if (capacity == 0) {
+        ++report.skipped_full;
+        continue;
+      }
+      if (pinned) {
+        // A pinned seed outranks any LRU resident, never another pin.
+        while (resident_entries + pinned_entries >= capacity &&
+               resident_entries != 0) {
+          evict_global_lru();
+        }
+      }
+      if (resident_entries + pinned_entries >= capacity) {
+        ++report.skipped_full;
+        continue;
+      }
+      const std::uint8_t* source = expert_major_bytes.data() +
+          index * static_cast<std::size_t>(kCudaExpertSpan);
+      Resident uploaded =
+          upload(source, static_cast<std::size_t>(kCudaExpertSpan));
+      if (pinned) {
+        pins.push_back(Entry{expert, std::move(uploaded), 0});
+        ++pinned_entries;
+      } else {
+        lru.push_back(Entry{expert, std::move(uploaded), ++use_clock});
+        ++resident_entries;
+      }
+      ++report.admitted;
+    }
+    report.pinned_entries = pinned_entries;
+    report.resident_entries = resident_entries;
+    report.capacity_experts = capacity;
+    return report;
+  }
+
   at::Device device;
   bool checked = false;
   bool enabled = false;
@@ -876,8 +976,11 @@ struct CudaMoeExpertCache::Impl {
   std::size_t stage_cursor = 0;
   std::uint64_t use_clock = 0;
   std::size_t resident_entries = 0;
+  std::size_t pinned_entries = 0;
   std::uint32_t rebuilds_remaining = 2;
   std::array<std::vector<Entry>, kCudaLayerStrata> layers;
+  /* Learned tier: heat-seeded residents that LRU eviction never touches. */
+  std::array<std::vector<Entry>, kCudaLayerStrata> pinned_layers;
   std::unordered_map<std::uint64_t, Plan> plans;
 };
 
@@ -1194,6 +1297,45 @@ CudaMoeHostFallback CudaMoeExpertCache::materialize_plan_for_cpu(
     }
     return fallback;
   });
+}
+
+CudaMoeCacheAdmitReport CudaMoeExpertCache::admit(
+    const std::uint32_t layer_index,
+    const std::span<const std::uint16_t> canonical_experts,
+    const std::span<const std::uint8_t> expert_major_bytes,
+    const bool pinned) {
+  if (canonical_experts.empty() ||
+      canonical_experts.size() > kMoePositionTileMaxExperts ||
+      expert_major_bytes.size() !=
+          canonical_experts.size() *
+              static_cast<std::size_t>(kCudaExpertSpan)) {
+    throw std::invalid_argument("CUDA expert admission has invalid bounds");
+  }
+  for (std::size_t index = 0; index < canonical_experts.size(); ++index) {
+    if (canonical_experts[index] >= k3_moe_geometry().experts ||
+        (index != 0 && canonical_experts[index - 1] >=
+                           canonical_experts[index])) {
+      throw std::invalid_argument(
+          "CUDA expert admission IDs must be canonical ascending IDs");
+    }
+  }
+  static_cast<void>(layer_slot(layer_index));
+  if (!available()) {
+    throw std::runtime_error("CUDA MXFP4 unavailable: " + impl_->reason);
+  }
+  return impl_->fail_closed([&] {
+    const c10::cuda::CUDAGuard guard(impl_->device);
+    return impl_->admit(layer_index, canonical_experts, expert_major_bytes,
+                        pinned);
+  });
+}
+
+CudaMoeCacheStats CudaMoeExpertCache::stats() const {
+  return CudaMoeCacheStats{
+      .capacity_experts = impl_->capacity,
+      .resident_entries = impl_->resident_entries,
+      .pinned_entries = impl_->pinned_entries,
+      .residency_enabled = impl_->capacity != 0};
 }
 
 void CudaMoeExpertCache::poison_external(const char* failure) noexcept {

@@ -551,6 +551,48 @@ unsafe impl Send for PageAlignedSpan {}
 // SAFETY: shared access is read-only.
 unsafe impl Sync for PageAlignedSpan {}
 
+/// Rank the histogram's hot experts, hottest first, under the same confidence
+/// ramp and frequency floor the RAM pin tier applies, truncated to the experts
+/// `budget_bytes` can hold at `span_bytes` each. Empty when the histogram is
+/// too young or nothing clears the floor. Entries are `(layer, expert)`.
+pub(crate) fn rank_hot_experts(
+    snapshot: &ExpertHeatSnapshot,
+    span_bytes: usize,
+    budget_bytes: u64,
+) -> Vec<(u32, u16)> {
+    if budget_bytes == 0 || span_bytes == 0 || snapshot.heats.len() != HEAT_SLOTS {
+        return Vec::new();
+    }
+    if snapshot.total_weight < MIN_WEIGHT_PASSES {
+        return Vec::new();
+    }
+    let floor = FLOOR_MULT * snapshot.total_weight * (ROUTED_EXPERTS as f64 / K3_EXPERTS as f64);
+    let mut ranked: Vec<(f32, u32)> = snapshot
+        .heats
+        .iter()
+        .enumerate()
+        .filter(|&(_, &heat)| f64::from(heat) >= floor)
+        .map(|(slot, &heat)| (heat, slot as u32))
+        .collect();
+    ranked.sort_unstable_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let capacity = usize::try_from(budget_bytes / span_bytes as u64).unwrap_or(usize::MAX);
+    ranked.truncate(capacity);
+    ranked
+        .into_iter()
+        .map(|(_, slot)| {
+            (
+                (slot as usize / K3_EXPERTS) as u32 + K3_MOE_LAYER_FIRST,
+                (slot as usize % K3_EXPERTS) as u16,
+            )
+        })
+        .collect()
+}
+
 /// The permanent RAM tier. The candidate roster is frozen at construction, so
 /// residency can only grow toward `candidate_count × span_bytes ≤ budget` and
 /// no eviction logic exists. Promotion is sticky: an expert enters only when
@@ -573,36 +615,14 @@ impl ExpertPinTier {
         span_bytes: usize,
         budget_bytes: u64,
     ) -> Option<Self> {
-        if budget_bytes == 0 || span_bytes == 0 || snapshot.heats.len() != HEAT_SLOTS {
-            return None;
-        }
-        if snapshot.total_weight < MIN_WEIGHT_PASSES {
-            return None;
-        }
-        let floor =
-            FLOOR_MULT * snapshot.total_weight * (ROUTED_EXPERTS as f64 / K3_EXPERTS as f64);
-        let mut ranked: Vec<(f32, u32)> = snapshot
-            .heats
-            .iter()
-            .enumerate()
-            .filter(|&(_, &heat)| f64::from(heat) >= floor)
-            .map(|(slot, &heat)| (heat, slot as u32))
-            .collect();
-        ranked.sort_unstable_by(|left, right| {
-            right
-                .0
-                .total_cmp(&left.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
-        let capacity = usize::try_from(budget_bytes / span_bytes as u64).unwrap_or(usize::MAX);
-        ranked.truncate(capacity);
+        let ranked = rank_hot_experts(snapshot, span_bytes, budget_bytes);
         if ranked.is_empty() {
             return None;
         }
         let mut candidates = vec![[0_u64; HEAT_BITSET_WORDS]; MOE_LAYERS].into_boxed_slice();
-        for &(_, slot) in &ranked {
-            let layer = slot as usize / K3_EXPERTS;
-            let expert = slot as usize % K3_EXPERTS;
+        for &(layer, expert) in &ranked {
+            let layer = (layer - K3_MOE_LAYER_FIRST) as usize;
+            let expert = expert as usize;
             candidates[layer][expert / 64] |= 1_u64 << (expert % 64);
         }
         Some(Self {
@@ -728,6 +748,30 @@ mod tests {
         fn heat_path(&self) -> PathBuf {
             self.0.join("k3-meta").join(EXPERT_HEAT_FILE_NAME)
         }
+    }
+
+    #[test]
+    fn rank_hot_experts_orders_hottest_first_under_the_floor_and_budget() {
+        let mut snapshot = ExpertHeatSnapshot::empty();
+        snapshot.total_weight = MIN_WEIGHT_PASSES.max(1.0) * 4.0;
+        let floor =
+            FLOOR_MULT * snapshot.total_weight * (ROUTED_EXPERTS as f64 / K3_EXPERTS as f64);
+        let hot = (floor as f32) * 10.0;
+        snapshot.heats[5] = hot; // layer 1, expert 5
+        snapshot.heats[3 * K3_EXPERTS + 100] = hot * 3.0; // layer 4, expert 100
+        snapshot.heats[3 * K3_EXPERTS + 7] = hot * 2.0; // layer 4, expert 7
+        snapshot.heats[9 * K3_EXPERTS + 1] = (floor as f32) * 0.5; // below the floor
+        assert_eq!(
+            rank_hot_experts(&snapshot, 10, 100),
+            vec![(4, 100), (4, 7), (1, 5)]
+        );
+        assert_eq!(rank_hot_experts(&snapshot, 10, 20), vec![(4, 100), (4, 7)]);
+        assert!(rank_hot_experts(&snapshot, 10, 0).is_empty());
+        assert!(rank_hot_experts(&snapshot, 0, 100).is_empty());
+        let mut young = ExpertHeatSnapshot::empty();
+        young.total_weight = 0.0;
+        young.heats[5] = hot;
+        assert!(rank_hot_experts(&young, 10, 100).is_empty());
     }
 
     impl Drop for TestDirectory {

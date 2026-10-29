@@ -390,10 +390,10 @@ impl MetalExpertCacheStatsReportV1 {
 const CUDA_CACHE_CAPACITY_EXACT: u32 = 1;
 const CUDA_CACHE_RESERVE_BYTES: u32 = 1;
 
-/// Provider-side bound: one cache entry per routed expert edge across the 92
-/// MoE layers (`92 * DELTAFIN_PROVIDER_ROUTE_TOP_K_V1`). The runtime rejects
+/// Provider-side bound: the whole routed corpus (`92 * 896` experts), so a
+/// learned, heat-seeded tier can grow with discrete VRAM. The runtime rejects
 /// larger requests, so the engine clamps before configuring.
-pub const CUDA_EXPERT_CACHE_MAX_EXPERTS: u32 = 92 * 16;
+pub const CUDA_EXPERT_CACHE_MAX_EXPERTS: u32 = 92 * 896;
 
 /// Explicit, session-frozen CUDA expert-cache budget. Configuration must
 /// happen before the first expert plan or availability probe; the provider
@@ -431,6 +431,67 @@ struct CudaCacheConfigureReportV1 {
     configured: u32,
     flags: u32,
     reserved: [u64; 2],
+}
+
+const CUDA_CACHE_ADMIT_PINNED: u32 = 1;
+
+#[repr(C)]
+struct CudaCacheAdmitRequestV1 {
+    struct_size: u32,
+    abi_version: u32,
+    session: u64,
+    layer_index: u32,
+    expert_count: u32,
+    flags: u32,
+    reserved0: u32,
+    expert_ids: [u16; TARGET_SEQUENCE_MAX_EXPERTS],
+    expert_major_bytes: *const u8,
+    expert_major_length: u64,
+    reserved: [u64; 4],
+}
+
+#[repr(C)]
+struct CudaCacheAdmitReportV1 {
+    struct_size: u32,
+    abi_version: u32,
+    session: u64,
+    admitted: u32,
+    already_resident: u32,
+    skipped_full: u32,
+    flags: u32,
+    pinned_entries: u64,
+    resident_entries: u64,
+    capacity_experts: u64,
+    reserved: [u64; 2],
+}
+
+impl CudaCacheAdmitReportV1 {
+    fn request() -> Self {
+        Self {
+            struct_size: size_of::<Self>() as u32,
+            abi_version: 0,
+            session: 0,
+            admitted: 0,
+            already_resident: 0,
+            skipped_full: 0,
+            flags: 0,
+            pinned_entries: 0,
+            resident_entries: 0,
+            capacity_experts: 0,
+            reserved: [0; 2],
+        }
+    }
+}
+
+/// Session totals after one out-of-plan CUDA cache admission.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CudaExpertCacheAdmitReport {
+    pub admitted: u32,
+    pub already_resident: u32,
+    pub skipped_full: u32,
+    pub pinned_entries: u64,
+    pub resident_entries: u64,
+    pub capacity_experts: u64,
 }
 
 impl CudaCacheConfigureReportV1 {
@@ -1872,6 +1933,9 @@ const _: [(); 24] = [(); std::mem::offset_of!(CudaCacheConfigureRequestV1, capac
 const _: [(); 40] = [(); std::mem::offset_of!(CudaCacheConfigureRequestV1, flags)];
 const _: [(); 64] = [(); size_of::<CudaCacheConfigureReportV1>()];
 const _: [(); 40] = [(); std::mem::offset_of!(CudaCacheConfigureReportV1, configured)];
+const _: [(); 208] = [(); size_of::<CudaCacheAdmitRequestV1>()];
+const _: [(); 160] = [(); std::mem::offset_of!(CudaCacheAdmitRequestV1, expert_major_bytes)];
+const _: [(); 72] = [(); size_of::<CudaCacheAdmitReportV1>()];
 
 /// Register (or with `len == 0`, unregister) a host arena with the Metal
 /// expert path, so every span inside it shares ONE MTLBuffer wrap and ONE
@@ -1974,6 +2038,12 @@ unsafe extern "C" {
     fn deltafin_provider_cuda_cache_configure_v1(
         request: *const CudaCacheConfigureRequestV1,
         report: *mut CudaCacheConfigureReportV1,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+    fn deltafin_provider_cuda_cache_admit_v1(
+        request: *const CudaCacheAdmitRequestV1,
+        report: *mut CudaCacheAdmitReportV1,
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
@@ -3234,6 +3304,83 @@ impl SessionInner {
         })
     }
 
+    fn admit_cuda_experts(
+        &self,
+        layer_index: u32,
+        canonical_expert_ids: &[u16],
+        expert_major_bytes: &[u8],
+        pinned: bool,
+    ) -> Result<CudaExpertCacheAdmitReport> {
+        if !matches!(self.device, Device::Cuda(_)) {
+            return Err(DeltafinError::new(
+                "CUDA expert-cache admission requires a CUDA provider session",
+            ));
+        }
+        if canonical_expert_ids.is_empty()
+            || canonical_expert_ids.len() > TARGET_SEQUENCE_MAX_EXPERTS
+        {
+            return Err(DeltafinError::new(format!(
+                "CUDA expert-cache admission takes 1..={TARGET_SEQUENCE_MAX_EXPERTS} experts, got {}",
+                canonical_expert_ids.len()
+            )));
+        }
+        let expected_bytes = crate::experts::K3_EXPERT_SOURCE_BYTES
+            .checked_mul(canonical_expert_ids.len())
+            .ok_or_else(|| DeltafinError::new("CUDA expert-cache admission bytes overflowed usize"))?;
+        if expert_major_bytes.len() != expected_bytes {
+            return Err(DeltafinError::new(format!(
+                "CUDA expert-cache admission slab has {} bytes, expected {expected_bytes}",
+                expert_major_bytes.len()
+            )));
+        }
+        let mut expert_ids = [0_u16; TARGET_SEQUENCE_MAX_EXPERTS];
+        expert_ids[..canonical_expert_ids.len()].copy_from_slice(canonical_expert_ids);
+        let request = CudaCacheAdmitRequestV1 {
+            struct_size: size_of::<CudaCacheAdmitRequestV1>() as u32,
+            abi_version: ABI_VERSION,
+            session: self.handle,
+            layer_index,
+            expert_count: canonical_expert_ids.len() as u32,
+            flags: if pinned { CUDA_CACHE_ADMIT_PINNED } else { 0 },
+            reserved0: 0,
+            expert_ids,
+            expert_major_bytes: borrowed_bytes_pointer(expert_major_bytes),
+            expert_major_length: expert_major_bytes.len() as u64,
+            reserved: [0; 4],
+        };
+        let mut report = CudaCacheAdmitReportV1::request();
+        let mut error = [0 as c_char; ERROR_CAPACITY];
+        // SAFETY: the slab is borrowed only for this synchronous call; the
+        // report and error buffers remain writable for its duration.
+        let status = unsafe {
+            deltafin_provider_cuda_cache_admit_v1(
+                &request,
+                &mut report,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error("native CUDA expert-cache admit", &error));
+        }
+        if report.struct_size as usize != size_of::<CudaCacheAdmitReportV1>()
+            || report.abi_version != ABI_VERSION
+            || report.session != self.handle
+        {
+            return Err(DeltafinError::new(
+                "native CUDA expert-cache admit returned an invalid report",
+            ));
+        }
+        Ok(CudaExpertCacheAdmitReport {
+            admitted: report.admitted,
+            already_resident: report.already_resident,
+            skipped_full: report.skipped_full,
+            pinned_entries: report.pinned_entries,
+            resident_entries: report.resident_entries,
+            capacity_experts: report.capacity_experts,
+        })
+    }
+
     fn configure_cuda_expert_cache(&self, policy: CudaExpertCachePolicy) -> Result<()> {
         if !matches!(self.device, Device::Cuda(_)) {
             return Err(DeltafinError::new(
@@ -3406,6 +3553,20 @@ impl NativeProviderSession {
     /// consumers can never double-book the device.
     pub fn configure_cuda_expert_cache(&self, policy: CudaExpertCachePolicy) -> Result<()> {
         self.inner.configure_cuda_expert_cache(policy)
+    }
+
+    /// Admit experts into the CUDA cache outside any plan (startup seeding
+    /// from the heat histogram). Pinned entries never leave through LRU
+    /// eviction; unpinned seeds enter as the coldest LRU entries.
+    pub fn admit_cuda_experts(
+        &self,
+        layer_index: u32,
+        canonical_expert_ids: &[u16],
+        expert_major_bytes: &[u8],
+        pinned: bool,
+    ) -> Result<CudaExpertCacheAdmitReport> {
+        self.inner
+            .admit_cuda_experts(layer_index, canonical_expert_ids, expert_major_bytes, pinned)
     }
 
     /// Create a real-target provider context. The complete K3 execution tape

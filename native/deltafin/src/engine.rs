@@ -1766,13 +1766,57 @@ impl NativeTargetEngine {
         // The CUDA expert cache is budgeted from the same snapshot that
         // residency consumes, then charged as a fixed provider cost so the
         // resident spine prefix and the cache can never double-book VRAM.
-        // Streaming-critical experts outrank resident spine layers.
-        let cuda_expert_cache = plan_cuda_expert_cache_budget(
+        // The resident spine comes first: a streamed spine layer costs its
+        // whole weight set in reads on every token (about 545 MB of int8, the
+        // equivalent of ~31 expert misses), far more than the marginal cached
+        // expert can save, so the cache takes only the VRAM the largest safe
+        // resident prefix leaves over. K3_CUDA_EXPERT_CACHE_GB overrides the
+        // split explicitly; K3_PROVIDER_RESIDENT_LAYERS shrinks the prefix and
+        // thereby grows the cache.
+        let residency_override = ResidencyOverride {
+            requested_layers: config.provider_resident_layers,
+            requested_provider_bytes: None,
+        };
+        // K3_SPINE_LOAD_RESERVE_GB mirrors K3_HOST_RESERVE_GB (see
+        // `admit_live_context_growth`) but for LOAD-TIME spine-layer
+        // residency sizing, which the growth-time fix deliberately left on
+        // the stock 10 GiB floor / 18% permille policy (~23 GiB reserve on a
+        // 128 GiB host). Unset keeps upstream behavior exactly.
+        let load_time_residency_policy = host_reserve_policy_from_env("K3_SPINE_LOAD_RESERVE_GB");
+        let (spine_first_residency, spine_first_transient) = select_residency_with_transient(
+            host_memory,
+            provider_memory,
+            &provider_layer_bytes,
+            fixed,
+            residency_override,
+            load_time_residency_policy,
+        )?;
+        let cuda_expert_cache = plan_cuda_expert_cache_budget_with(
             device,
             provider_memory_snapshot,
-            fixed.provider_bytes,
-            provider_layer_bytes.iter().copied().max().unwrap_or(0),
+            load_time_residency_policy,
+            fixed
+                .provider_bytes
+                .saturating_add(spine_first_residency.resident_provider_bytes),
+            spine_first_transient,
+            config.cuda_expert_cache_bytes,
         );
+        let cuda_seed_capacity = cuda_expert_cache
+            .as_ref()
+            .map_or(0, |budget| budget.policy.capacity_experts);
+        if cuda_expert_cache.is_some() {
+            eprintln!(
+                "[native] CUDA expert cache split: resident spine prefix {} layers ({:.2} GiB) first, cache from the remainder{}",
+                spine_first_residency.resident_layers,
+                spine_first_residency.resident_provider_bytes as f64 / (1_u64 << 30) as f64,
+                config
+                    .cuda_expert_cache_bytes
+                    .map_or(String::new(), |bytes| format!(
+                        " (overridden to {:.2} GB by K3_CUDA_EXPERT_CACHE_GB)",
+                        bytes as f64 / 1e9
+                    )),
+            );
+        }
         let fixed = match &cuda_expert_cache {
             Some(budget) => FixedCosts {
                 host_bytes: fixed.host_bytes,
@@ -1796,16 +1840,6 @@ impl NativeTargetEngine {
             verify_snapshots,
             speculative_max_drafts,
         );
-        let residency_override = ResidencyOverride {
-            requested_layers: config.provider_resident_layers,
-            requested_provider_bytes: None,
-        };
-        // K3_SPINE_LOAD_RESERVE_GB mirrors K3_HOST_RESERVE_GB (see
-        // `admit_live_context_growth`) but for LOAD-TIME spine-layer
-        // residency sizing, which the growth-time fix deliberately left on
-        // the stock 10 GiB floor / 18% permille policy (~23 GiB reserve on a
-        // 128 GiB host). Unset keeps upstream behavior exactly.
-        let load_time_residency_policy = host_reserve_policy_from_env("K3_SPINE_LOAD_RESERVE_GB");
         let (baseline_residency, baseline_transient) = select_residency_with_transient(
             host_memory,
             provider_memory,
@@ -2037,7 +2071,92 @@ impl NativeTargetEngine {
             next_target_boundary_id: 1,
         };
         engine.validate_owned_state()?;
+        engine.seed_cuda_expert_cache(
+            config.expert_pin_bytes,
+            config.cuda_expert_seed,
+            cuda_seed_capacity,
+        )?;
         Ok(engine)
+    }
+
+    /// Seed the CUDA expert cache from the learned heat histogram before the
+    /// first token: the hottest experts up to the cache budget, of which the
+    /// first `K3_EXPERT_PIN_GB` worth are pinned (never LRU-evicted) and the
+    /// rest enter coldest-first as ordinary LRU residents, so a live route
+    /// always outranks them. Storage placement only: no weights, routes or
+    /// reductions change.
+    fn seed_cuda_expert_cache(
+        &self,
+        pin_bytes: u64,
+        seed_enabled: bool,
+        capacity_experts: u32,
+    ) -> Result<()> {
+        if capacity_experts == 0
+            || !matches!(
+                self.expert_backend,
+                ResolvedExpertBackend::Cuda | ResolvedExpertBackend::CudaAuto
+            )
+            || (!seed_enabled && pin_bytes == 0)
+        {
+            return Ok(());
+        }
+        if self.experts.layout() != ExpertStorageLayout::RawV1 {
+            eprintln!("[native] CUDA expert cache seed skipped: the corpus layout is not raw-v1");
+            return Ok(());
+        }
+        let span = self.experts.layout().expert_span_bytes();
+        let budget_bytes = u64::from(capacity_experts).saturating_mul(span as u64);
+        let seed_bytes = if seed_enabled {
+            budget_bytes
+        } else {
+            pin_bytes.min(budget_bytes)
+        };
+        let ranked =
+            crate::expert_heat::rank_hot_experts(self.expert_heat.snapshot(), span, seed_bytes);
+        if ranked.is_empty() {
+            eprintln!(
+                "[native] CUDA expert cache seed: no learned heat yet (histogram young or absent); the cache starts cold"
+            );
+            return Ok(());
+        }
+        let pinned_count = usize::try_from(pin_bytes / span as u64)
+            .unwrap_or(usize::MAX)
+            .min(ranked.len());
+        let (pinned_list, lru_list) = ranked.split_at(pinned_count);
+        // Coldest first: the hottest unpinned seed then carries the newest
+        // recency stamp and is the last seed a live route can evict.
+        let lru_coldest_first: Vec<(u32, u16)> = lru_list.iter().rev().copied().collect();
+        let started = Instant::now();
+        let mut totals = CudaSeedTotals::default();
+        seed_cuda_cache_list(
+            &self.experts,
+            &self.expert_reader,
+            &self.provider,
+            pinned_list,
+            true,
+            &mut totals,
+        )?;
+        seed_cuda_cache_list(
+            &self.experts,
+            &self.expert_reader,
+            &self.provider,
+            &lru_coldest_first,
+            false,
+            &mut totals,
+        )?;
+        eprintln!(
+            "[native] CUDA expert cache seed: {} admitted ({} pinned, {} LRU) of {} ranked, {:.2} GiB uploaded, {} already resident, {} refused full, budget {} experts, {:.1} s",
+            totals.admitted,
+            totals.pinned,
+            totals.admitted.saturating_sub(totals.pinned),
+            ranked.len(),
+            totals.admitted.saturating_mul(span as u64) as f64 / (1_u64 << 30) as f64,
+            totals.already_resident,
+            totals.skipped_full,
+            capacity_experts,
+            started.elapsed().as_secs_f64(),
+        );
+        Ok(())
     }
 
     /// Snapshot of the PILOT gate's scored recall and admission telemetry.
@@ -11300,6 +11419,91 @@ struct CudaExpertCacheBudget {
     charged_provider_bytes: u64,
 }
 
+/// Experts per seeding admission: the provider's position-tile bound, which
+/// the demand reader already serves on every CUDA miss tile.
+const CUDA_SEED_RUN_EXPERTS: usize = 64;
+
+#[derive(Default)]
+struct CudaSeedTotals {
+    admitted: u64,
+    pinned: u64,
+    already_resident: u64,
+    skipped_full: u64,
+    full: bool,
+}
+
+/// Read one ordered run of hot experts from the corpus and admit it.
+fn seed_cuda_cache_run(
+    experts: &RawExpertCorpus,
+    expert_reader: &Reader,
+    provider: &NativeProviderSession,
+    layer: u32,
+    ids: &mut Vec<u16>,
+    pinned: bool,
+    totals: &mut CudaSeedTotals,
+) -> Result<()> {
+    if ids.is_empty() || totals.full {
+        ids.clear();
+        return Ok(());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let batch = experts.read_union(expert_reader, layer, ids)?;
+    if batch.layer() != layer
+        || batch.expert_ids() != ids.as_slice()
+        || batch.layout() != ExpertStorageLayout::RawV1
+    {
+        return Err(DeltafinError::new(
+            "CUDA expert-cache seed reader returned a stale layer, id set, or layout",
+        ));
+    }
+    let report = provider.admit_cuda_experts(layer, ids, batch.buffers().other(), pinned)?;
+    totals.admitted += u64::from(report.admitted);
+    if pinned {
+        totals.pinned += u64::from(report.admitted);
+    }
+    totals.already_resident += u64::from(report.already_resident);
+    totals.skipped_full += u64::from(report.skipped_full);
+    totals.full = report.skipped_full != 0
+        || report
+            .resident_entries
+            .saturating_add(report.pinned_entries)
+            >= report.capacity_experts;
+    ids.clear();
+    Ok(())
+}
+
+/// Admit an ordered list of `(layer, expert)` seeds, batching consecutive
+/// same-layer entries so the list order (and with it LRU recency) survives.
+fn seed_cuda_cache_list(
+    experts: &RawExpertCorpus,
+    expert_reader: &Reader,
+    provider: &NativeProviderSession,
+    list: &[(u32, u16)],
+    pinned: bool,
+    totals: &mut CudaSeedTotals,
+) -> Result<()> {
+    let mut current_layer: Option<u32> = None;
+    let mut ids: Vec<u16> = Vec::with_capacity(CUDA_SEED_RUN_EXPERTS);
+    for &(layer, expert) in list {
+        if totals.full {
+            break;
+        }
+        if current_layer.is_some_and(|current| current != layer)
+            || ids.len() == CUDA_SEED_RUN_EXPERTS
+        {
+            let run_layer = current_layer.expect("a non-empty seed run has a layer");
+            seed_cuda_cache_run(experts, expert_reader, provider, run_layer, &mut ids, pinned, totals)?;
+        }
+        current_layer = Some(layer);
+        ids.push(expert);
+    }
+    if let Some(layer) = current_layer {
+        seed_cuda_cache_run(experts, expert_reader, provider, layer, &mut ids, pinned, totals)?;
+    }
+    Ok(())
+}
+
 /// Split discrete VRAM between the CUDA expert cache and every other
 /// provider consumer before residency selection runs.
 ///
@@ -11317,10 +11521,33 @@ fn plan_cuda_expert_cache_budget(
     fixed_provider_bytes: u64,
     peak_transient_layer_bytes: u64,
 ) -> Option<CudaExpertCacheBudget> {
+    plan_cuda_expert_cache_budget_with(
+        device,
+        snapshot,
+        ResidencyPolicy::default(),
+        fixed_provider_bytes,
+        peak_transient_layer_bytes,
+        None,
+    )
+}
+
+/// The same split under an explicit residency policy (the load-time policy
+/// the spine prefix is selected with, so both VRAM consumers see one
+/// envelope) and an optional operator override: `explicit_bytes`
+/// (K3_CUDA_EXPERT_CACHE_GB) fixes the cache size instead of taking the
+/// resident spine's remainder. `fixed_provider_bytes` already includes the
+/// resident spine prefix in the automatic mode.
+fn plan_cuda_expert_cache_budget_with(
+    device: Device,
+    snapshot: NativeProviderMemorySnapshot,
+    policy: ResidencyPolicy,
+    fixed_provider_bytes: u64,
+    peak_transient_layer_bytes: u64,
+    explicit_bytes: Option<u64>,
+) -> Option<CudaExpertCacheBudget> {
     if !matches!(device, Device::Cuda(_)) {
         return None;
     }
-    let policy = ResidencyPolicy::default();
     let zero = CudaExpertCacheBudget {
         policy: CudaExpertCachePolicy {
             capacity_experts: 0,
@@ -11338,6 +11565,19 @@ fn plan_cuda_expert_cache_budget(
         .device_reserve_floor_bytes
         .max(total.saturating_mul(u64::from(policy.device_reserve_permille)) / 1_000)
         .min(total);
+    if let Some(bytes) = explicit_bytes {
+        let span = crate::experts::K3_EXPERT_SOURCE_BYTES as u64;
+        let capacity =
+            u32::try_from((bytes / span).min(u64::from(CUDA_EXPERT_CACHE_MAX_EXPERTS)))
+                .expect("bounded CUDA expert-cache capacity fits u32");
+        return Some(CudaExpertCacheBudget {
+            policy: CudaExpertCachePolicy {
+                capacity_experts: capacity,
+                reserve_bytes: reserve,
+            },
+            charged_provider_bytes: u64::from(capacity) * span,
+        });
+    }
     let raw = total
         .saturating_sub(reserve)
         .min(available.min(total).saturating_sub(reserve));

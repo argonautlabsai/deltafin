@@ -131,6 +131,29 @@ fn parse_expert_heat(raw: &str) -> Result<bool> {
     }
 }
 
+fn parse_cuda_expert_cache_gb(raw: &str) -> Result<u64> {
+    let gigabytes = raw.trim().parse::<f64>().map_err(|_| {
+        DeltafinError::new("K3_CUDA_EXPERT_CACHE_GB must be a finite non-negative number")
+    })?;
+    let bytes = gigabytes * 1_000_000_000.0;
+    if !gigabytes.is_finite() || gigabytes < 0.0 || bytes > u64::MAX as f64 {
+        return Err(DeltafinError::new(
+            "K3_CUDA_EXPERT_CACHE_GB must be a finite non-negative number",
+        ));
+    }
+    Ok(bytes as u64)
+}
+
+fn parse_cuda_expert_seed(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "enabled" => Ok(true),
+        "0" | "false" | "off" | "no" | "disabled" => Ok(false),
+        _ => Err(DeltafinError::new(
+            "K3_CUDA_EXPERT_SEED must be 0/1, false/true, or off/on",
+        )),
+    }
+}
+
 fn parse_pilot_gate_threshold(raw: &str) -> Result<f64> {
     let threshold = raw.trim().parse::<f64>().map_err(|_| {
         DeltafinError::new("K3_PILOT_GATE_THRESHOLD must be a finite number in [0,1)")
@@ -380,6 +403,12 @@ pub struct RuntimeConfig {
     /// Whether ordinary runs accumulate the persistent expert-heat histogram.
     /// Recording is advisory and default-on; it never affects routing.
     pub expert_heat: bool,
+    /// Explicit CUDA expert-cache size in bytes instead of the resident
+    /// spine's VRAM remainder; `None` keeps the automatic spine-first split.
+    pub cuda_expert_cache_bytes: Option<u64>,
+    /// Seed the CUDA expert cache from the heat histogram at startup. The
+    /// `expert_pin_bytes` budget decides how many of the seeds are pinned.
+    pub cuda_expert_seed: bool,
     /// Adaptive admission for PILOT speculative expert reads. Threshold and
     /// warmup are resolved even when the gate is off so a bad value never
     /// silently rides along with a disabled feature.
@@ -458,6 +487,15 @@ impl RuntimeConfig {
         let expert_heat = environment("K3_EXPERT_HEAT")
             .as_deref()
             .map(parse_expert_heat)
+            .transpose()?
+            .unwrap_or(true);
+        let cuda_expert_cache_bytes = environment("K3_CUDA_EXPERT_CACHE_GB")
+            .as_deref()
+            .map(parse_cuda_expert_cache_gb)
+            .transpose()?;
+        let cuda_expert_seed = environment("K3_CUDA_EXPERT_SEED")
+            .as_deref()
+            .map(parse_cuda_expert_seed)
             .transpose()?
             .unwrap_or(true);
         let backend_value = arguments.expert_backend.or_else(|| environment("K3_MOE"));
@@ -574,6 +612,8 @@ impl RuntimeConfig {
             expert_scale4,
             expert_pin_bytes,
             expert_heat,
+            cuda_expert_cache_bytes,
+            cuda_expert_seed,
             pilot_gate,
             pilot_gate_threshold,
             pilot_gate_warmup,
@@ -786,6 +826,41 @@ mod tests {
 
         let unset = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
         assert_eq!(unset.reasoning_effort, None);
+    }
+
+    #[test]
+    fn cuda_expert_cache_knobs_parse_strictly_and_default_safely() {
+        let defaults = RuntimeConfig::resolve(arguments(), |_| None).unwrap();
+        assert_eq!(defaults.cuda_expert_cache_bytes, None);
+        assert!(defaults.cuda_expert_seed);
+
+        let set = RuntimeConfig::resolve(arguments(), |name| match name {
+            "K3_CUDA_EXPERT_CACHE_GB" => Some("32.5".into()),
+            "K3_CUDA_EXPERT_SEED" => Some("off".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(set.cuda_expert_cache_bytes, Some(32_500_000_000));
+        assert!(!set.cuda_expert_seed);
+
+        for bad in ["-1", "nan", "gigabytes", "inf", ""] {
+            assert!(
+                RuntimeConfig::resolve(arguments(), |name| {
+                    (name == "K3_CUDA_EXPERT_CACHE_GB").then(|| bad.into())
+                })
+                .is_err(),
+                "K3_CUDA_EXPERT_CACHE_GB={bad} should be rejected"
+            );
+        }
+        for bad in ["auto", "2", "maybe", ""] {
+            assert!(
+                RuntimeConfig::resolve(arguments(), |name| {
+                    (name == "K3_CUDA_EXPERT_SEED").then(|| bad.into())
+                })
+                .is_err(),
+                "K3_CUDA_EXPERT_SEED={bad} should be rejected"
+            );
+        }
     }
 
     #[test]

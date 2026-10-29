@@ -358,6 +358,19 @@ continuing with uncertain ownership. The per-pass phase summary reports
 `expert plans: N cache hits, M misses read+uploaded` so cache health is
 visible in any contributed log.
 
+The cache can also be seeded before the first token. On a host with learned
+heat (`k3-meta/expert_heat.v1.bin`), the engine ranks the hottest experts,
+reads them through the ordinary authenticated reader and admits them through
+a dedicated out-of-plan ABI call: the `K3_EXPERT_PIN_GB` share is pinned and
+never evicted, the remainder enters as the coldest LRU entries so a live
+route always outranks a seed. The budget bound is the whole corpus rather
+than one token's route union, and the split with the resident spine is
+spine-first: a streamed spine layer costs its full weight set in reads on
+every token, so the cache takes only what the largest safe resident prefix
+leaves (`K3_CUDA_EXPERT_CACHE_GB` overrides). Pinned entries hold their share
+of the budget; a budget that is entirely pinned still executes misses from
+their upload, it merely stops retaining them.
+
 ### Draft models remain proposal-only
 
 DSpark and optional Qwen are parsed, mapped and executed through native

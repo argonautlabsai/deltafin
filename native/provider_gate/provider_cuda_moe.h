@@ -42,6 +42,25 @@ struct CudaMoeHostFallback {
   std::vector<CudaMoeHostExpert> resident_experts;
 };
 
+/* Outcome of one out-of-plan admission (startup seeding). The entry counts
+ * are session totals after the call; `capacity_experts` is the frozen
+ * budget in experts. */
+struct CudaMoeCacheAdmitReport {
+  std::size_t admitted = 0;
+  std::size_t already_resident = 0;
+  std::size_t skipped_full = 0;
+  std::size_t pinned_entries = 0;
+  std::size_t resident_entries = 0;
+  std::size_t capacity_experts = 0;
+};
+
+struct CudaMoeCacheStats {
+  std::size_t capacity_experts = 0;
+  std::size_t resident_entries = 0;
+  std::size_t pinned_entries = 0;
+  bool residency_enabled = false;
+};
+
 /*
  * Live device/allocator accounting used by Rust's memory-admission policy.
  * Every qualified CUDA LibTorch build exposes this accounting, even when the
@@ -109,6 +128,22 @@ class CudaMoeExpertCache final {
   /* Bounded D2H materialization of the plan's pinned hits only. */
   [[nodiscard]] CudaMoeHostFallback materialize_plan_for_cpu(
       std::uint64_t plan_id);
+
+  /*
+   * Admit experts outside any plan: startup seeding from the learned heat
+   * histogram. A pinned entry never leaves through LRU eviction; an unpinned
+   * seed joins the LRU as its coldest entry, so a live route always outranks
+   * it. `expert_major_bytes` is the exact raw-v1 slab for `canonical_experts`
+   * (ascending IDs, at most one position tile). Budget rules are those of a
+   * miss admission; pinned seeds may evict LRU residents, never other pins.
+   */
+  [[nodiscard]] CudaMoeCacheAdmitReport admit(
+      std::uint32_t layer_index,
+      std::span<const std::uint16_t> canonical_experts,
+      std::span<const std::uint8_t> expert_major_bytes, bool pinned);
+
+  /* Live counts; capacity is zero until the budget was first established. */
+  [[nodiscard]] CudaMoeCacheStats stats() const;
 
   /* Marks the adapter terminal; this operation is allocation-failure safe. */
   void poison_external(const char* failure) noexcept;

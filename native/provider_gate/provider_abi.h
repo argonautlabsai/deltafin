@@ -525,6 +525,44 @@ typedef struct DeltafinProviderCudaCacheConfigureReportV1 {
 } DeltafinProviderCudaCacheConfigureReportV1;
 
 /*
+ * Out-of-plan expert admission for the CUDA cache: startup seeding from the
+ * learned heat histogram. IDs are canonical ascending within one layer; the
+ * slab is their exact raw-v1 expert-major bytes, borrowed for this
+ * synchronous call. The pinned flag keeps the entries out of LRU eviction.
+ * Entry counts in the report are session totals after the call.
+ */
+#define DELTAFIN_PROVIDER_CUDA_CACHE_ADMIT_PINNED_V1 1u
+#define DELTAFIN_PROVIDER_CUDA_CACHE_MAX_EXPERTS_V1 (92u * 896u)
+
+typedef struct DeltafinProviderCudaCacheAdmitRequestV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderSessionHandleV1 session;
+  uint32_t layer_index;
+  uint32_t expert_count;
+  uint32_t flags;
+  uint32_t reserved0;
+  uint16_t expert_ids[DELTAFIN_PROVIDER_TARGET_SEQUENCE_MAX_EXPERTS_V1];
+  const uint8_t* expert_major_bytes;
+  uint64_t expert_major_length;
+  uint64_t reserved[4];
+} DeltafinProviderCudaCacheAdmitRequestV1;
+
+typedef struct DeltafinProviderCudaCacheAdmitReportV1 {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  DeltafinProviderSessionHandleV1 session;
+  uint32_t admitted;
+  uint32_t already_resident;
+  uint32_t skipped_full;
+  uint32_t flags;
+  uint64_t pinned_entries;
+  uint64_t resident_entries;
+  uint64_t capacity_experts;
+  uint64_t reserved[2];
+} DeltafinProviderCudaCacheAdmitReportV1;
+
+/*
  * Session-scoped qualification of the statically linked Metal expert bridge.
  * The source path is borrowed for this synchronous call. The report exposes
  * only layouts backed by the complete versioned descriptor symbol/pipeline
@@ -1576,6 +1614,12 @@ int32_t deltafin_provider_session_destroy_v1(
 int32_t deltafin_provider_cuda_cache_configure_v1(
     const DeltafinProviderCudaCacheConfigureRequestV1* request,
     DeltafinProviderCudaCacheConfigureReportV1* report,
+    char* error,
+    size_t error_capacity);
+
+int32_t deltafin_provider_cuda_cache_admit_v1(
+    const DeltafinProviderCudaCacheAdmitRequestV1* request,
+    DeltafinProviderCudaCacheAdmitReportV1* report,
     char* error,
     size_t error_capacity);
 

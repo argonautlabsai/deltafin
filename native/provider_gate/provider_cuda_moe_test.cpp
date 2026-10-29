@@ -242,6 +242,141 @@ void physical_cuda_test() {
   }
   resident_cache.cancel_plan(102);
   std::cout << "provider_cuda_moe.residency=ok\n";
+
+  // Learned-tier semantics on a two-entry budget: a pinned admission survives
+  // LRU pressure, an unpinned seed is the first victim, a pinned seed evicts
+  // LRU residents but never another pin, and admission reports totals.
+  {
+    CudaMoeExpertCache tier{at::Device(at::kCUDA, 0)};
+    tier.configure(CudaMoeCachePolicy{
+        .automatic_capacity = false,
+        .capacity_experts = 2,
+        .reserve_kind = CudaMoeCacheReserveKind::Bytes,
+        .reserve_value = 0});
+    if (!tier.available()) {
+      throw std::runtime_error(
+          std::string("physical CUDA tier qualification failed: ") +
+          tier.detail());
+    }
+    std::vector<std::uint8_t> pinned_bytes(expert_span);
+    for (std::size_t index = 0; index < pinned_bytes.size(); ++index) {
+      pinned_bytes[index] = static_cast<std::uint8_t>(
+          (index * std::size_t{7} + std::size_t{3}) & 0xffU);
+    }
+    const std::array<std::uint16_t, 1> expert_three{3};
+    const std::array<std::uint16_t, 1> expert_five{5};
+    const std::array<std::uint16_t, 1> expert_nine{9};
+    const std::array<std::uint16_t, 1> expert_eleven{11};
+    const std::array<std::uint16_t, 1> expert_thirteen{13};
+    const auto pin = tier.admit(layer, expert_three, pinned_bytes, true);
+    if (pin.admitted != 1 || pin.pinned_entries != 1 ||
+        pin.resident_entries != 0 || pin.capacity_experts != 2) {
+      throw std::runtime_error("pinned admission did not report one pin");
+    }
+    const auto seed = tier.admit(layer, expert_five, exact_bytes, false);
+    if (seed.admitted != 1 || seed.pinned_entries != 1 ||
+        seed.resident_entries != 1) {
+      throw std::runtime_error("LRU seed admission did not report one resident");
+    }
+    const auto again = tier.admit(layer, expert_five, exact_bytes, false);
+    if (again.admitted != 0 || again.already_resident != 1) {
+      throw std::runtime_error("re-admission was not idempotent");
+    }
+
+    // A miss on expert 9 evicts the unpinned seed (5), never the pin (3).
+    const auto nine = tier.plan(201, layer, expert_nine);
+    if (nine.missing_experts !=
+        std::vector<std::uint16_t>(expert_nine.begin(), expert_nine.end())) {
+      throw std::runtime_error("expert 9 was unexpectedly resident");
+    }
+    deltafin::provider_internal::PreparedMoeT1 prepared_nine;
+    prepared_nine.layer_index = layer;
+    prepared_nine.geometry = deltafin::provider_internal::k3_moe_geometry();
+    prepared_nine.routed_input = at::zeros(
+        {1, hidden},
+        at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+    prepared_nine.route.expert_ids.fill(9);
+    prepared_nine.route.weight_bits.fill(
+        std::bit_cast<std::uint32_t>(1.0F / 16.0F));
+    const std::array<const deltafin::provider_internal::PreparedMoeT1*, 1>
+        nine_rows{&prepared_nine};
+    const deltafin::provider_internal::CanonicalExpertPositionTileT1 nine_tile{
+        .expert_ids = std::span<const std::uint16_t>(expert_nine),
+        .expert_major_bytes = std::span<const std::uint8_t>(exact_bytes),
+        .layout = deltafin::provider_internal::MoeExpertLayout::RawV1,
+        .expert_span_bytes = expert_span};
+    const at::Tensor nine_output = tier.execute_positions_plan_t1(
+        201,
+        std::span<const deltafin::provider_internal::PreparedMoeT1* const>(
+            nine_rows),
+        nine_tile);
+    if (!nine_output.defined()) {
+      throw std::runtime_error("planned execution of expert 9 failed");
+    }
+    const std::array<std::uint16_t, 3> three_five_nine{3, 5, 9};
+    const auto after = tier.plan(202, layer, three_five_nine);
+    if (after.missing_experts != std::vector<std::uint16_t>{5}) {
+      throw std::runtime_error(
+          "LRU pressure did not evict exactly the unpinned seed");
+    }
+    const auto snapshot = tier.materialize_plan_for_cpu(202);
+    bool pin_bytes_intact = false;
+    for (const auto& resident : snapshot.resident_experts) {
+      if (resident.expert == 3) {
+        const at::Tensor host = resident.bytes;
+        pin_bytes_intact = host.numel() ==
+                static_cast<std::int64_t>(pinned_bytes.size()) &&
+            std::memcmp(host.const_data_ptr<std::uint8_t>(),
+                        pinned_bytes.data(), pinned_bytes.size()) == 0;
+      }
+    }
+    if (snapshot.resident_experts.size() != 2 || !pin_bytes_intact) {
+      throw std::runtime_error(
+          "pinned expert bytes did not survive LRU pressure intact");
+    }
+    tier.cancel_plan(202);
+
+    // A pinned seed under a full budget evicts the LRU resident (9), and a
+    // budget that is entirely pinned refuses further unpinned seeds while
+    // misses still execute without retention.
+    const auto second_pin = tier.admit(layer, expert_eleven, pinned_bytes, true);
+    if (second_pin.admitted != 1 || second_pin.pinned_entries != 2 ||
+        second_pin.resident_entries != 0) {
+      throw std::runtime_error("second pin did not displace the LRU resident");
+    }
+    const auto refused = tier.admit(layer, expert_thirteen, exact_bytes, false);
+    if (refused.admitted != 0 || refused.skipped_full != 1) {
+      throw std::runtime_error("fully pinned budget admitted an LRU seed");
+    }
+    const auto thirteen = tier.plan(203, layer, expert_thirteen);
+    if (thirteen.missing_experts != std::vector<std::uint16_t>{13}) {
+      throw std::runtime_error("expert 13 was unexpectedly resident");
+    }
+    prepared_nine.route.expert_ids.fill(13);
+    const deltafin::provider_internal::CanonicalExpertPositionTileT1
+        thirteen_tile{
+            .expert_ids = std::span<const std::uint16_t>(expert_thirteen),
+            .expert_major_bytes = std::span<const std::uint8_t>(exact_bytes),
+            .layout = deltafin::provider_internal::MoeExpertLayout::RawV1,
+            .expert_span_bytes = expert_span};
+    static_cast<void>(tier.execute_positions_plan_t1(
+        203,
+        std::span<const deltafin::provider_internal::PreparedMoeT1* const>(
+            nine_rows),
+        thirteen_tile));
+    const auto still_missing = tier.plan(204, layer, expert_thirteen);
+    if (still_missing.missing_experts != std::vector<std::uint16_t>{13}) {
+      throw std::runtime_error(
+          "a fully pinned budget retained an unretainable miss");
+    }
+    tier.cancel_plan(204);
+    const auto stats = tier.stats();
+    if (stats.capacity_experts != 2 || stats.pinned_entries != 2 ||
+        stats.resident_entries != 0 || !stats.residency_enabled) {
+      throw std::runtime_error("cache stats disagree with the admissions");
+    }
+    std::cout << "provider_cuda_moe.pinned_tier=ok\n";
+  }
 #endif
 }
 

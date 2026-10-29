@@ -4211,7 +4211,8 @@ extern "C" int32_t deltafin_provider_cuda_cache_configure_v1(
     if ((!automatic_capacity && request->capacity_mode !=
              DELTAFIN_PROVIDER_CUDA_CACHE_CAPACITY_EXACT_V1) ||
         (automatic_capacity && request->capacity_experts != 0) ||
-        request->capacity_experts > 92u * DELTAFIN_PROVIDER_ROUTE_TOP_K_V1) {
+        request->capacity_experts >
+            DELTAFIN_PROVIDER_CUDA_CACHE_MAX_EXPERTS_V1) {
       throw std::invalid_argument(
           "provider CUDA cache capacity policy is invalid");
     }
@@ -4261,6 +4262,88 @@ extern "C" int32_t deltafin_provider_cuda_cache_configure_v1(
     produced.capacity_experts = request->capacity_experts;
     produced.reserve_value = request->reserve_value;
     produced.configured = 1;
+    *report = produced;
+  });
+}
+
+static_assert(sizeof(DeltafinProviderCudaCacheAdmitRequestV1) == 208,
+              "CUDA cache admit request ABI layout drifted");
+static_assert(sizeof(DeltafinProviderCudaCacheAdmitReportV1) == 72,
+              "CUDA cache admit report ABI layout drifted");
+
+extern "C" int32_t deltafin_provider_cuda_cache_admit_v1(
+    const DeltafinProviderCudaCacheAdmitRequestV1* request,
+    DeltafinProviderCudaCacheAdmitReportV1* report, char* error,
+    const size_t error_capacity) {
+  return ffi_guard(error, error_capacity, [&] {
+    if (request == nullptr || report == nullptr) {
+      throw std::invalid_argument(
+          "provider CUDA cache admission request/report is null");
+    }
+    require_header(request->struct_size, sizeof(*request), request->abi_version,
+                   "provider CUDA cache admission request");
+    if (report->struct_size != sizeof(*report) ||
+        (request->flags & ~DELTAFIN_PROVIDER_CUDA_CACHE_ADMIT_PINNED_V1) != 0 ||
+        request->reserved0 != 0 || !all_zero(request->reserved) ||
+        request->expert_count == 0 ||
+        request->expert_count >
+            DELTAFIN_PROVIDER_TARGET_SEQUENCE_MAX_EXPERTS_V1 ||
+        request->expert_major_bytes == nullptr) {
+      throw std::invalid_argument(
+          "provider CUDA cache admission has invalid bounds/pointer/flags/reserved fields");
+    }
+    for (std::size_t index = 0; index < request->expert_count; ++index) {
+      if (request->expert_ids[index] >= kK3Experts ||
+          (index != 0 &&
+           request->expert_ids[index - 1] >= request->expert_ids[index])) {
+        throw std::invalid_argument(
+            "provider CUDA cache admission IDs are not unique canonical ascending IDs");
+      }
+    }
+    if (!std::all_of(
+            request->expert_ids + request->expert_count,
+            std::end(request->expert_ids),
+            [](const std::uint16_t value) { return value == 0; })) {
+      throw std::invalid_argument(
+          "provider CUDA cache admission unused ID slots must be zero");
+    }
+    const std::uint64_t expected_bytes =
+        K3_RAW_V1_EXPERT_SPAN *
+        static_cast<std::uint64_t>(request->expert_count);
+    if (request->expert_major_length != expected_bytes ||
+        request->expert_major_length > SIZE_MAX) {
+      throw std::invalid_argument(
+          "provider CUDA cache admission bytes do not match raw-v1 IDs");
+    }
+
+    const auto session = find_session(request->session);
+    const c10::InferenceMode inference_guard;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    session->require_open();
+    if (session->cuda_expert_cache == nullptr) {
+      throw std::invalid_argument(
+          "CUDA cache admission requires a selected CUDA provider");
+    }
+    const auto admitted = session->cuda_expert_cache->admit(
+        request->layer_index,
+        std::span<const std::uint16_t>(request->expert_ids,
+                                       request->expert_count),
+        std::span<const std::uint8_t>(
+            request->expert_major_bytes,
+            static_cast<std::size_t>(request->expert_major_length)),
+        (request->flags & DELTAFIN_PROVIDER_CUDA_CACHE_ADMIT_PINNED_V1) != 0);
+
+    DeltafinProviderCudaCacheAdmitReportV1 produced = {};
+    produced.struct_size = sizeof(produced);
+    produced.abi_version = DELTAFIN_PROVIDER_ABI_VERSION;
+    produced.session = request->session;
+    produced.admitted = static_cast<uint32_t>(admitted.admitted);
+    produced.already_resident =
+        static_cast<uint32_t>(admitted.already_resident);
+    produced.skipped_full = static_cast<uint32_t>(admitted.skipped_full);
+    produced.pinned_entries = admitted.pinned_entries;
+    produced.resident_entries = admitted.resident_entries;
+    produced.capacity_experts = admitted.capacity_experts;
     *report = produced;
   });
 }
