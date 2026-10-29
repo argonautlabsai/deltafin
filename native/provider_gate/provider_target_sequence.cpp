@@ -896,7 +896,7 @@ class TargetSequenceTape::Impl {
             pending_->whole_layer_metal_staging && selects_metal;
       }
 
-      bool tail_on_loop = false;
+      [[maybe_unused]] bool tail_on_loop = false;  // set on Apple only
 #if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
       // K3_KDA_LOOP=on, plan Step 5: the entire MoE tail of a T=1 routed
       // layer runs as one synchronous loop command buffer (expert stack +
@@ -1875,7 +1875,7 @@ class TargetSequenceTape::Impl {
                         SequenceCacheStage& stage,
                         PendingSequenceLayer* routed) {
     stage.kind = SequenceCacheStage::Kind::Mla;
-    bool chained_done = false;
+    [[maybe_unused]] bool chained_done = false;  // set on Apple only
     at::Tensor chained_output;
     std::unique_ptr<MlaDecodeShell> chained_shell;
 #if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)

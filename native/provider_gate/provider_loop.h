@@ -654,6 +654,41 @@ void loop_fused_flush();
 [[nodiscard]] LoopWeightsTableStats loop_weights_table_stats();
 void loop_weights_table_reset();
 
+#else  // !defined(__APPLE__)
+
+/* Portable stand-ins for the bespoke-loop hooks that the shared provider
+ * sources call unconditionally. There is no Metal loop on this host: every
+ * query answers "feature absent", every timeline note is dropped, every drain
+ * is already satisfied, and the unified-memory alias is refused so callers
+ * take their documented copy fallback. Signatures mirror the Apple
+ * declarations above exactly. */
+inline void loop_drain_aten_stream() noexcept {}
+inline at::Tensor loop_host_alias_of_mps(const at::Tensor& /*tensor*/) {
+  return at::Tensor();
+}
+inline void loop_gpu_timeline_note_aten(const char* /*klass*/) noexcept {}
+inline void loop_gpu_timeline_flush() noexcept {}
+inline std::uint64_t loop_aten_sync_now_ns() noexcept { return 0; }
+inline void* loop_aten_sync_begin() noexcept { return nullptr; }
+inline void loop_aten_sync_end(void* /*token*/, std::uint64_t /*began_ns*/,
+                               std::uint64_t /*ended_ns*/) noexcept {}
+inline void loop_aten_sync_note_prep(std::uint64_t /*ns*/) noexcept {}
+inline void loop_aten_sync_note_second(std::uint64_t /*ns*/) noexcept {}
+inline void loop_residency_register_tensor(
+    const at::Tensor& /*tensor*/) noexcept {}
+inline void loop_residency_register_activation(
+    const at::Tensor& /*tensor*/) noexcept {}
+inline bool loop_consume_fresh_marker() noexcept { return false; }
+[[nodiscard]] inline bool kda_int8_direct_enabled() { return false; }
+[[nodiscard]] inline std::uint32_t loop_router_pending_layer() {
+  return UINT32_MAX;  // never equal to a real layer index
+}
+[[nodiscard]] inline bool loop_tail_async_enabled() noexcept { return false; }
+[[nodiscard]] inline bool loop_tail_poisoned() noexcept { return false; }
+inline void loop_moe_tail_drain() {}
+[[nodiscard]] inline bool loop_cb_fusion_enabled() noexcept { return false; }
+inline void loop_fused_flush() {}
+
 #endif  // defined(__APPLE__)
 
 }  // namespace deltafin::provider_internal

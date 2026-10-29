@@ -1,10 +1,11 @@
 #include "provider_moe.h"
 
 #include "provider_cuda_moe.h"
-#if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+#if !defined(__APPLE__) || defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
+// Apple: the bespoke Metal loop. Elsewhere: its portable no-op stand-ins.
 #include "provider_loop.h"
-#include "provider_prep_timer.h"
 #endif
+#include "provider_prep_timer.h"
 #include "../../tools/metal_moe_abi.h"
 
 #if defined(__APPLE__) && defined(DELTAFIN_HAVE_MPS_ROUTE_MAILBOX_V1)
@@ -950,6 +951,7 @@ std::array<float, kMoeRouteTopK> route_weights(const MoeRouteT1& route) {
   return weights;
 }
 
+#if defined(__APPLE__)
 // Drop route edges whose blob is null (arrival-driven partial groups) so the
 // Metal bridge sees a dense edge list. With no nulls this is the identity.
 struct CompactEdges {
@@ -972,6 +974,7 @@ CompactEdges compact_present_edges(
   }
   return out;
 }
+#endif  // defined(__APPLE__): only the Metal bridges compact edges
 
 at::Tensor execute_cpu(const PreparedMoeT1& prepared,
                        const std::array<const std::uint8_t*, kMoeRouteTopK>& blobs,
@@ -1991,7 +1994,7 @@ PreparedMoeT1 prepare_moe_t1(const at::Tensor& hidden,
   prepared.spine_generation = spine.generation;
   prepared.geometry = spine.geometry;
   at::Tensor routed_input;
-  bool route_from_sidequeue = false;
+  [[maybe_unused]] bool route_from_sidequeue = false;  // read on Apple only
 #if defined(__APPLE__) && defined(DELTAFIN_HAVE_BESPOKE_LOOP_V1)
   if (takeover_begun) {
     // routed_down rides the ATen queue while the side queue finishes the
