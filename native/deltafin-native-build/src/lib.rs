@@ -2965,15 +2965,12 @@ fn find_cuda_provider(torch_root: &Path) -> CudaProviderBuild {
         "aarch64" => "aarch64-linux",
         arch => panic!("CUDA provider does not support target architecture {arch}"),
     };
-    let mut roots = vec![
-        torch_root.to_path_buf(),
-        torch_root
-            .parent()
-            .unwrap_or(torch_root)
-            .join("nvidia/cuda_runtime"),
-        PathBuf::from("/usr/local/cuda"),
-        PathBuf::from("/usr"),
-    ];
+    // An explicitly selected toolkit (CUDAToolkit_ROOT, CUDA_HOME, CUDA_PATH,
+    // or the toolkit owning the selected NVCC) must win over the ambient
+    // /usr/local/cuda link: a host carrying several toolkits would otherwise
+    // pair the kernels' NVCC with a different runtime directory and fail the
+    // "different runtimes" check even though the operator named the right one.
+    let mut roots = Vec::new();
     for variable in ["CUDAToolkit_ROOT", "CUDA_HOME", "CUDA_PATH"] {
         if let Some(value) = env::var_os(variable) {
             let root = fs::canonicalize(&value).unwrap_or_else(|error| {
@@ -2992,6 +2989,15 @@ fn find_cuda_provider(torch_root: &Path) -> CudaProviderBuild {
             .unwrap_or_else(|| panic!("NVCC path has no toolkit root: {}", compiler.display()));
         roots.push(root.to_path_buf());
     }
+    roots.extend([
+        torch_root.to_path_buf(),
+        torch_root
+            .parent()
+            .unwrap_or(torch_root)
+            .join("nvidia/cuda_runtime"),
+        PathBuf::from("/usr/local/cuda"),
+        PathBuf::from("/usr"),
+    ]);
     for root in roots {
         for include in [
             root.join("include"),
