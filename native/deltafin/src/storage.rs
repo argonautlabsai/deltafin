@@ -3292,14 +3292,36 @@ fn advise_read_range(file: &File, offset: u64, length: usize) {
     if !rdadvise_enabled() || length == 0 {
         return;
     }
-    let advisory = libc::radvisory {
-        ra_offset: offset as libc::off_t,
-        ra_count: length.min(i32::MAX as usize) as libc::c_int,
-    };
-    // SAFETY: valid descriptor and a fully initialized radvisory struct; the
-    // call never modifies user memory and failure is advisory-only.
-    unsafe {
-        libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &advisory as *const libc::radvisory);
+    #[cfg(target_os = "macos")]
+    {
+        let advisory = libc::radvisory {
+            ra_offset: offset as libc::off_t,
+            ra_count: length.min(i32::MAX as usize) as libc::c_int,
+        };
+        // SAFETY: valid descriptor and a fully initialized radvisory struct; the
+        // call never modifies user memory and failure is advisory-only.
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &advisory as *const libc::radvisory);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux has no F_RDADVISE; POSIX_FADV_WILLNEED starts an asynchronous
+        // readahead of the same byte range, the closest kernel-side analogue.
+        // SAFETY: valid descriptor; the call never touches user memory and
+        // failure is advisory-only.
+        unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                offset as libc::off_t,
+                length.min(i64::MAX as usize) as libc::off_t,
+                libc::POSIX_FADV_WILLNEED,
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (file, offset, length);
     }
 }
 
