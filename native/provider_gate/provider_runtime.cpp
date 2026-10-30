@@ -4148,11 +4148,16 @@ extern "C" int32_t deltafin_provider_target_pilot_enable_v1(
     const auto session = find_session(request->session);
     std::lock_guard<std::mutex> lock(session->mutex);
     session->require_open();
+    // The PILOT routers are per-layer clones of the authoritative bind and
+    // the prediction is plain ATen arithmetic, so a CUDA session qualifies as
+    // well (kpai 2026-10-30: the engine's K3_CUDA_PILOT port schedules the
+    // hint's reads on the CUDA plan path).
     if (session->flags != 0 ||
         (session->selected.kind != DELTAFIN_PROVIDER_DEVICE_CPU_V1 &&
-         session->selected.kind != DELTAFIN_PROVIDER_DEVICE_MPS_V1)) {
+         session->selected.kind != DELTAFIN_PROVIDER_DEVICE_MPS_V1 &&
+         session->selected.kind != DELTAFIN_PROVIDER_DEVICE_CUDA_V1)) {
       throw std::invalid_argument(
-          "target PILOT admission requires a real CPU or MPS session");
+          "target PILOT admission requires a real CPU, MPS or CUDA session");
     }
     if (session->target_pilot_enabled || session->last_spine_generation != 0 ||
         session->resident_spine_prefix_layers != 0 ||
@@ -8330,12 +8335,18 @@ deltafin_provider_target_sequence_finish_planned_experts_v1(
         planned.layer_index != request->layer_index ||
         planned.first_row != request->first_row ||
         planned.row_count != request->row_count ||
-        planned.missing_experts.size() != request->missing_count ||
-        !std::equal(planned.missing_experts.begin(),
-                    planned.missing_experts.end(),
-                    request->missing_experts)) {
+        planned.missing_experts.size() < request->missing_count ||
+        !std::includes(planned.missing_experts.begin(),
+                       planned.missing_experts.end(),
+                       request->missing_experts,
+                       request->missing_experts + request->missing_count)) {
+      // The request may carry a (sorted) subset of the planned misses when
+      // the engine admitted the rest ahead of finish (arrival-driven
+      // execution, K3_CUDA_ARRIVAL_ADMIT); the plan execution re-derives the
+      // live miss set from its cache and rejects any expert that is neither
+      // supplied nor resident.
       throw std::invalid_argument(
-          "provider planned finish does not exactly match its residency snapshot");
+          "provider planned finish is not a subset of its residency snapshot");
     }
     require_live_target_sequence(*session, request->sequence);
     if (request->layer_index !=

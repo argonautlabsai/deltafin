@@ -5950,6 +5950,24 @@ impl TargetSequenceExpertPlan {
         &self.missing_experts
     }
 
+    /// Arrival-driven execution (K3_CUDA_ARRIVAL_ADMIT=1): the caller admitted
+    /// some planned misses to the device cache ahead of finish, so the miss
+    /// slab it supplies covers only `remaining`, which must be a sorted subset
+    /// of the plan's misses. The native side re-derives the live miss set from
+    /// its cache and still rejects any mismatch.
+    pub(crate) fn narrow_missing_experts(&mut self, remaining: &[u16]) -> Result<()> {
+        let mut planned = self.missing_experts.iter();
+        for expert in remaining {
+            if !planned.any(|candidate| candidate == expert) {
+                return Err(DeltafinError::new(
+                    "narrowed CUDA miss set is not a sorted subset of the expert plan",
+                ));
+            }
+        }
+        self.missing_experts = remaining.to_vec().into_boxed_slice();
+        Ok(())
+    }
+
     pub const fn effective_backend(&self) -> TargetExpertBackend {
         self.effective_backend
     }

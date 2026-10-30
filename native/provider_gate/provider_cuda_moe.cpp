@@ -1,6 +1,7 @@
 #include "provider_cuda_moe.h"
 
 #include <ATen/Context.h>
+#include <ATen/Parallel.h>
 #include <ATen/ops/cat.h>
 #include <c10/core/InferenceMode.h>
 
@@ -9,6 +10,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -680,6 +682,15 @@ struct CudaMoeExpertCache::Impl {
         }
       }
     }
+    for (auto& ready : batch_ready) {
+      if (ready != nullptr) {
+        try {
+          ready->synchronize();
+        } catch (...) {
+          // As above: the batch slabs may still be DMA sources at shutdown.
+        }
+      }
+    }
   }
 
   void establish_budget() {
@@ -840,6 +851,12 @@ struct CudaMoeExpertCache::Impl {
       return *found;
     }
     Resident uploaded = upload(source, source_bytes);
+    admit_lru(slot, expert, uploaded);
+    return uploaded;
+  }
+
+  void admit_lru(const std::size_t slot, const std::uint16_t expert,
+                 const Resident& uploaded) {
     if (capacity != 0) {
       // Pinned residents hold their share of the budget; only the LRU set
       // yields. A budget that is entirely pinned executes the miss from its
@@ -853,7 +870,122 @@ struct CudaMoeExpertCache::Impl {
         ++resident_entries;
       }
     }
-    return uploaded;
+  }
+
+  /*
+   * Planned misses are known for the whole layer before the first tile
+   * runs, so stage them together: one pinned slab per miss (a pool of
+   * kBatchSlots), the host copies spread over ATen's intra-op pool, then one
+   * async DMA + readiness event per expert enqueued back to back. The
+   * single-expert `upload()` path above copied each 17.5 MB span with one
+   * serial memcpy ahead of its DMA — ~1,500 serial copies per token on a
+   * decode step — which is what capped uploads at ~15 GB/s on kpai
+   * (2026-10-30). Residents are admitted to the LRU exactly as `resident()`
+   * admits them; `prestaged[i]` corresponds to `missing_ids[i]`.
+   */
+  std::vector<Resident> prestage_misses(
+      const std::uint32_t layer_index,
+      const std::span<const std::uint16_t> missing_ids,
+      const std::span<const std::uint8_t> missing_bytes) {
+    std::vector<Resident> out;
+    if (missing_ids.empty()) {
+      return out;
+    }
+    establish_budget();
+    const std::size_t span = static_cast<std::size_t>(kCudaExpertSpan);
+    if (missing_bytes.size() != missing_ids.size() * span) {
+      throw std::invalid_argument(
+          "CUDA prestage bytes do not match the planned miss list");
+    }
+    const std::size_t slot = layer_slot(layer_index);
+    const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
+    out.reserve(missing_ids.size());
+    for (std::size_t begin = 0; begin < missing_ids.size();
+         begin += kBatchSlots) {
+      const std::size_t count =
+          std::min(kBatchSlots, missing_ids.size() - begin);
+      for (std::size_t i = 0; i < count; ++i) {
+        // Host writes cannot be ordered by a stream wait: each slab waits for
+        // its own previous DMA before it is overwritten.
+        if (batch_ready[i] != nullptr) {
+          batch_ready[i]->synchronize();
+          batch_ready[i].reset();
+        }
+        if (!batch_stage[i].defined()) {
+          batch_stage[i] = at::empty(
+              {kCudaExpertSpan},
+              at::TensorOptions()
+                  .dtype(at::kByte)
+                  .device(at::kCPU)
+                  .pinned_memory(true));
+          if (!batch_stage[i].is_pinned()) {
+            throw std::runtime_error(
+                "CUDA expert batch staging allocation is not pinned");
+          }
+        }
+      }
+      at::parallel_for(
+          0, static_cast<std::int64_t>(count), 1,
+          [&](const std::int64_t lo, const std::int64_t hi) {
+            for (std::int64_t i = lo; i < hi; ++i) {
+              std::memcpy(
+                  batch_stage[static_cast<std::size_t>(i)]
+                      .data_ptr<std::uint8_t>(),
+                  missing_bytes.data() +
+                      (begin + static_cast<std::size_t>(i)) * span,
+                  span);
+            }
+          });
+      for (std::size_t i = 0; i < count; ++i) {
+        auto ready = std::make_shared<CudaReadyEvent>();
+        at::Tensor uploaded = at::empty(
+            {kCudaExpertSpan},
+            at::TensorOptions().dtype(at::kByte).device(device));
+        try {
+          uploaded.copy_(batch_stage[i], true);
+          ready->record(stream);
+        } catch (...) {
+          // `copy_` may have submitted DMA before reporting a later failure;
+          // no slab may be reused or destroyed until that work has drained.
+          static_cast<void>(cudaStreamSynchronize(stream.stream()));
+          throw;
+        }
+        batch_ready[i] = ready;
+        Resident resident{std::move(uploaded), std::move(ready)};
+        admit_lru(slot, missing_ids[begin + i], resident);
+        out.push_back(std::move(resident));
+      }
+    }
+    return out;
+  }
+
+  Resident planned_resident_prestaged(
+      Plan& plan, const std::uint16_t expert,
+      const std::span<const std::uint16_t> missing_ids,
+      const std::vector<Resident>& prestaged) {
+    const auto hit_found = std::find_if(
+        plan.hits.begin(), plan.hits.end(), [expert](const Entry& entry) {
+          return entry.expert == expert;
+        });
+    if (hit_found != plan.hits.end()) {
+      return hit_found->resident;
+    }
+    if (Resident* live = hit(plan.layer_index, expert); live != nullptr) {
+      // Admitted after the plan was taken (arrival-driven execution).
+      return *live;
+    }
+    const auto found =
+        std::lower_bound(missing_ids.begin(), missing_ids.end(), expert);
+    if (found == missing_ids.end() || *found != expert) {
+      throw std::invalid_argument(
+          "CUDA planned execution requested an expert outside its residency plan");
+    }
+    const std::size_t index =
+        static_cast<std::size_t>(found - missing_ids.begin());
+    if (index >= prestaged.size()) {
+      throw std::logic_error("CUDA prestaged residents lost a planned miss");
+    }
+    return prestaged[index];
   }
 
   Resident planned_resident(
@@ -866,6 +998,10 @@ struct CudaMoeExpertCache::Impl {
         });
     if (hit_found != plan.hits.end()) {
       return hit_found->resident;
+    }
+    if (Resident* live = hit(plan.layer_index, expert); live != nullptr) {
+      // Admitted after the plan was taken (arrival-driven execution).
+      return *live;
     }
     if (!std::binary_search(plan.canonical_experts.begin(),
                             plan.canonical_experts.end(), expert)) {
@@ -932,12 +1068,12 @@ struct CudaMoeExpertCache::Impl {
         ++report.skipped_full;
         continue;
       }
-      if (pinned) {
-        // A pinned seed outranks any LRU resident, never another pin.
-        while (resident_entries + pinned_entries >= capacity &&
-               resident_entries != 0) {
-          evict_global_lru();
-        }
+      // A pinned seed outranks any LRU resident, never another pin. An
+      // unpinned admission is an ordinary miss arriving early (arrival-driven
+      // execution), so it evicts exactly as `resident()` would.
+      while (resident_entries + pinned_entries >= capacity &&
+             resident_entries != 0) {
+        evict_global_lru();
       }
       if (resident_entries + pinned_entries >= capacity) {
         ++report.skipped_full;
@@ -975,6 +1111,10 @@ struct CudaMoeExpertCache::Impl {
   std::array<at::Tensor, kStageSlots> pinned_stage;
   std::array<std::shared_ptr<CudaReadyEvent>, kStageSlots> stage_ready;
   std::size_t stage_cursor = 0;
+  /* Planned-miss staging pool: one pinned slab per routed expert. */
+  static constexpr std::size_t kBatchSlots = kMoeRouteTopK;
+  std::array<at::Tensor, kBatchSlots> batch_stage;
+  std::array<std::shared_ptr<CudaReadyEvent>, kBatchSlots> batch_ready;
   std::uint64_t use_clock = 0;
   std::size_t resident_entries = 0;
   std::size_t pinned_entries = 0;
@@ -1134,10 +1274,12 @@ at::Tensor CudaMoeExpertCache::execute_positions_plan_t1(
   std::vector<std::uint16_t> expected_missing;
   expected_missing.reserve(plan.canonical_experts.size());
   for (const std::uint16_t expert : plan.canonical_experts) {
+    // A planned hit, or an expert admitted to the cache after the plan was
+    // taken (arrival-driven execution), needs no source bytes.
     const bool hit = std::any_of(
         plan.hits.begin(), plan.hits.end(), [expert](const Impl::Entry& entry) {
           return entry.expert == expert;
-        });
+        }) || impl_->hit(plan.layer_index, expert) != nullptr;
     if (!hit) {
       expected_missing.push_back(expert);
     }
@@ -1205,6 +1347,20 @@ at::Tensor CudaMoeExpertCache::execute_positions_plan_t1(
     at::Tensor expert_outputs = at::empty(
         {positions * static_cast<std::int64_t>(kMoeRouteTopK), kCudaHidden},
         float_options);
+    // K3_CUDA_PRESTAGE=1|on stages every planned miss before the first tile
+    // (parallel host copies, back-to-back DMAs). Measured slower on kpai
+    // 2026-10-30 (5.42 vs 5.05 s/token): it removes the per-expert memcpy/DMA
+    // overlap and holds the first kernel behind the whole batch, so it is
+    // opt-in; the default keeps the per-expert path below.
+    static const bool prestage_enabled = [] {
+      const char* raw = std::getenv("K3_CUDA_PRESTAGE");
+      return raw != nullptr &&
+          (std::strcmp(raw, "1") == 0 || std::strcmp(raw, "on") == 0);
+    }();
+    const std::vector<Impl::Resident> prestaged = prestage_enabled
+        ? impl_->prestage_misses(plan.layer_index, missing_experts.expert_ids,
+                                 missing_experts.expert_major_bytes)
+        : std::vector<Impl::Resident>{};
 
     for (const std::uint16_t expert : plan.canonical_experts) {
       std::vector<std::int64_t> token_indices;
@@ -1222,9 +1378,11 @@ at::Tensor CudaMoeExpertCache::execute_positions_plan_t1(
         throw std::logic_error(
             "validated CUDA residency plan lost a routed expert");
       }
-      const Impl::Resident resident = impl_->planned_resident(
-          plan, expert, missing_experts.expert_ids,
-          missing_experts.expert_major_bytes);
+      const Impl::Resident resident = prestaged.empty()
+          ? impl_->planned_resident(plan, expert, missing_experts.expert_ids,
+                                    missing_experts.expert_major_bytes)
+          : impl_->planned_resident_prestaged(
+                plan, expert, missing_experts.expert_ids, prestaged);
       resident.ready->wait(stream);
       const at::Tensor tokens = owned_cpu_tensor(
           token_indices,

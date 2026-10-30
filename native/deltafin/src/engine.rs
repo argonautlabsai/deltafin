@@ -157,6 +157,8 @@ fn phase_trace_demand(begin: f64, end: f64) {
 
 const EXPERT_PREFETCH_MAX_EXPERTS: usize = 2 * K3_EXPERT_TOP_K;
 const EXPERT_PREFETCH_GENERATIONS: usize = 2;
+/// Arena slots of the CUDA arrival pool: two layers of per-expert tickets.
+const CUDA_ARRIVAL_ARENA_SLOTS: usize = 40;
 const EXPERT_PREFETCH_LIVE_SLOTS: usize = EXPERT_PREFETCH_GENERATIONS * EXPERT_PREFETCH_MAX_EXPERTS;
 const EXPERT_PREFETCH_ARENA_SLOTS: usize = EXPERT_PREFETCH_LIVE_SLOTS + 1;
 /// The provider route ABI currently admits at most 64 positions.  Keeping the
@@ -1303,6 +1305,10 @@ pub struct NativeTargetEngine {
     experts: RawExpertCorpus,
     expert_reader: Reader,
     expert_prefetch_reader: Option<Reader>,
+    /// CUDA arrival-driven admission (K3_CUDA_ARRIVAL_ADMIT=1): a dedicated
+    /// demand pool whose per-expert tickets let every planned miss upload the
+    /// moment it lands instead of after the whole union has been read.
+    cuda_arrival_reader: Option<Reader>,
     /// Resolved prefetch-pool worker policy (configured override or the
     /// demand pool's count) — the fail-closed startup invariant checks the
     /// live reader against this, not against the demand pool.
@@ -1650,10 +1656,13 @@ impl NativeTargetEngine {
         // owned cache plan and requires one contiguous miss slab, so the
         // scattered host-span path is intentionally limited to CPU/Metal.
         let expert_prefetch_enabled = experts.lazy_missing_files() == 0
-            && matches!(
+            && (matches!(
                 expert_backend,
                 ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
-            );
+            ) || (matches!(
+                expert_backend,
+                ResolvedExpertBackend::Cuda | ResolvedExpertBackend::CudaAuto
+            ) && cuda_pilot_enabled()));
         let expert_prefetch_workers = config
             .expert_prefetch_threads
             .map_or(expert_reader_workers, |workers| {
@@ -1670,6 +1679,18 @@ impl NativeTargetEngine {
                     true,
                 )
             })
+            .transpose()?;
+        // CUDA arrival-driven admission: a dedicated demand pool with enough
+        // arena slots for two layers of per-expert tickets. Each planned miss
+        // is read as its own ticket and admitted to the device cache as soon
+        // as it lands, so the host->device upload of expert i overlaps the
+        // reads of experts i+1.. instead of waiting for the whole union
+        // (kpai 2026-10-30: reads 3.1 s + uploads 1.75 s per token, serial).
+        let cuda_arrival_reader = (matches!(
+            expert_backend,
+            ResolvedExpertBackend::Cuda | ResolvedExpertBackend::CudaAuto
+        ) && cuda_arrival_admit_enabled())
+            .then(|| Reader::with_arena_capacity(expert_reader_workers, CUDA_ARRIVAL_ARENA_SLOTS))
             .transpose()?;
         // The gate governs only speculative reads, so it exists exactly when
         // the speculative reader does; `K3_PILOT_GATE=off` keeps the legacy
@@ -2044,6 +2065,7 @@ impl NativeTargetEngine {
             experts,
             expert_reader,
             expert_prefetch_reader,
+            cuda_arrival_reader,
             expert_prefetch_workers,
             pilot_gate,
             expert_heat,
@@ -2275,10 +2297,13 @@ impl NativeTargetEngine {
             ));
         }
         let prefetch_expected = self.experts.lazy_missing_files() == 0
-            && matches!(
+            && (matches!(
                 self.expert_backend,
                 ResolvedExpertBackend::Cpu | ResolvedExpertBackend::Metal
-            );
+            ) || (matches!(
+                self.expert_backend,
+                ResolvedExpertBackend::Cuda | ResolvedExpertBackend::CudaAuto
+            ) && cuda_pilot_enabled()));
         if self.expert_prefetch_reader.is_some() != prefetch_expected
             || self
                 .expert_prefetch_reader
@@ -2774,6 +2799,7 @@ impl NativeTargetEngine {
             &self.experts,
             &self.expert_reader,
             self.expert_prefetch_reader.as_ref(),
+            self.cuda_arrival_reader.as_ref(),
             self.pilot_gate.as_mut(),
             &self.expert_heat,
             self.expert_pin_tier.as_ref(),
@@ -6174,6 +6200,7 @@ fn execute_target_sequence(
     experts: &RawExpertCorpus,
     expert_reader: &Reader,
     expert_prefetch_reader: Option<&Reader>,
+    cuda_arrival_reader: Option<&Reader>,
     mut pilot_gate: Option<&mut PilotGate>,
     expert_heat: &ExpertHeat,
     expert_pin_tier: Option<&ExpertPinTier>,
@@ -6288,6 +6315,8 @@ fn execute_target_sequence(
                         experts,
                         expert_reader,
                         expert_prefetch_reader,
+                        cuda_arrival_reader,
+                        provider,
                         &mut pending_expert_prefetch,
                         oracle_step,
                         &mut oracle_pending,
@@ -9206,6 +9235,8 @@ fn finish_expert_mailbox(
     experts: &RawExpertCorpus,
     expert_reader: &Reader,
     expert_prefetch_reader: Option<&Reader>,
+    cuda_arrival_reader: Option<&Reader>,
+    provider: &NativeProviderSession,
     pending_expert_prefetch: &mut Option<ExpertPrefetchSet>,
     oracle_step: Option<u64>,
     oracle_pending: &mut Vec<ExpertPrefetchSet>,
@@ -9557,7 +9588,9 @@ fn finish_expert_mailbox(
             backend,
             TargetExpertBackend::Auto | TargetExpertBackend::Cuda
         ) {
-            if expert_prefetch_reader.is_some() || pending_expert_prefetch.is_some() {
+            if (expert_prefetch_reader.is_some() || pending_expert_prefetch.is_some())
+                && !cuda_pilot_enabled()
+            {
                 return Err(DeltafinError::new(
                     "CUDA expert planning cannot share the scattered host-prefetch path",
                 ));
@@ -9568,7 +9601,7 @@ fn finish_expert_mailbox(
                 ));
             }
             let planning_started = profile.as_ref().map(|_| Instant::now());
-            let plan = sequence.plan_expert_tile(
+            let mut plan = sequence.plan_expert_tile(
                 mailbox,
                 tile.first_row,
                 tile.row_count,
@@ -9592,16 +9625,77 @@ fn finish_expert_mailbox(
             }
             let read_started = profile.as_ref().map(|_| Instant::now());
             let demand_begin = mono_raw_seconds();
-            let misses = if plan.missing_experts().is_empty() {
+            // Arrival-driven admission (K3_CUDA_ARRIVAL_ADMIT=1): one ticket per
+            // planned miss on the dedicated pool; each is admitted to the device
+            // cache as it lands, so its upload overlaps the remaining reads.
+            // Misses the pool could not take (arena full) fall back to the
+            // ordinary contiguous union below and execute as the plan's miss
+            // batch; the admitted ones resolve as live cache hits.
+            let mut remaining_misses: Vec<u16> = plan.missing_experts().to_vec();
+            let planned_miss_count = remaining_misses.len();
+            // K3_CUDA_PILOT=1: speculative tickets submitted at the previous
+            // layer from the provider's route hint are admitted to the device
+            // cache as they land; mispredicted tickets are cancelled. Whatever
+            // the hint did not cover falls through to the arrival pool / the
+            // demand union below.
+            if let Some(due) = take_due_expert_prefetch(pending_expert_prefetch, mailbox.layer_index())
+            {
+                if due.target_layer == mailbox.layer_index() && !remaining_misses.is_empty() {
+                    let mut wanted = Vec::new();
+                    let mut unwanted = Vec::new();
+                    for (expert, ticket) in due.tickets {
+                        if remaining_misses.binary_search(&expert).is_ok() {
+                            wanted.push((expert, ticket));
+                        } else {
+                            unwanted.push((expert, ticket));
+                        }
+                    }
+                    cancel_and_drain_prefetch_tickets(unwanted);
+                    admit_cuda_tickets_as_they_land(
+                        provider,
+                        mailbox.layer_index(),
+                        wanted,
+                        &mut remaining_misses,
+                    )?;
+                } else {
+                    due.cancel_and_drain();
+                }
+            }
+            // Arrival-driven admission (K3_CUDA_ARRIVAL_ADMIT=1): one ticket per
+            // remaining miss on the dedicated pool, admitted in completion order.
+            if let Some(arrival) = cuda_arrival_reader {
+                if !remaining_misses.is_empty() {
+                    let layer = mailbox.layer_index();
+                    let mut tickets = Vec::with_capacity(remaining_misses.len());
+                    let mut deferred = Vec::new();
+                    for &expert in &remaining_misses {
+                        match experts.try_submit_union_with_priority(
+                            arrival,
+                            layer,
+                            &[expert],
+                            crate::storage::ReadPriority::Demand,
+                        )? {
+                            Some(ticket) => tickets.push((expert, ticket)),
+                            None => deferred.push(expert),
+                        }
+                    }
+                    admit_cuda_tickets_as_they_land(provider, layer, tickets, &mut remaining_misses)?;
+                    debug_assert_eq!(remaining_misses, deferred);
+                }
+            }
+            if remaining_misses.len() != planned_miss_count {
+                plan.narrow_missing_experts(&remaining_misses)?;
+            }
+            let misses = if remaining_misses.is_empty() {
                 None
             } else {
                 let batch = experts.read_union(
                     expert_reader,
                     mailbox.layer_index(),
-                    plan.missing_experts(),
+                    &remaining_misses,
                 )?;
                 if batch.layer() != mailbox.layer_index()
-                    || batch.expert_ids() != plan.missing_experts()
+                    || batch.expert_ids() != remaining_misses.as_slice()
                     || batch.layout() != ExpertStorageLayout::RawV1
                 {
                     return Err(DeltafinError::new(
@@ -9623,14 +9717,47 @@ fn finish_expert_mailbox(
                 profile.expert_demand_read_ns =
                     profile.expert_demand_read_ns.saturating_add(elapsed);
             }
+            // K3_CUDA_PILOT=1: at the layer's final tile take the provider's
+            // next-layer route hint and submit its speculative reads on the
+            // prefetch pool, so they run under this layer's upload and compute.
+            if cuda_pilot_enabled() {
+                if let Some(reader) = expert_prefetch_reader {
+                    let final_tile = first_row
+                        .checked_add(tile.row_count)
+                        .is_some_and(|end| end == mailbox.position_count());
+                    if final_tile && pending_expert_prefetch.is_none() {
+                        let hint_started = profile.as_ref().map(|_| Instant::now());
+                        let next_hint = sequence.take_prefetch_hint()?;
+                        let next_plan = next_hint.as_ref().and_then(|hint| {
+                            ExpertPrefetchPlan::new(hint.target_layer(), hint.expert_ids())
+                        });
+                        let next_plan = match pilot_gate.as_deref_mut() {
+                            Some(gate) => gate.admit(mailbox.layer_index(), next_plan),
+                            None => next_plan,
+                        };
+                        if let Some(next_plan) = next_plan {
+                            *pending_expert_prefetch =
+                                try_schedule_expert_prefetch(experts, reader, next_plan);
+                        }
+                        add_profile_elapsed(profile.as_deref_mut(), hint_started, |profile| {
+                            &mut profile.expert_hint_ns
+                        });
+                    }
+                }
+            }
             let kernel_started = profile.as_ref().map(|_| Instant::now());
-            sequence.finish_planned_expert_tile(
+            if let Err(error) = sequence.finish_planned_expert_tile(
                 mailbox,
                 plan,
                 misses
                     .as_ref()
                     .map_or(&[][..], |batch| batch.buffers().other()),
-            )?;
+            ) {
+                if let Some(prefetch) = pending_expert_prefetch.take() {
+                    prefetch.cancel_and_drain();
+                }
+                return Err(error);
+            }
             add_profile_elapsed(profile.as_deref_mut(), kernel_started, |profile| {
                 &mut profile.expert_kernel_ns
             });
@@ -10153,6 +10280,69 @@ fn prefill_fanout_max() -> usize {
             .and_then(|value| value.parse::<usize>().ok())
             .map_or(96, |value| value.clamp(16, 120))
     })
+}
+
+/// K3_CUDA_ARRIVAL_ADMIT=1|on: per-expert tickets admitted to the CUDA cache
+/// as they land (see `cuda_arrival_reader`). Default off until measured.
+fn cuda_arrival_admit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("K3_CUDA_ARRIVAL_ADMIT")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true"))
+    })
+}
+
+/// K3_CUDA_PILOT=1|on: the CUDA plan path takes the provider's next-layer
+/// route hint at each layer's final tile, submits those reads on the prefetch
+/// pool, and admits them to the device cache as they land at the next layer.
+fn cuda_pilot_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("K3_CUDA_PILOT")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true"))
+    })
+}
+
+/// Wait per-expert read tickets in completion order and admit each expert to
+/// the CUDA cache the moment it lands, removing it from `remaining` (which
+/// stays sorted). A slow ticket never holds the uploads of experts already
+/// read.
+fn admit_cuda_tickets_as_they_land(
+    provider: &NativeProviderSession,
+    layer: u32,
+    tickets: Vec<(u16, crate::experts::ExpertUnionReadTicket)>,
+    remaining: &mut Vec<u16>,
+) -> Result<()> {
+    let mut pending = tickets;
+    while !pending.is_empty() {
+        let mut progressed = false;
+        let mut index = 0;
+        while index < pending.len() {
+            if !pending[index].1.is_ready() {
+                index += 1;
+                continue;
+            }
+            let (expert, ticket) = pending.swap_remove(index);
+            let batch = ticket.wait()?;
+            if batch.layer() != layer
+                || batch.expert_ids() != &[expert][..]
+                || batch.layout() != ExpertStorageLayout::RawV1
+            {
+                return Err(DeltafinError::new(
+                    "CUDA ticket reader returned a stale layer, expert, or layout",
+                ));
+            }
+            provider.admit_cuda_experts(layer, &[expert], batch.buffers().other(), false)?;
+            if let Ok(position) = remaining.binary_search(&expert) {
+                remaining.remove(position);
+            }
+            progressed = true;
+        }
+        if !progressed {
+            std::thread::sleep(std::time::Duration::from_micros(150));
+        }
+    }
+    Ok(())
 }
 
 fn pilot_early_enabled() -> bool {
