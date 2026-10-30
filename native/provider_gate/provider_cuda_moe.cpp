@@ -1,5 +1,6 @@
 #include "provider_cuda_moe.h"
 
+#include <ATen/Context.h>
 #include <ATen/ops/cat.h>
 #include <c10/core/InferenceMode.h>
 
@@ -1513,6 +1514,11 @@ CudaProviderMemorySnapshot cuda_provider_memory_snapshot(
     throw std::invalid_argument(
         "CUDA memory snapshot requires an indexed CUDA device");
   }
+  // ATen creates the CUDA caching allocator lazily on first device use. The
+  // engine takes its first memory snapshot before any device tensor exists,
+  // so initialise the device here (idempotent); otherwise getDeviceStats
+  // throws "Invalid device argument 0: did you call init?".
+  at::globalContext().lazyInitDevice(c10::DeviceType::CUDA);
   const c10::cuda::CUDAGuard guard(device);
   if (trim_unused) {
     // The caller proves that its provider session is between transactions.
