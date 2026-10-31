@@ -3359,7 +3359,7 @@ fn open_catalog_tier(
         openat(
             directory.as_raw_fd(),
             source.as_c_str().as_ptr(),
-            open_cloexec_nofollow(),
+            expert_source_open_flags(),
         )
     };
     EXPERT_OPEN_NS.fetch_add(open_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -5437,6 +5437,27 @@ const fn open_cloexec_nofollow() -> i32 {
     libc::O_CLOEXEC | libc::O_NOFOLLOW
 }
 
+/// K3_EXPERT_ODIRECT=1|on (Linux): expert source files are opened O_DIRECT so
+/// a landed slab is DMA'd by the disk straight into the (page-locked) read
+/// arena, with no page-cache copy on the reader thread. Every expert read is
+/// a whole file or a BUFFER_ALIGNMENT-rounded chunk of one into an aligned
+/// slab, which satisfies the 4 KiB O_DIRECT contract; the page cache (and
+/// its incidental hits) is bypassed. Directory opens never use it.
+fn expert_source_open_flags() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        static DIRECT: OnceLock<bool> = OnceLock::new();
+        let direct = *DIRECT.get_or_init(|| {
+            std::env::var("K3_EXPERT_ODIRECT")
+                .is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true"))
+        });
+        if direct {
+            return open_cloexec_nofollow() | libc::O_DIRECT;
+        }
+    }
+    open_cloexec_nofollow()
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("Deltafin native storage currently supports macOS and Linux");
 
@@ -6152,7 +6173,7 @@ fn open_deferred_catalog_source(
             continue;
         };
         descriptor = unsafe {
-            openat(dir_fd, source.as_c_str().as_ptr(), open_cloexec_nofollow())
+            openat(dir_fd, source.as_c_str().as_ptr(), expert_source_open_flags())
         };
         if descriptor >= 0 {
             served = dev;
@@ -6279,7 +6300,7 @@ fn open_catalog_home(
             openat(
                 directory.as_raw_fd(),
                 source.as_c_str().as_ptr(),
-                open_cloexec_nofollow(),
+                expert_source_open_flags(),
             )
         };
         if descriptor >= 0 {
