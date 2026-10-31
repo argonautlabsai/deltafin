@@ -521,8 +521,7 @@ at::Tensor row_int8_linear(const at::Tensor& input,
     // changing arithmetic after routing would make diagnosis impossible.
     deltafin::provider_internal::loop_residency_register_tensor(matrix.quantized);
     deltafin::provider_internal::loop_residency_register_tensor(matrix.row_scales);
-    return at::_weight_int8pack_mm(input, matrix.quantized,
-                                   matrix.row_scales);
+    return cuda_int8_linear(input, matrix.quantized, matrix.row_scales);
   }
   if (matrix.original_bf16.defined()) {
     return original_bf16_linear(input, matrix.original_bf16);

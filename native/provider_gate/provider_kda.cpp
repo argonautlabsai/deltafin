@@ -1,4 +1,5 @@
 #include "provider_kda.h"
+#include "provider_cuda_moe.h"
 
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/conv1d.h>
@@ -205,8 +206,8 @@ at::Tensor packed_linear(const at::Tensor& hidden,
   if (!projection.scale.defined()) {
     return at::linear(hidden, projection.weight, std::nullopt);
   }
-  return at::_weight_int8pack_mm(hidden, projection.weight,
-                                 projection.scale);
+  return deltafin::provider_internal::cuda_int8_linear(
+      hidden, projection.weight, projection.scale);
 }
 
 template <std::size_t Size>

@@ -2,6 +2,7 @@
 
 #include <ATen/Context.h>
 #include <ATen/Parallel.h>
+#include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/cat.h>
 #include <c10/core/InferenceMode.h>
 
@@ -11,12 +12,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,6 +52,9 @@ int k3_cuda_mxfp4_gemv(const std::uint8_t* packed,
 int k3_cuda_moe_launch(const std::uint8_t* expert_span, const float* x,
                        int batches, float* gate, float* up,
                        float* expert_output, void* stream_pointer);
+int k3_cuda_int8_gemv(const std::int8_t* weights, const float* scales,
+                      const float* x, float* output, int rows, int cols,
+                      int batches, void* stream_pointer);
 }
 #endif
 
@@ -190,6 +196,20 @@ at::Tensor CudaMoeExpertCache::execute_positions_plan_t1(
 }
 
 bool cuda_moe_compiled() noexcept { return false; }
+
+at::Tensor cuda_int8_linear(const at::Tensor& input, const at::Tensor& weight,
+                            const at::Tensor& scales) {
+  return at::_weight_int8pack_mm(input, weight, scales);
+}
+
+extern "C" int32_t deltafin_provider_cuda_host_alloc_v1(uint64_t, void** out) {
+  if (out != nullptr) {
+    *out = nullptr;
+  }
+  return 3;
+}
+
+extern "C" void deltafin_provider_cuda_host_free_v1(void*) {}
 
 #else
 
@@ -791,12 +811,106 @@ struct CudaMoeExpertCache::Impl {
     return found->second;
   }
 
+  // K3_CUDA_DIRECT_DMA=1|on (kpai 2026-10-31): DMA straight from the caller's
+  // slab instead of staging it through a pinned slab first. The staging
+  // memcpy (~1.5 ms per 17.5 MB expert) runs on the engine thread, so with
+  // arrival-driven admission a 16-expert layer spends ~24 ms admitting while
+  // its reads need ~14 ms. The caller's slab is page-locked on first sight
+  // (cudaHostRegister, cached by base pointer, bounded) and the copy is
+  // waited for before returning because the caller recycles the slab on
+  // return. Default off; unregisterable memory falls back to the staging path.
+  // K3_CUDA_STAGE_PARALLEL=N (1..16, default 1 = upstream): copy each
+  // expert into its pinned staging slab as N chunks on the intra-op pool.
+  // The single-thread memcpy is ~1.2 ms per 17.5 MB expert on kpai and
+  // runs on the engine thread, serialising arrival-driven admission.
+  static std::size_t stage_parallel_chunks() {
+    static const std::size_t chunks = [] {
+      const char* raw = std::getenv("K3_CUDA_STAGE_PARALLEL");
+      if (raw == nullptr) {
+        return static_cast<std::size_t>(1);
+      }
+      const long value = std::strtol(raw, nullptr, 10);
+      if (value < 1) {
+        return static_cast<std::size_t>(1);
+      }
+      return static_cast<std::size_t>(value > 16 ? 16 : value);
+    }();
+    return chunks;
+  }
+
+  static bool direct_dma_enabled() {
+    static const bool enabled = [] {
+      const char* raw = std::getenv("K3_CUDA_DIRECT_DMA");
+      if (raw == nullptr) {
+        return false;
+      }
+      const std::string value(raw);
+      return value == "1" || value == "on" || value == "true";
+    }();
+    return enabled;
+  }
+
+  bool source_page_locked(const std::uint8_t* source,
+                          const std::size_t) {
+    if (registered_sources.count(source) != 0) {
+      return true;
+    }
+    // Only memory the CUDA runtime itself page-locked (cudaHostAlloc through
+    // deltafin_provider_cuda_host_alloc_v1) qualifies: registering foreign
+    // memory with cudaHostRegister collides with the LibTorch allocator on
+    // this driver (kpai 2026-10-31: "resource already mapped").
+    cudaPointerAttributes attributes{};
+    const cudaError_t status = cudaPointerGetAttributes(
+        &attributes, static_cast<const void*>(source));
+    if (status != cudaSuccess) {
+      static_cast<void>(cudaGetLastError());
+      return false;
+    }
+    if (attributes.type != cudaMemoryTypeHost) {
+      return false;
+    }
+    if (registered_sources.empty()) {
+      std::fputs("[native] CUDA direct expert DMA: on (reader slabs are page-locked)\n", stderr);
+    }
+    if (registered_sources.size() < kMaxRegisteredSources) {
+      registered_sources.insert(source);
+    }
+    return true;
+  }
+
+  Resident upload_direct(const std::uint8_t* source,
+                         const std::size_t source_bytes) {
+    const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
+    auto ready = std::make_shared<CudaReadyEvent>();
+    at::Tensor uploaded = at::empty(
+        {kCudaExpertSpan},
+        at::TensorOptions().dtype(at::kByte).device(device));
+    const cudaError_t status = cudaMemcpyAsync(
+        uploaded.data_ptr<std::uint8_t>(), source, source_bytes,
+        cudaMemcpyHostToDevice, stream.stream());
+    if (status != cudaSuccess) {
+      static_cast<void>(cudaStreamSynchronize(stream.stream()));
+      static_cast<void>(cudaGetLastError());
+      throw std::runtime_error(
+          std::string("cudaMemcpyAsync (direct expert DMA) failed: ") +
+          cudaGetErrorString(status));
+    }
+    ready->record(stream);
+    // The caller recycles its slab as soon as this returns.
+    ready->synchronize();
+    ++direct_uploads;
+    return Resident{std::move(uploaded), std::move(ready)};
+  }
+
   Resident upload(const std::uint8_t* source,
                   const std::size_t source_bytes) {
     if (source == nullptr ||
         source_bytes != static_cast<std::size_t>(kCudaExpertSpan)) {
       throw std::invalid_argument(
           "CUDA expert source does not have the exact raw-v1 span");
+    }
+    if (direct_dma_enabled() && source_page_locked(source, source_bytes)) {
+      return upload_direct(source, source_bytes);
     }
     // Two pinned slabs alternate so this host memcpy overlaps the previous
     // expert's still-running DMA instead of serializing every miss behind
@@ -821,7 +935,25 @@ struct CudaMoeExpertCache::Impl {
             "CUDA expert staging allocation is not pinned");
       }
     }
-    std::memcpy(pinned.data_ptr<std::uint8_t>(), source, source_bytes);
+    const std::size_t chunks = stage_parallel_chunks();
+    if (chunks > 1) {
+      const std::size_t chunk = (source_bytes + chunks - 1) / chunks;
+      std::uint8_t* destination = pinned.data_ptr<std::uint8_t>();
+      at::parallel_for(
+          0, static_cast<std::int64_t>(chunks), 1,
+          [&](const std::int64_t lo, const std::int64_t hi) {
+            for (std::int64_t i = lo; i < hi; ++i) {
+              const std::size_t begin = static_cast<std::size_t>(i) * chunk;
+              if (begin >= source_bytes) {
+                continue;
+              }
+              const std::size_t length = std::min(chunk, source_bytes - begin);
+              std::memcpy(destination + begin, source + begin, length);
+            }
+          });
+    } else {
+      std::memcpy(pinned.data_ptr<std::uint8_t>(), source, source_bytes);
+    }
     const auto stream = c10::cuda::getCurrentCUDAStream(device.index());
     auto ready = std::make_shared<CudaReadyEvent>();
     at::Tensor uploaded = at::empty(
@@ -1107,10 +1239,14 @@ struct CudaMoeExpertCache::Impl {
   std::size_t capacity = 0;
   CudaMoeCachePolicy policy;
   std::string reason = "CUDA MXFP4 capability has not been checked";
-  static constexpr std::size_t kStageSlots = 2;
+  static constexpr std::size_t kStageSlots = 4;
   std::array<at::Tensor, kStageSlots> pinned_stage;
   std::array<std::shared_ptr<CudaReadyEvent>, kStageSlots> stage_ready;
   std::size_t stage_cursor = 0;
+  /* K3_CUDA_DIRECT_DMA: caller slabs page-locked on first sight (bounded). */
+  static constexpr std::size_t kMaxRegisteredSources = 512;
+  std::unordered_set<const void*> registered_sources;
+  std::uint64_t direct_uploads = 0;
   /* Planned-miss staging pool: one pinned slab per routed expert. */
   static constexpr std::size_t kBatchSlots = kMoeRouteTopK;
   std::array<at::Tensor, kBatchSlots> batch_stage;
@@ -1362,6 +1498,117 @@ at::Tensor CudaMoeExpertCache::execute_positions_plan_t1(
                                  missing_experts.expert_major_bytes)
         : std::vector<Impl::Resident>{};
 
+    // K3_CUDA_TILE_FASTPATH=0 restores the per-expert path below (two
+    // synchronous host->device index uploads, three allocations and two
+    // gather/scatter kernels per expert). The default fast path (kpai
+    // 2026-10-31) keeps the same kernels and the same bytes: for a
+    // single-position tile every expert takes `inputs` directly and writes
+    // its routed output row in place; multi-position tiles upload all index
+    // tensors once per tile. Scratch is reused across experts because every
+    // launch sits on one in-order stream.
+    static const bool tile_fastpath = [] {
+      const char* raw = std::getenv("K3_CUDA_TILE_FASTPATH");
+      return raw == nullptr ||
+          (std::strcmp(raw, "0") != 0 && std::strcmp(raw, "off") != 0);
+    }();
+    if (tile_fastpath) {
+      struct ExpertRoutes {
+        std::vector<std::int64_t> tokens;
+        std::vector<std::int64_t> routes;
+      };
+      std::vector<ExpertRoutes> per_expert(plan.canonical_experts.size());
+      std::size_t max_batches = 0;
+      std::vector<std::int64_t> all_tokens;
+      std::vector<std::int64_t> all_routes;
+      std::vector<std::int64_t> offsets(plan.canonical_experts.size() + 1, 0);
+      for (std::size_t index = 0; index < plan.canonical_experts.size(); ++index) {
+        const std::uint16_t expert = plan.canonical_experts[index];
+        ExpertRoutes& entry = per_expert[index];
+        for (std::size_t row = 0; row < prepared_rows.size(); ++row) {
+          for (std::size_t edge = 0; edge < kMoeRouteTopK; ++edge) {
+            if (prepared_rows[row]->route.expert_ids[edge] == expert) {
+              entry.tokens.push_back(static_cast<std::int64_t>(row));
+              entry.routes.push_back(static_cast<std::int64_t>(
+                  row * kMoeRouteTopK + edge));
+            }
+          }
+        }
+        if (entry.tokens.empty()) {
+          throw std::logic_error(
+              "validated CUDA residency plan lost a routed expert");
+        }
+        max_batches = std::max(max_batches, entry.tokens.size());
+        all_tokens.insert(all_tokens.end(), entry.tokens.begin(), entry.tokens.end());
+        all_routes.insert(all_routes.end(), entry.routes.begin(), entry.routes.end());
+        offsets[index + 1] = static_cast<std::int64_t>(all_tokens.size());
+      }
+      const bool single_position = positions == 1;
+      at::Tensor tokens_device;
+      at::Tensor routes_device;
+      if (!single_position) {
+        tokens_device = owned_cpu_tensor(
+            all_tokens, {static_cast<std::int64_t>(all_tokens.size())}, at::kLong)
+            .to(impl_->device, at::kLong, false, true);
+        routes_device = owned_cpu_tensor(
+            all_routes, {static_cast<std::int64_t>(all_routes.size())}, at::kLong)
+            .to(impl_->device, at::kLong, false, true);
+      }
+      at::Tensor gate_scratch = at::empty(
+          {static_cast<std::int64_t>(max_batches), kCudaIntermediate}, float_options);
+      at::Tensor up_scratch = at::empty_like(gate_scratch);
+      at::Tensor output_scratch = single_position
+          ? at::Tensor()
+          : at::empty({static_cast<std::int64_t>(max_batches), kCudaHidden}, float_options);
+      for (std::size_t index = 0; index < plan.canonical_experts.size(); ++index) {
+        const std::uint16_t expert = plan.canonical_experts[index];
+        const ExpertRoutes& entry = per_expert[index];
+        const std::int64_t batches = static_cast<std::int64_t>(entry.tokens.size());
+        const Impl::Resident resident = prestaged.empty()
+            ? impl_->planned_resident(plan, expert, missing_experts.expert_ids,
+                                      missing_experts.expert_major_bytes)
+            : impl_->planned_resident_prestaged(
+                  plan, expert, missing_experts.expert_ids, prestaged);
+        resident.ready->wait(stream);
+        record_stream(resident.bytes, stream);
+        at::Tensor expert_input;
+        at::Tensor batch_output;
+        if (single_position) {
+          // One routed position: the expert reads the tile input as it is
+          // and its single output row is the routed slot itself.
+          expert_input = inputs;
+          batch_output = expert_outputs.narrow(0, entry.routes[0], 1);
+        } else {
+          const at::Tensor tokens =
+              tokens_device.narrow(0, offsets[index], batches);
+          expert_input = inputs.index_select(0, tokens).contiguous();
+          batch_output = output_scratch.narrow(0, 0, batches);
+          record_stream(expert_input, stream);
+        }
+        const at::Tensor gate = gate_scratch.narrow(0, 0, batches);
+        const at::Tensor up = up_scratch.narrow(0, 0, batches);
+        const int status = k3_cuda_moe_launch(
+            resident.bytes.const_data_ptr<std::uint8_t>(),
+            expert_input.const_data_ptr<float>(), static_cast<int>(batches),
+            gate.data_ptr<float>(), up.data_ptr<float>(),
+            batch_output.data_ptr<float>(), stream_pointer(stream));
+        require_launch("CUDA planned routed expert position batch", status);
+        if (!single_position) {
+          const at::Tensor routes =
+              routes_device.narrow(0, offsets[index], batches);
+          expert_outputs.index_copy_(0, routes, batch_output);
+        }
+      }
+      for (const at::Tensor& tensor : {gate_scratch, up_scratch}) {
+        record_stream(tensor, stream);
+      }
+      if (output_scratch.defined()) {
+        record_stream(output_scratch, stream);
+      }
+      if (tokens_device.defined()) {
+        record_stream(tokens_device, stream);
+        record_stream(routes_device, stream);
+      }
+    } else
     for (const std::uint16_t expert : plan.canonical_experts) {
       std::vector<std::int64_t> token_indices;
       std::vector<std::int64_t> route_indices;
@@ -1661,6 +1908,65 @@ at::Tensor CudaMoeExpertCache::execute_positions_t1(
 }
 
 bool cuda_moe_compiled() noexcept { return true; }
+
+// K3_CUDA_INT8_GEMV=1|on (kpai 2026-10-31): decode-sized (M <= 4) row-int8
+// linears run the fused warp-per-row GEMV in cuda_moe_kernels.cu instead of
+// at::_weight_int8pack_mm. Any shape or launch rejection falls back to ATen.
+at::Tensor cuda_int8_linear(const at::Tensor& input, const at::Tensor& weight,
+                            const at::Tensor& scales) {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("K3_CUDA_INT8_GEMV");
+    return raw != nullptr &&
+        (std::strcmp(raw, "1") == 0 || std::strcmp(raw, "on") == 0);
+  }();
+  if (enabled && input.is_cuda() && weight.is_cuda() && scales.is_cuda() &&
+      input.dim() == 2 && weight.dim() == 2 && scales.dim() == 1 &&
+      input.scalar_type() == at::kFloat && weight.scalar_type() == at::kChar &&
+      scales.scalar_type() == at::kFloat && input.size(0) >= 1 &&
+      input.size(0) <= 4 && input.size(1) == weight.size(1) &&
+      scales.size(0) == weight.size(0) && (weight.size(1) % 512) == 0 &&
+      weight.is_contiguous() && scales.is_contiguous()) {
+    const at::Tensor x = input.contiguous();
+    const c10::cuda::CUDAGuard guard(input.device());
+    const auto stream = c10::cuda::getCurrentCUDAStream(input.device().index());
+    at::Tensor output = at::empty({input.size(0), weight.size(0)}, x.options());
+    const int status = k3_cuda_int8_gemv(
+        weight.const_data_ptr<std::int8_t>(), scales.const_data_ptr<float>(),
+        x.const_data_ptr<float>(), output.data_ptr<float>(),
+        static_cast<int>(weight.size(0)), static_cast<int>(weight.size(1)),
+        static_cast<int>(input.size(0)), stream_pointer(stream));
+    if (status == 0) {
+      return output;
+    }
+  }
+  return at::_weight_int8pack_mm(input, weight, scales);
+}
+
+// Page-locked host memory for read arenas (K3_CUDA_DIRECT_DMA): the engine's
+// arrival reader lands expert bytes here and `upload()` DMAs from the slab
+// without a staging copy. cudaHostAlloc, portable; freed by the paired call.
+extern "C" int32_t deltafin_provider_cuda_host_alloc_v1(const uint64_t bytes,
+                                                        void** out) {
+  if (out == nullptr || bytes == 0) {
+    return 1;
+  }
+  *out = nullptr;
+  const cudaError_t status = cudaHostAlloc(
+      out, static_cast<std::size_t>(bytes), cudaHostAllocPortable);
+  if (status != cudaSuccess) {
+    static_cast<void>(cudaGetLastError());
+    *out = nullptr;
+    return 2;
+  }
+  return 0;
+}
+
+extern "C" void deltafin_provider_cuda_host_free_v1(void* pointer) {
+  if (pointer != nullptr) {
+    static_cast<void>(cudaFreeHost(pointer));
+    static_cast<void>(cudaGetLastError());
+  }
+}
 
 #endif
 

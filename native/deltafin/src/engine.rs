@@ -1668,15 +1668,29 @@ impl NativeTargetEngine {
             .map_or(expert_reader_workers, |workers| {
                 workers.clamp(1, crate::config::MAX_EXPERT_READ_THREADS)
             });
+        // K3_CUDA_DIRECT_DMA=1 on a CUDA backend: pinned prefetch arena, so
+        // pilot tickets are DMA'd from their slab like arrival tickets
+        // (kpai 2026-10-31: with a pageable arena the pilot's hits went back
+        // through the staging memcpy and the pilot lost 0.8 s/token).
+        let pinned_prefetch_arena = matches!(
+            expert_backend,
+            ResolvedExpertBackend::Cuda | ResolvedExpertBackend::CudaAuto
+        ) && cuda_direct_dma_enabled();
+        if pinned_prefetch_arena {
+            crate::storage::install_pinned_host_allocator(
+                crate::provider::pinned_host_allocator(),
+            );
+        }
         let expert_prefetch_reader = expert_prefetch_enabled
             .then(|| {
-                Reader::with_arena_capacity_retire_hook_and_class(
+                Reader::with_arena_capacity_class_and_pinned(
                     expert_prefetch_workers,
                     expert_prefetch_arena_slots(),
                     metal_expert_retire_hook.clone(),
                     // Speculative pool: eligible for K3_PREFETCH_IOPOL kernel
                     // deprioritization so demand never queues behind it.
                     true,
+                    pinned_prefetch_arena,
                 )
             })
             .transpose()?;
@@ -1690,7 +1704,18 @@ impl NativeTargetEngine {
             expert_backend,
             ResolvedExpertBackend::Cuda | ResolvedExpertBackend::CudaAuto
         ) && cuda_arrival_admit_enabled())
-            .then(|| Reader::with_arena_capacity(expert_reader_workers, CUDA_ARRIVAL_ARENA_SLOTS))
+            .then(|| {
+                if cuda_direct_dma_enabled() {
+                    // K3_CUDA_DIRECT_DMA=1: page-locked arena, the provider
+                    // DMAs from the landed slab (no staging memcpy).
+                    crate::storage::install_pinned_host_allocator(
+                        crate::provider::pinned_host_allocator(),
+                    );
+                    Reader::with_pinned_arena_capacity(expert_reader_workers, CUDA_ARRIVAL_ARENA_SLOTS)
+                } else {
+                    Reader::with_arena_capacity(expert_reader_workers, CUDA_ARRIVAL_ARENA_SLOTS)
+                }
+            })
             .transpose()?;
         // The gate governs only speculative reads, so it exists exactly when
         // the speculative reader does; `K3_PILOT_GATE=off` keeps the legacy
@@ -10299,6 +10324,17 @@ fn cuda_pilot_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("K3_CUDA_PILOT")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true"))
+    })
+}
+
+/// K3_CUDA_DIRECT_DMA=1|on: the arrival arena is page-locked provider memory
+/// and the CUDA cache DMAs from it directly (the C++ side reads the same
+/// variable to choose the upload path).
+fn cuda_direct_dma_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("K3_CUDA_DIRECT_DMA")
             .is_ok_and(|value| matches!(value.trim(), "1" | "on" | "true"))
     })
 }

@@ -1,4 +1,5 @@
 #include "provider_mla.h"
+#include "provider_cuda_moe.h"
 
 #if defined(__APPLE__) && defined(DELTAFIN_HAVE_MLA_ATTN_METAL_V1)
 #include "provider_mla_attn_metal.h"
@@ -113,7 +114,8 @@ at::Tensor linear(const at::Tensor& input, const MlaLinearWeight& weight) {
       output = at::linear(flat, weight.data, std::nullopt);
       break;
     case MlaLinearEncoding::RowI8F32Scale:
-      output = at::_weight_int8pack_mm(flat, weight.data, weight.row_scale);
+      output = deltafin::provider_internal::cuda_int8_linear(
+          flat, weight.data, weight.row_scale);
       break;
     case MlaLinearEncoding::OriginalBf16:
       output = original_bf16_linear(flat, weight.original_bf16);

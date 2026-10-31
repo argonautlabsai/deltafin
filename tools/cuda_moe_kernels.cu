@@ -447,3 +447,84 @@ extern "C" int k3_cuda_int8_dequant(
         cols);
     return device_status("int8 dequant launch", k3_gpu::peek_error());
 }
+
+// Fused row-int8 x fp32 GEMV for decode-sized batches (kpai 2026-10-31): one
+// warp per (batch, row); each lane streams 16 contiguous int8 weights (one
+// 16-byte load) against the matching fp32 activations, accumulates in fp32,
+// reduces across the warp in a fixed order and applies the row scale once.
+// Used instead of at::_weight_int8pack_mm for M <= 4, where that kernel
+// reaches a small fraction of VRAM bandwidth.
+__global__ void int8_row_gemv_kernel(
+    const int8_t* __restrict__ weights,
+    const float* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    int rows,
+    int cols,
+    int batches) {
+    const int64_t warp =
+        (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int64_t total = static_cast<int64_t>(rows) * batches;
+    if (warp >= total) {
+        return;
+    }
+    const int row = static_cast<int>(warp % rows);
+    const int batch = static_cast<int>(warp / rows);
+    const int8_t* w = weights + static_cast<int64_t>(row) * cols;
+    const float* xb = x + static_cast<int64_t>(batch) * cols;
+    float acc = 0.0f;
+    for (int c = lane * 16; c < cols; c += 32 * 16) {
+        const int4 packed = *reinterpret_cast<const int4*>(w + c);
+        const int8_t* b = reinterpret_cast<const int8_t*>(&packed);
+        const float4* xv = reinterpret_cast<const float4*>(xb + c);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 v = xv[i];
+            acc = fmaf(static_cast<float>(b[4 * i + 0]), v.x, acc);
+            acc = fmaf(static_cast<float>(b[4 * i + 1]), v.y, acc);
+            acc = fmaf(static_cast<float>(b[4 * i + 2]), v.z, acc);
+            acc = fmaf(static_cast<float>(b[4 * i + 3]), v.w, acc);
+        }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        output[static_cast<int64_t>(batch) * rows + row] = acc * scales[row];
+    }
+}
+
+extern "C" int k3_cuda_int8_gemv(
+    const int8_t* weights,
+    const float* scales,
+    const float* x,
+    float* output,
+    int rows,
+    int cols,
+    int batches,
+    void* stream_pointer) {
+    if (!weights || !scales || !x || !output) {
+        return reject("int8 GEMV", "null input, scale, or output pointer");
+    }
+    if (rows <= 0 || cols <= 0 || batches <= 0 || (cols % 512) != 0) {
+        return reject(
+            "int8 GEMV",
+            "rows/batches must be positive and cols a positive multiple of 512");
+    }
+    if ((reinterpret_cast<uintptr_t>(weights) & 15u) != 0 ||
+        (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
+        return reject("int8 GEMV", "weights and activations must be 16-byte aligned");
+    }
+    const int64_t warps = static_cast<int64_t>(rows) * batches;
+    const int64_t blocks = (warps * 32 + kThreads - 1) / kThreads;
+    if (blocks > std::numeric_limits<int>::max()) {
+        return reject("int8 GEMV", "launch grid is too large");
+    }
+    int8_row_gemv_kernel<<<
+        static_cast<int>(blocks), kThreads, 0,
+        reinterpret_cast<k3_gpu::Stream>(stream_pointer)>>>(
+        weights, scales, x, output, rows, cols, batches);
+    return device_status("int8 GEMV launch", k3_gpu::peek_error());
+}

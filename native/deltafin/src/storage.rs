@@ -36,6 +36,27 @@ pub(crate) const BUFFER_ALIGNMENT: usize = 16 * 1024;
 // the arena when direct/pinned provider uploads are enabled later.
 pub(crate) const BUFFER_ALIGNMENT: usize = 64 * 1024;
 const MAX_PLAN_JOBS: usize = 1_000_000;
+
+/// Page-locked host allocator installed by the engine when the CUDA provider
+/// can pin read slabs (K3_CUDA_DIRECT_DMA): a pinned arena reads straight into
+/// memory the device can DMA from, so admission needs no staging memcpy
+/// (kpai 2026-10-31: that memcpy on the engine thread was ~60 % of its time).
+#[derive(Clone, Copy)]
+pub(crate) struct PinnedHostAllocator {
+    pub(crate) alloc: unsafe extern "C" fn(u64, *mut *mut std::ffi::c_void) -> i32,
+    pub(crate) free: unsafe extern "C" fn(*mut std::ffi::c_void),
+}
+
+static PINNED_HOST_ALLOCATOR: OnceLock<PinnedHostAllocator> = OnceLock::new();
+
+/// Install once per process; a second install keeps the first and reports it.
+pub(crate) fn install_pinned_host_allocator(allocator: PinnedHostAllocator) -> bool {
+    PINNED_HOST_ALLOCATOR.set(allocator).is_ok()
+}
+
+fn pinned_host_allocator() -> Option<PinnedHostAllocator> {
+    PINNED_HOST_ALLOCATOR.get().copied()
+}
 const DEFAULT_ARENA_SLOTS: usize = 2;
 const WORK_QUANTUM: usize = 4;
 const MAX_DEMAND_STREAK: usize = 8;
@@ -2074,9 +2095,54 @@ struct AlignedBuffer {
     /// must not free it. `keepalive` pins the owner for the buffer's life.
     owned: bool,
     keepalive: Option<Arc<dyn Any + Send + Sync>>,
+    /// Page-locked allocation (K3_CUDA_DIRECT_DMA): the base pointer the
+    /// provider handed out and the allocator that frees it; `pointer` is the
+    /// BUFFER_ALIGNMENT-aligned view inside it.
+    pinned_base: Option<(NonNull<u8>, PinnedHostAllocator)>,
 }
 
 impl AlignedBuffer {
+    /// Page-locked variant of `new`: BUFFER_ALIGNMENT-aligned view over a
+    /// provider `cudaHostAlloc` block, zeroed like `alloc_zeroed` would.
+    fn new_pinned(capacity: usize) -> Result<Self> {
+        let allocator = pinned_host_allocator().ok_or_else(|| {
+            DeltafinError::new("pinned read arena requested before a pinned host allocator was installed")
+        })?;
+        let allocated_len = aligned_allocation_len(capacity)?;
+        let total = allocated_len
+            .checked_add(BUFFER_ALIGNMENT)
+            .ok_or_else(|| DeltafinError::new("pinned-buffer size overflows usize"))?;
+        let layout = Layout::from_size_align(allocated_len, BUFFER_ALIGNMENT)
+            .map_err(|_| DeltafinError::new("invalid pinned-buffer layout"))?;
+        let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the provider ABI writes a page-locked host allocation of
+        // `total` bytes into `raw` on status 0; ownership is released exactly
+        // once in `Drop` through the paired free.
+        let status = unsafe { (allocator.alloc)(total as u64, &mut raw) };
+        if status != 0 || raw.is_null() {
+            return Err(DeltafinError::new(format!(
+                "pinned host allocation of {total} bytes failed (status {status})"
+            )));
+        }
+        let base = raw.cast::<u8>();
+        let aligned = ((base as usize + BUFFER_ALIGNMENT - 1) / BUFFER_ALIGNMENT * BUFFER_ALIGNMENT) as *mut u8;
+        // SAFETY: `aligned..aligned + allocated_len` lies inside the `total`
+        // byte allocation because the pad is at most BUFFER_ALIGNMENT - 1.
+        unsafe { std::ptr::write_bytes(aligned, 0, allocated_len) };
+        let pointer = NonNull::new(aligned)
+            .ok_or_else(|| DeltafinError::new("pinned host allocation is null"))?;
+        let base = NonNull::new(base)
+            .ok_or_else(|| DeltafinError::new("pinned host allocation is null"))?;
+        Ok(Self {
+            pointer,
+            capacity,
+            layout,
+            owned: true,
+            keepalive: None,
+            pinned_base: Some((base, allocator)),
+        })
+    }
+
     fn new(capacity: usize) -> Result<Self> {
         let allocated_len = aligned_allocation_len(capacity)?;
         let layout = Layout::from_size_align(allocated_len, BUFFER_ALIGNMENT)
@@ -2092,6 +2158,7 @@ impl AlignedBuffer {
             layout,
             owned: true,
             keepalive: None,
+            pinned_base: None,
         })
     }
 
@@ -2117,6 +2184,7 @@ impl AlignedBuffer {
             layout,
             owned: false,
             keepalive: Some(keepalive),
+            pinned_base: None,
         })
     }
 
@@ -2171,6 +2239,12 @@ impl Drop for AlignedBuffer {
             self.keepalive.take();
             return;
         }
+        if let Some((base, allocator)) = self.pinned_base.take() {
+            // SAFETY: `base` came from this allocator's alloc and is released
+            // exactly once here.
+            unsafe { (allocator.free)(base.as_ptr().cast::<std::ffi::c_void>()) };
+            return;
+        }
         // SAFETY: `pointer` came from `alloc_zeroed(self.layout)` and has not
         // been deallocated or transferred.
         unsafe { dealloc(self.pointer.as_ptr(), self.layout) }
@@ -2183,14 +2257,27 @@ struct SharedBuffers {
 
 impl SharedBuffers {
     fn new(capacities: BufferLengths) -> Result<Self> {
+        Self::new_with(capacities, false)
+    }
+
+    /// `pinned`: every buffer is a page-locked provider allocation
+    /// (K3_CUDA_DIRECT_DMA read arenas); otherwise ordinary aligned memory.
+    fn new_with(capacities: BufferLengths, pinned: bool) -> Result<Self> {
         let capacities = capacities.as_array();
+        let make = |capacity: usize| {
+            if pinned {
+                AlignedBuffer::new_pinned(capacity)
+            } else {
+                AlignedBuffer::new(capacity)
+            }
+        };
         Ok(Self {
-            values: [
-                AlignedBuffer::new(capacities[0])?,
-                AlignedBuffer::new(capacities[1])?,
-                AlignedBuffer::new(capacities[2])?,
-            ],
+            values: [make(capacities[0])?, make(capacities[1])?, make(capacities[2])?],
         })
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.values.iter().any(|buffer| buffer.pinned_base.is_some())
     }
 
     fn get(&self, kind: BufferKind) -> &AlignedBuffer {
@@ -2260,6 +2347,11 @@ fn donate_expert_allocation_owned(
     if Arc::strong_count(&buffers) != 1 {
         return Err(buffers);
     }
+    // Page-locked slabs belong to their arena's provider allocation policy
+    // and never enter the shared pool (a pageable arena would reuse them).
+    if buffers.is_pinned() {
+        return Err(buffers);
+    }
     let capacities = BufferLengths::new(
         buffers.get(BufferKind::Quantized).allocation_len(),
         buffers.get(BufferKind::Scales).allocation_len(),
@@ -2296,6 +2388,8 @@ struct BufferArena {
     inner: Mutex<Vec<ArenaSlot>>,
     available: Condvar,
     retire_hook: Option<BufferRetireHook>,
+    /// Slots are page-locked provider allocations (K3_CUDA_DIRECT_DMA).
+    pinned: bool,
 }
 
 impl BufferArena {
@@ -2306,6 +2400,14 @@ impl BufferArena {
     fn new_with_retire_hook(
         slots: usize,
         retire_hook: Option<BufferRetireHook>,
+    ) -> Result<Arc<Self>> {
+        Self::new_full(slots, retire_hook, false)
+    }
+
+    fn new_full(
+        slots: usize,
+        retire_hook: Option<BufferRetireHook>,
+        pinned: bool,
     ) -> Result<Arc<Self>> {
         if slots == 0 {
             return Err(DeltafinError::new(
@@ -2324,6 +2426,7 @@ impl BufferArena {
             ),
             available: Condvar::new(),
             retire_hook,
+            pinned,
         }))
     }
 
@@ -2410,10 +2513,10 @@ impl BufferArena {
             // Donated allocations first: stable addresses keep the no-copy
             // wrapper cache warm and cost no page faults. Fresh allocation
             // remains the fallback.
-            if let Some(donated) = take_fitting_donation(target_capacities) {
+            if let Some(donated) = (!self.pinned).then(|| take_fitting_donation(target_capacities)).flatten() {
                 Some(donated)
             } else {
-                match SharedBuffers::new(target_capacities) {
+                match SharedBuffers::new_with(target_capacities, self.pinned) {
                     Ok(buffers) => Some((Arc::new(buffers), target_capacities)),
                     Err(error) => {
                         self.release(slot_index);
@@ -2530,7 +2633,7 @@ impl BufferArena {
             return Err(error);
         }
         drop(old_buffers);
-        let replacement = match SharedBuffers::new(target) {
+        let replacement = match SharedBuffers::new_with(target, self.pinned) {
             Ok(buffers) => Arc::new(buffers),
             Err(error) => {
                 let mut slots = self.inner.lock().unwrap();
@@ -4642,6 +4745,36 @@ impl Reader {
         retire_hook: Option<BufferRetireHook>,
         prefetch_class: bool,
     ) -> Result<Self> {
+        Self::with_arena_capacity_full(workers, arena_slots, retire_hook, prefetch_class, false)
+    }
+
+    /// Demand reader whose arena slots are page-locked provider allocations
+    /// (K3_CUDA_DIRECT_DMA): the device DMAs straight from a landed slab.
+    /// Requires `install_pinned_host_allocator` first.
+    pub(crate) fn with_pinned_arena_capacity(workers: usize, arena_slots: usize) -> Result<Self> {
+        Self::with_arena_capacity_full(workers, arena_slots, None, false, true)
+    }
+
+    /// Speculative (prefetch-class) reader whose arena may be page-locked
+    /// provider memory (K3_CUDA_DIRECT_DMA): pilot tickets then DMA straight
+    /// from their slab like arrival tickets do, instead of the staging copy.
+    pub(crate) fn with_arena_capacity_class_and_pinned(
+        workers: usize,
+        arena_slots: usize,
+        retire_hook: Option<BufferRetireHook>,
+        prefetch_class: bool,
+        pinned: bool,
+    ) -> Result<Self> {
+        Self::with_arena_capacity_full(workers, arena_slots, retire_hook, prefetch_class, pinned)
+    }
+
+    fn with_arena_capacity_full(
+        workers: usize,
+        arena_slots: usize,
+        retire_hook: Option<BufferRetireHook>,
+        prefetch_class: bool,
+        pinned: bool,
+    ) -> Result<Self> {
         if workers == 0 {
             return Err(DeltafinError::new(
                 "storage reader needs at least one worker",
@@ -4655,7 +4788,7 @@ impl Reader {
             }),
             available: Condvar::new(),
         });
-        let arena = BufferArena::new_with_retire_hook(arena_slots, retire_hook)?;
+        let arena = BufferArena::new_full(arena_slots, retire_hook, pinned)?;
         let mut threads: Vec<JoinHandle<()>> = Vec::with_capacity(workers);
         for index in 0..workers {
             let worker_state = Arc::clone(&state);

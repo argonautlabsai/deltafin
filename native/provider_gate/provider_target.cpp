@@ -1,4 +1,5 @@
 #include "provider_target.h"
+#include "provider_cuda_moe.h"
 
 #include <ATen/ops/_weight_int8pack_mm.h>
 #include <ATen/ops/add.h>
@@ -106,7 +107,8 @@ std::int64_t linear_rows(const MoeRowInt8Matrix &matrix) {
 at::Tensor linear(const at::Tensor &input, const MoeRowInt8Matrix &weight,
                   const bool packed) {
   if (packed) {
-    return at::_weight_int8pack_mm(input, weight.quantized, weight.row_scales);
+    return deltafin::provider_internal::cuda_int8_linear(
+        input, weight.quantized, weight.row_scales);
   }
   if (weight.original_bf16.defined()) {
     return original_bf16_linear(input, weight.original_bf16);

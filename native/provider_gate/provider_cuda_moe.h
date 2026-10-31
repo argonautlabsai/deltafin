@@ -169,6 +169,11 @@ class CudaMoeExpertCache final {
 /* Compile-time capability only; `available()` is the runtime authority. */
 [[nodiscard]] bool cuda_moe_compiled() noexcept;
 
+/// Row-int8 linear: fused decode GEMV when K3_CUDA_INT8_GEMV=1 and the
+/// operands qualify, otherwise at::_weight_int8pack_mm (same contract).
+at::Tensor cuda_int8_linear(const at::Tensor& input, const at::Tensor& weight,
+                            const at::Tensor& scales);
+
 }  // namespace deltafin::provider_internal
 
 #endif

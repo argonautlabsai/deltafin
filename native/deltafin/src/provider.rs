@@ -435,6 +435,15 @@ struct CudaCacheConfigureReportV1 {
 
 const CUDA_CACHE_ADMIT_PINNED: u32 = 1;
 
+/// Page-locked host allocation through the CUDA provider (`cudaHostAlloc`),
+/// for read arenas the device DMAs from directly (K3_CUDA_DIRECT_DMA).
+pub(crate) fn pinned_host_allocator() -> crate::storage::PinnedHostAllocator {
+    crate::storage::PinnedHostAllocator {
+        alloc: deltafin_provider_cuda_host_alloc_v1,
+        free: deltafin_provider_cuda_host_free_v1,
+    }
+}
+
 #[repr(C)]
 struct CudaCacheAdmitRequestV1 {
     struct_size: u32,
@@ -2041,6 +2050,8 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> i32;
+    fn deltafin_provider_cuda_host_alloc_v1(bytes: u64, out: *mut *mut std::ffi::c_void) -> i32;
+    fn deltafin_provider_cuda_host_free_v1(pointer: *mut std::ffi::c_void);
     fn deltafin_provider_cuda_cache_admit_v1(
         request: *const CudaCacheAdmitRequestV1,
         report: *mut CudaCacheAdmitReportV1,
