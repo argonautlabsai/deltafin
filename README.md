@@ -1,3 +1,5 @@
+<p align="center"><a href="https://argonautlabs.ai/"><img src="docs/branding/argonaut-labs.svg" width="112" alt="Argonaut Labs"></a></p>
+
 # ARGODRIVE Deltafin
 
 **TL;DR** — Kimi K3 (2.8T-parameter MoE, 1.45 TB of expert weights) running on one M5 Max MacBook Pro with 128 GB, experts streamed from four SSDs.
