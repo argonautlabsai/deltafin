@@ -290,3 +290,8 @@ Exact provenance and distribution boundaries are recorded in [Third-party proven
 ## License
 
 Deltafin's tracked project code is [MIT](LICENSE). Kimi K3 weights, the DSpark checkpoint, optional Qwen checkpoints and all other third-party material retain their upstream terms. Deltafin is an independent project with no affiliation to Moonshot AI.
+
+
+## Related research: Kimi 3.1 on one GPU
+
+For Kimi K3.1 Pro on Linux and NVIDIA CUDA, see the separate [Argodrive DS4 Kimi K3.1 engine](https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1) and its [single-GPU setup and benchmark guide](https://argonautlabs.ai/research/kimi-k31-single-gpu.html). It was tested on one 96 GB RTX PRO 6000 Blackwell with experts streamed from NVMe. Its hardware, model version and benchmark conditions differ from the results in this repository.
