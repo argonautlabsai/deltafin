@@ -2,6 +2,15 @@
 
 # ARGODRIVE Deltafin
 
+> **Update, 9 November 2026: Kimi K3.1 Pro at 2.04 tok/s on the same MacBook Pro.** Our new engine,
+> [Argodrive DS4 Kimi K3.1](https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1), built on antirez's ds4, runs
+> Kimi K3.1 Pro on an M5 Max MacBook Pro with 128 GB at **2.04 tok/s decode** (512 generated tokens, Qwen drafter, same tokens
+> as plain decoding), about twice this repository's 1.00 tok/s, with the experts on the internal SSD and two Thunderbolt 5
+> NVMe drives. A 512-token prompt now reaches its first token in about a minute instead of six. The same engine runs on one
+> RTX PRO 6000 (96 GB) at 3.05 tok/s. [Results and setup →](https://argonautlabs.ai/research/kimi-k31-single-gpu.html#apple-silicon)
+>
+> This repository stays as the record of the September Kimi K3 work on deltafin.
+
 **TL;DR** — Kimi K3 (2.8T-parameter MoE, 1.45 TB of expert weights) running on one M5 Max MacBook Pro with 128 GB, experts streamed from four SSDs.
 - **1.00 tok/s** steady decode over a 512-token answer; 1.13 over 128; 0.96 on the public 17-token prompt (upstream reported 0.68).
 - **The honest limit:** a 512-token prompt takes ~6.3 minutes to its first token. Cause found (prefill re-reads each layer's experts 8×), fix planned, not built.
