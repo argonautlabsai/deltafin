@@ -1,12 +1,12 @@
 <p align="center"><a href="https://argonautlabs.ai/"><img src="docs/branding/argonaut-labs.svg" width="112" alt="Argonaut Labs"></a></p>
 
 > [!IMPORTANT]
-> **New, 9 November 2026: Kimi K3.1 Pro now runs at 2.04 tok/s on the same MacBook Pro, twice this repository's 1.00 tok/s.**  
-> Get the new engine: **[argonautlabsai/argodrive-ds4-kimi-k3.1](https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1)** · [results and setup](https://argonautlabs.ai/research/kimi-k31-single-gpu.html#apple-silicon)
+> **New, 19 November 2026: Kimi K3.1 Pro at 5.52 tok/s on two RTX PRO 6000 (2 × 96 GB) with the Qwen drafter, 2.97 without.**  
+> Get the engine: **[argonautlabsai/argodrive-ds4-kimi-k3.1](https://github.com/argonautlabsai/argodrive-ds4-kimi-k3.1)** · [two-card results](https://argonautlabs.ai/research/kimi-k31-single-gpu.html#two-cards) · [Mac results](https://argonautlabs.ai/research/kimi-k31-single-gpu.html#apple-silicon)
 >
-> M5 Max with 128 GB, the experts on the internal SSD and two Thunderbolt 5 NVMe drives, Qwen drafter with the same tokens as
-> plain decoding. A 512-token prompt reaches its first token in about a minute instead of six. The same engine runs on one
-> RTX PRO 6000 (96 GB) at 3.05 tok/s. This repository stays as the record of the September Kimi K3 work on deltafin.
+> One RTX PRO 6000 runs the same tests at 3.87 tok/s with the drafter and 2.04 without; a MacBook Pro M5 Max (128 GB)
+> reaches 2.49 with the drafter, against this repository's 1.00. The drafter keeps the same tokens as plain decoding.
+> This repository stays as the record of the September Kimi K3 work on deltafin.
 
 # ARGODRIVE Deltafin
 
